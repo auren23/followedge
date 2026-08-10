@@ -159,32 +159,38 @@ const (
 )
 
 // rankActors sorts by the requested axis, then applies the optional Pareto
-// frontier filter on (Quality, conservative EV).
-func rankActors(list []*Actor, sortKey ActorSortKey, frontier bool) []*Actor {
+// frontier filter on (Quality, conservative EV). Replication axes honor a
+// minimum sample gate (--min-repl-due/--min-repl-filled): an actor with
+// N=1 +300%% must not top the replicability sort nor enter the frontier.
+func rankActors(list []*Actor, sortKey ActorSortKey, frontier bool, minReplDue, minReplFilled int) []*Actor {
+	replEligible := func(a *Actor) bool {
+		return a.Due >= minReplDue && a.Filled >= minReplFilled
+	}
 	switch sortKey {
 	case SortReplicability:
 		sort.SliceStable(list, func(i, j int) bool {
-			vi, vj := -math.MaxFloat64, -math.MaxFloat64
-			if list[i].ConsValid {
-				vi = list[i].ConsEV
+			ei, ej := replEligible(list[i]) && list[i].ConsValid, replEligible(list[j]) && list[j].ConsValid
+			if ei != ej {
+				return ei
 			}
-			if list[j].ConsValid {
-				vj = list[j].ConsEV
+			if !ei {
+				return false // both ineligible: keep stable order
 			}
-			return vi > vj
+			return list[i].ConsEV > list[j].ConsEV
 		})
 	case SortPnl:
 		sort.SliceStable(list, func(i, j int) bool { return list[i].RealizedPnL > list[j].RealizedPnL })
 	case SortCopyEV:
 		sort.SliceStable(list, func(i, j int) bool {
-			vi, vj := -math.MaxFloat64, -math.MaxFloat64
-			if list[i].ObservedValid {
-				vi = list[i].ObservedEV
+			ei := replEligible(list[i]) && list[i].ObservedValid
+			ej := replEligible(list[j]) && list[j].ObservedValid
+			if ei != ej {
+				return ei
 			}
-			if list[j].ObservedValid {
-				vj = list[j].ObservedEV
+			if !ei {
+				return false
 			}
-			return vi > vj
+			return list[i].ObservedEV > list[j].ObservedEV
 		})
 	default: // quality
 		sort.SliceStable(list, func(i, j int) bool { return list[i].Quality > list[j].Quality })
@@ -193,15 +199,20 @@ func rankActors(list []*Actor, sortKey ActorSortKey, frontier bool) []*Actor {
 	if frontier {
 		// Pareto frontier on (Quality, consEV): keep only actors not strictly
 		// dominated — nobody else has BOTH more quality AND more conservative
-		// replication EV. ponytail: O(n²), fine at hundreds of actors.
+		// replication EV. Sample gate first: actors without enough replication
+		// data cannot claim a frontier slot. ponytail: O(n²), fine at hundreds
+		// of actors.
 		cons := func(a *Actor) float64 {
-			if !a.ConsValid {
+			if !a.ConsValid || !replEligible(a) {
 				return -math.MaxFloat64
 			}
 			return a.ConsEV
 		}
 		out := list[:0]
 		for i, a := range list {
+			if !replEligible(a) || !a.ConsValid {
+				continue // no replication evidence → no frontier slot
+			}
 			dominated := false
 			for j, b := range list {
 				if i == j {
@@ -227,15 +238,18 @@ func rankActors(list []*Actor, sortKey ActorSortKey, frontier bool) []*Actor {
 // measurement loss / unresolved), so a flattering filled-only mean can't
 // hide survivor bias. Sorting and the Pareto frontier are user-selectable.
 func Rank(w io.Writer, s *storage.Store, since time.Time, horizon time.Duration,
-	limit, minTrades int, noExitLoss float64, grace time.Duration, sortKey ActorSortKey, frontier bool) error {
+	limit, minTrades int, noExitLoss float64, grace time.Duration, sortKey ActorSortKey,
+	frontier bool, minReplDue, minReplFilled int) error {
 	groups, err := s.ActorGroups(since)
 	if err != nil {
 		return err
 	}
 	actors := actorRows(groups)
 
-	// coverage-aware replication census per wallet at the reference horizon
-	census, err := s.ReplicationCensus(horizon, grace, time.Now().UTC())
+	// coverage-aware replication census per wallet at the reference horizon,
+	// SAME window as Quality (since) and buy-side only — the two axes of the
+	// card must describe the same period and the same question.
+	census, err := s.ReplicationCensus(since, horizon, grace, time.Now().UTC())
 	if err != nil {
 		return err
 	}
@@ -251,7 +265,7 @@ func Rank(w io.Writer, s *storage.Store, since time.Time, horizon time.Duration,
 			list = append(list, a)
 		}
 	}
-	list = rankActors(list, sortKey, frontier)
+	list = rankActors(list, sortKey, frontier, minReplDue, minReplFilled)
 	if limit > 0 && len(list) > limit {
 		list = list[:limit]
 	}
@@ -374,10 +388,11 @@ func Inspect(w io.Writer, s *storage.Store, wallet string, since time.Time,
 			float64(wins)/float64(len(rets))*100)
 	}
 
-	// coverage-aware replication census per horizon — the survivor-bias guard
+	// coverage-aware replication census per horizon — the survivor-bias guard,
+	// same window as the card and buy-side only
 	now := time.Now().UTC()
 	for _, h := range horizons {
-		census, err := s.ReplicationCensus(h, grace, now)
+		census, err := s.ReplicationCensus(since, h, grace, now)
 		if err != nil {
 			return err
 		}
@@ -412,11 +427,12 @@ func Inspect(w io.Writer, s *storage.Store, wallet string, since time.Time,
 	}
 
 	// the EV cliff in one line: does chasing kill this actor's edge?
+	// OBSERVED-ONLY: filled rows; coverage/market loss are in the census above.
 	const refHorizon = 5 * time.Minute
 	low := chaseConditionedEV(s, wallet, refHorizon, func(c float64) bool { return c <= 5 })
 	high := chaseConditionedEV(s, wallet, refHorizon, func(c float64) bool { return c > 10 })
 	if low.n > 0 || high.n > 0 {
-		fmt.Fprintf(w, "\nCHASE-CONDITIONED EV @ %v (follower)\n", refHorizon)
+		fmt.Fprintf(w, "\nCHASE-CONDITIONED EV @ %v (follower, OBSERVED-ONLY — filled rows; coverage in REPLICATION census above)\n", refHorizon)
 		fmt.Fprintf(w, "%-14s %8s %10s\n", "condition", "N", "avg")
 		if low.n > 0 {
 			fmt.Fprintf(w, "%-14s %8d %+9.2f%%\n", "chase <= 5%", low.n, low.mean)

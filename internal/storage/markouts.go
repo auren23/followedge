@@ -3,6 +3,7 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/auren23/followedge/internal/domain"
@@ -62,12 +63,25 @@ type DueMarkout struct {
 // TERMINAL market statuses (no_candle, token_inactive, stale_outcome) are
 // excluded: their observed_price stays NULL forever, so re-listing them
 // every tick would burn kline quota on rows that can never fill.
-func (s *Store) DueMarkouts(grace time.Duration, now time.Time, limit int) ([]DueMarkout, error) {
+//
+// skipTokens (tokens currently in backoff, e.g. no_kline_data) are excluded
+// at the SQL level so they cannot occupy the LIMIT slots and starve fresh
+// pending rows; ordering puts fresh pending FIRST for the same reason —
+// retry rows only get the remaining budget.
+func (s *Store) DueMarkouts(grace time.Duration, now time.Time, limit int, skipTokens []string) ([]DueMarkout, error) {
 	cutoff := now.Add(-grace).Unix()
-	// follower rows first (the measurement that matters), transient failures
-	// next (api_error/rate_limited/lookback_miss can still recover, and a
-	// fresh kline window is most likely to fix them), then newest first —
-	// stale leader rows from dead tokens must not starve fresh data.
+	skipClause := ""
+	args := []any{cutoff}
+	if len(skipTokens) > 0 {
+		skipClause = " AND e.token_address NOT IN (" + strings.Repeat("?,", len(skipTokens))[:len(skipTokens)*2-1] + ")"
+		for _, t := range skipTokens {
+			args = append(args, t)
+		}
+	}
+	args = append(args, limit)
+	// fresh pending follower rows first (the measurement that matters),
+	// then retryable rows — a backoff-heavy backlog must never starve new
+	// data, and newest first inside each class.
 	rows, err := s.db.Query(`
 		SELECT m.event_id, m.kind, m.horizon_ms, m.base_price, m.base_ms,
 		       e.token_address
@@ -75,11 +89,11 @@ func (s *Store) DueMarkouts(grace time.Duration, now time.Time, limit int) ([]Du
 		JOIN trade_events e ON e.event_id = m.event_id
 		WHERE m.observed_price IS NULL
 		  AND m.base_ms + m.horizon_ms/1000 <= ?
-		  AND m.status IN ('pending','lookback_miss','api_error','rate_limited','price_parse_error','no_kline_data')
+		  AND m.status IN ('pending','lookback_miss','api_error','rate_limited','price_parse_error','no_kline_data')`+skipClause+`
 		ORDER BY (m.kind = 'follower') DESC,
-		         (m.status IN ('lookback_miss','api_error','rate_limited','no_kline_data')) DESC,
+		         (m.status = 'pending') DESC,
 		         m.base_ms + m.horizon_ms/1000 DESC
-		LIMIT ?`, cutoff, limit)
+		LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -359,9 +373,14 @@ type ReplicationRow struct {
 	ObservedValid bool
 }
 
-// ReplicationCensus aggregates one horizon's due follower markouts per
-// wallet. Conservative EV is computed by the caller (it needs noExitLoss).
-func (s *Store) ReplicationCensus(horizon, grace time.Duration, now time.Time) ([]ReplicationRow, error) {
+// ReplicationCensus aggregates one horizon's due follower BUY markouts per
+// wallet — the v0.1.4 entry-replication question: "would a follower at our
+// latency capturing this actor's BUY entries make money?". SELL legs are
+// excluded (their markout return has the opposite sign) and the census is
+// restricted to the SAME time window as Quality (ActorGroups), so the two
+// axes of an actor card always describe the same period. Conservative EV
+// is computed by the caller (it needs noExitLoss).
+func (s *Store) ReplicationCensus(since time.Time, horizon, grace time.Duration, now time.Time) ([]ReplicationRow, error) {
 	cutoff := now.Add(-grace).Unix()
 	rows, err := s.db.Query(`
 		SELECT e.wallet,
@@ -375,9 +394,11 @@ func (s *Store) ReplicationCensus(horizon, grace time.Duration, now time.Time) (
 		FROM markouts m
 		JOIN trade_events e ON e.event_id = m.event_id
 		WHERE m.kind = 'follower' AND m.horizon_ms = ?
+		  AND e.side = 'buy'
+		  AND e.trade_time >= ?
 		  AND m.base_ms + m.horizon_ms/1000 <= ?
 		GROUP BY e.wallet
-		ORDER BY e.wallet`, horizon.Milliseconds(), cutoff)
+		ORDER BY e.wallet`, horizon.Milliseconds(), since.Unix(), cutoff)
 	if err != nil {
 		return nil, err
 	}

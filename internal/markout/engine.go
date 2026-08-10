@@ -113,7 +113,17 @@ func (e *Engine) Run(ctx context.Context, tick time.Duration) {
 // SampleDue fills every due markout with the first available candle close at
 // or after its due time.
 func (e *Engine) SampleDue(ctx context.Context) error {
-	due, err := e.store.DueMarkouts(e.grace, time.Now().UTC(), 5000)
+	now := time.Now().UTC()
+	// tokens still in backoff are excluded at the SQL level — if they filled
+	// the LIMIT slots, the engine would skip them all and fresh pending rows
+	// could starve behind a no_kline_data backlog.
+	var backoffTokens []string
+	for t, until := range e.skipUntil {
+		if now.Before(until) {
+			backoffTokens = append(backoffTokens, t)
+		}
+	}
+	due, err := e.store.DueMarkouts(e.grace, now, 5000, backoffTokens)
 	if err != nil {
 		return err
 	}
@@ -135,7 +145,6 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 		}
 	}
 
-	now := time.Now().UTC()
 	tokensDone := 0
 	entryCache := map[string]entryPrice{} // event → entry (shared across its 6 horizon rows)
 	for token, targets := range byToken {

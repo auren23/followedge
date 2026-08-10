@@ -345,7 +345,7 @@ func TestReplicationCensus(t *testing.T) {
 	mk("W2", "e", &p5, "")
 	mk("W2", "f", nil, "") // stays pending
 
-	rows, err := s.ReplicationCensus(30*time.Second, 0, now.Add(time.Hour))
+	rows, err := s.ReplicationCensus(ts.Add(-time.Minute), 30*time.Second, 0, now.Add(time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,5 +370,112 @@ func TestReplicationCensus(t *testing.T) {
 	}
 	if !w2.ObservedValid || math.Abs(w2.ObservedEV-5) > 0.001 {
 		t.Errorf("W2 observed EV = %v, want +5", w2.ObservedEV)
+	}
+}
+
+// TestReplicationCensusWindowAndSide pins both P0 fixes: the census must
+// describe the SAME window as Quality (--since) and only BUY entries —
+// a sell leg's markout has the opposite sign and must not enter entry
+// replication.
+func TestReplicationCensusWindowAndSide(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	since := now.Add(-24 * time.Hour)
+	mk := func(wallet, id string, side domain.Side, ts time.Time, ret float64) {
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, wallet, "T_"+id, string(side)),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: wallet, WalletType: domain.WalletSmartMoney,
+			TokenAddress: "T_" + id, Side: side, AmountUSD: 10, PriceUSD: 1.0,
+			TradeTime: ts, ReceivedAt: ts,
+		}
+		if _, err := s.InsertEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+		entry := 1.0
+		if err := s.CreateMarkouts(ev, MarkoutFollower, &entry, []time.Duration{30 * time.Second}, now); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.FillMarkout(ev.ID, MarkoutFollower, 30*time.Second, 1.0+ret/100, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("W_IN", "in1", domain.Buy, now.Add(-20*time.Minute), 10)       // in window, buy → included
+	mk("W_OLD", "old1", domain.Buy, now.Add(-48*time.Hour), 100)      // buy but BEFORE since → excluded
+	mk("W_SELL", "sell1", domain.Sell, now.Add(-20*time.Minute), 200) // huge sell return → excluded
+
+	rows, err := s.ReplicationCensus(since, 30*time.Second, 0, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Wallet != "W_IN" {
+		t.Fatalf("census = %+v, want only W_IN (window + buy side)", rows)
+	}
+	r := rows[0]
+	if r.Due != 1 || r.Filled != 1 || !r.ObservedValid || math.Abs(r.ObservedEV-10) > 0.001 {
+		t.Errorf("W_IN census = due%d filled%d ev%v, want 1/1/+10", r.Due, r.Filled, r.ObservedEV)
+	}
+}
+
+// TestDueMarkoutsFreshFirst pins the fresh-first ordering: pending rows come
+// before retry rows in the queue, and tokens in backoff are excluded at the
+// SQL level so they can't occupy LIMIT slots and starve fresh data.
+func TestDueMarkoutsFreshFirst(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	mk := func(id, token string, status string, ago time.Duration) {
+		base := now.Add(-ago).Truncate(30 * time.Second)
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W1", token, "buy"),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W1", WalletType: domain.WalletSmartMoney,
+			TokenAddress: token, Side: domain.Buy, AmountUSD: 100, PriceUSD: 1.00,
+			TradeTime: base, ReceivedAt: base,
+		}
+		if _, err := s.InsertEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+		price := ev.PriceUSD
+		if err := s.CreateMarkouts(ev, MarkoutLeader, &price, []time.Duration{30 * time.Second}, now); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.SetMarkoutStatus(ev.ID, MarkoutLeader, 30*time.Second, status); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("r1", "TOKEN_R", MarkoutStatusLookbackMiss, 10*time.Minute) // retry, newer
+	mk("p1", "TOKEN_P", MarkoutStatusPending, 20*time.Minute)      // pending, older
+	mk("b1", "TOKEN_B", MarkoutStatusNoKlineData, 30*time.Minute)  // in backoff
+
+	// fresh pending first, retry after
+	due, err := s.DueMarkouts(0, now, 100, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 3 || due[0].Token != "TOKEN_P" {
+		t.Errorf("fresh-first order broken: %+v", due)
+	}
+	// backoff token excluded at SQL level
+	due, err = s.DueMarkouts(0, now, 100, []string{"TOKEN_B"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(due) != 2 {
+		t.Fatalf("skipTokens not honored: %+v", due)
+	}
+	for _, d := range due {
+		if d.Token == "TOKEN_B" {
+			t.Errorf("backoff token TOKEN_B leaked into queue: %+v", due)
+		}
 	}
 }

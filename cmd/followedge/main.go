@@ -26,7 +26,7 @@ import (
 	"github.com/auren23/followedge/internal/storage"
 )
 
-const version = "0.1.4-actor-replication"
+const version = "0.1.4.1-actor-census-integrity"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -265,6 +265,8 @@ func cmdActors(ctx context.Context, args []string) error {
 	sortBy := fs.String("sort", "quality", "rank axis: quality|replicability|pnl|copy-ev")
 	frontier := fs.Bool("frontier", false, "keep only the Pareto frontier on (quality, conservative EV)")
 	noExitLoss := fs.Float64("noexit-loss", 100, "assumed loss %% for unpriced market-outcome rows in conservative EV")
+	minReplDue := fs.Int("min-repl-due", 20, "min due replication rows for frontier/replication sort eligibility")
+	minReplFilled := fs.Int("min-repl-filled", 5, "min filled replication rows for frontier/replication sort eligibility")
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
@@ -292,7 +294,8 @@ func cmdActors(ctx context.Context, args []string) error {
 	switch sub {
 	case "rank":
 		return analyze.Rank(os.Stdout, store, sinceT, h, *limit, *minTrades,
-			*noExitLoss, cfg.Markout.Grace, analyze.ActorSortKey(*sortBy), *frontier)
+			*noExitLoss, cfg.Markout.Grace, analyze.ActorSortKey(*sortBy), *frontier,
+			*minReplDue, *minReplFilled)
 	case "inspect":
 		if fs.NArg() != 1 {
 			return fmt.Errorf("usage: followedge actors inspect <wallet> [--since 24h]")

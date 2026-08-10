@@ -667,7 +667,7 @@ func TestDueMarkoutsExcludesTerminal(t *testing.T) {
 	mk("d", storage.MarkoutStatusStaleOutcome)  // terminal
 	mk("e", storage.MarkoutStatusLookbackMiss)  // retryable (eligible)
 
-	due, err := s.DueMarkouts(0, now, 100)
+	due, err := s.DueMarkouts(0, now, 100, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

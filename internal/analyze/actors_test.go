@@ -122,7 +122,7 @@ func TestRankCoverageAware(t *testing.T) {
 	mkReplEvent(t, s, "W_B", "b4", ts, 0, &p50, "")
 
 	var buf sink
-	if err := Rank(&buf, s, now.Add(-24*time.Hour), 30*time.Second, 10, 2, 100, 0, SortQuality, false); err != nil {
+	if err := Rank(&buf, s, now.Add(-24*time.Hour), 30*time.Second, 10, 2, 100, 0, SortQuality, false, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	out := buf.String()
@@ -172,7 +172,7 @@ func TestRankSortAndFrontier(t *testing.T) {
 
 	rank := func(key ActorSortKey, frontier bool) string {
 		var buf sink
-		if err := Rank(&buf, s, now.Add(-24*time.Hour), 30*time.Second, 10, 2, 100, 0, key, frontier); err != nil {
+		if err := Rank(&buf, s, now.Add(-24*time.Hour), 30*time.Second, 10, 2, 100, 0, key, frontier, 0, 0); err != nil {
 			t.Fatal(err)
 		}
 		return buf.String()
@@ -196,5 +196,51 @@ func TestRankSortAndFrontier(t *testing.T) {
 	}
 	if !strings.Contains(out, "W_A") || !strings.Contains(out, "W_B") {
 		t.Errorf("--frontier must keep W_A and W_B:\n%s", out)
+	}
+}
+
+// TestRankSampleGate pins the P1 fix: a N=1 +300% actor must not top
+// --sort replicability nor claim a --frontier slot — replication axes
+// require a minimum sample (--min-repl-due/--min-repl-filled).
+func TestRankSampleGate(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	ts := now.Add(-20 * time.Minute)
+	// W_G: one lucky fill +300% (due=1 filled=1) — ineligible
+	p300 := 300.0
+	mkReplEvent(t, s, "W_G", "g0", ts, 0, &p300, "")
+	// W_N: 30 fills +5% — eligible
+	p5 := 5.0
+	for i := 0; i < 30; i++ {
+		mkReplEvent(t, s, "W_N", fmt.Sprintf("n%d", i), ts, 0, &p5, "")
+	}
+
+	rank := func(key ActorSortKey, frontier bool) string {
+		var buf sink
+		if err := Rank(&buf, s, now.Add(-24*time.Hour), 30*time.Second, 10, 1, 100, 0,
+			key, frontier, 20, 5); err != nil {
+			t.Fatal(err)
+		}
+		return buf.String()
+	}
+	idx := func(out, w string) int { return strings.Index(out, w+" ") }
+
+	// --sort replicability: W_G (ineligible) must sort after W_N
+	out := rank(SortReplicability, false)
+	if !(idx(out, "W_N") < idx(out, "W_G")) {
+		t.Errorf("N=1 actor must not top replicability sort:\n%s", out)
+	}
+	// --frontier: W_G must not claim a frontier slot
+	out = rank(SortQuality, true)
+	if strings.Contains(out, "W_G") {
+		t.Errorf("N=1 actor must not enter the frontier:\n%s", out)
+	}
+	if !strings.Contains(out, "W_N") {
+		t.Errorf("eligible actor W_N must stay in frontier:\n%s", out)
 	}
 }
