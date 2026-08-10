@@ -1,8 +1,13 @@
 package analyze
 
 import (
+	"fmt"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/auren23/followedge/internal/domain"
 	"github.com/auren23/followedge/internal/storage"
 )
 
@@ -19,7 +24,7 @@ func TestActorRowsAggregates(t *testing.T) {
 		{Wallet: "B", WalletType: "smart_money", Token: "OTHER", Day: "2026-04-01", RealizedPnL: 3, Trades: 3, Buys: 2, Sells: 1, TotalUSD: 100},
 		{Wallet: "B", WalletType: "smart_money", Token: "LOTTO", Day: "2026-04-02", RealizedPnL: -10, Trades: 2, Buys: 1, Sells: 1, TotalUSD: 60},
 	}
-	actors := actorRows(groups, map[string][]float64{})
+	actors := actorRows(groups)
 
 	a := actors["A"]
 	if a == nil || a.RealizedPnL != 200 || a.Trades != 11 || a.Buys != 6 || a.Sells != 5 {
@@ -51,18 +56,145 @@ func TestActorRowsAggregates(t *testing.T) {
 }
 
 func TestReplicabilityZeroForLosingEdge(t *testing.T) {
-	if got := replicabilityScore(-3, 50); got != 0 {
-		t.Errorf("negative EV must score 0, got %.1f", got)
+	// replicabilityScore is gone: the replication census shows facts
+	// (coverage, obs EV, cons EV, loss decomposition) instead of a single
+	// 0-100 score that a filled-only mean could flatter.
+}
+
+// mkReplEvent inserts one trade + one follower markout at 30s horizon.
+func mkReplEvent(t *testing.T, s *storage.Store, wallet, id string, ts time.Time, pnl float64, ret *float64, status string) {
+	side := domain.Buy
+	amount := 100.0
+	buyCost := 0.0
+	if pnl > 0 { // a sell leg that realizes pnl
+		side = domain.Sell
+		amount = pnl + 100
+		buyCost = 100
 	}
-	if got := replicabilityScore(0, 50); got != 0 {
-		t.Errorf("zero EV must score 0, got %.1f", got)
+	ev := domain.TradeEvent{
+		ID:     domain.EventID("sol", id, wallet, "T_"+id, string(side)),
+		Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+		Wallet: wallet, WalletType: domain.WalletSmartMoney,
+		TokenAddress: "T_" + id, Side: side, AmountUSD: amount, BuyCostUSD: buyCost, PriceUSD: 1.0,
+		TradeTime: ts, ReceivedAt: ts,
 	}
-	// +5% mean over 20 fills → half of max
-	if got := replicabilityScore(5, 20); got < 49 || got > 51 {
-		t.Errorf("+5%%/20 fills should be ~50, got %.1f", got)
+	if _, err := s.InsertEvent(ev); err != nil {
+		t.Fatal(err)
 	}
-	// tiny sample is heavily discounted
-	if got := replicabilityScore(10, 2); got != 10 {
-		t.Errorf("+10%% with 2 fills should be 10 (sample factor 0.1), got %.1f", got)
+	entry := 1.0
+	if err := s.CreateMarkouts(ev, storage.MarkoutFollower, &entry, []time.Duration{30 * time.Second}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	switch {
+	case ret != nil:
+		if err := s.FillMarkout(ev.ID, storage.MarkoutFollower, 30*time.Second, 1.0+*ret/100, 0); err != nil {
+			t.Fatal(err)
+		}
+	case status != "":
+		if err := s.SetMarkoutStatus(ev.ID, storage.MarkoutFollower, 30*time.Second, status); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestRankCoverageAware pins the P0 fix: the actor table reports the
+// coverage-aware census, so a wallet whose tokens mostly died shows low
+// coverage and a conservative EV dragged down by market loss — no more
+// filled-only mean flattery.
+func TestRankCoverageAware(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	ts := now.Add(-20 * time.Minute)
+	p5, p50 := 5.0, 50.0
+	// W_A: 3 filled +5% → coverage 100%, cons EV +5
+	for i := 0; i < 3; i++ {
+		mkReplEvent(t, s, "W_A", fmt.Sprintf("a%d", i), ts, 0, &p5, "")
+	}
+	// W_B: 1 filled +50%, 4 no_candle → coverage 20%, cons EV (50-400)/5 = -70
+	for i := 0; i < 4; i++ {
+		mkReplEvent(t, s, "W_B", fmt.Sprintf("b%d", i), ts, 0, nil, storage.MarkoutStatusNoCandle)
+	}
+	mkReplEvent(t, s, "W_B", "b4", ts, 0, &p50, "")
+
+	var buf sink
+	if err := Rank(&buf, s, now.Add(-24*time.Hour), 30*time.Second, 10, 2, 100, 0, SortQuality, false); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	t.Log(out)
+
+	if !strings.Contains(out, "100.0%") || !strings.Contains(out, "+5.00%") {
+		t.Errorf("W_A coverage/consEV missing (want 100.0%% / +5.00%%): %s", out)
+	}
+	if !strings.Contains(out, "20.0%") || !strings.Contains(out, "-70.00%") {
+		t.Errorf("W_B market loss must drag consEV (want 20.0%% coverage / -70.00%%): %s", out)
+	}
+	if !strings.Contains(out, "+50.00%") {
+		t.Errorf("W_B observed EV must still show the +50%% fill: %s", out)
+	}
+	if strings.Contains(out, "repl") && !strings.Contains(out, "consEV") {
+		t.Errorf("old single repl score must be gone, census columns expected: %s", out)
+	}
+}
+
+// TestRankSortAndFrontier pins --sort and --frontier: sorting by different
+// axes reorders the same facts, and the Pareto frontier drops actors
+// strictly dominated on both (quality, conservative EV).
+func TestRankSortAndFrontier(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	ts := now.Add(-20 * time.Minute)
+	p5, p50 := 5.0, 50.0
+	// A: big PnL, terrible replication (cons -85); C: same replication,
+	//    lower PnL → dominated by A; B: small PnL, perfect replication.
+	for i := 0; i < 9; i++ {
+		mkReplEvent(t, s, "W_A", fmt.Sprintf("a%d", i), ts, 0, nil, storage.MarkoutStatusNoCandle)
+	}
+	mkReplEvent(t, s, "W_A", "a9", ts, 10000, &p50, "")
+	for i := 0; i < 10; i++ {
+		mkReplEvent(t, s, "W_B", fmt.Sprintf("b%d", i), ts, 0, &p5, "")
+	}
+	mkReplEvent(t, s, "W_B", "b10", ts, 100, &p5, "")
+	for i := 0; i < 9; i++ {
+		mkReplEvent(t, s, "W_C", fmt.Sprintf("c%d", i), ts, 0, nil, storage.MarkoutStatusNoCandle)
+	}
+	mkReplEvent(t, s, "W_C", "c9", ts, 5000, &p50, "")
+
+	rank := func(key ActorSortKey, frontier bool) string {
+		var buf sink
+		if err := Rank(&buf, s, now.Add(-24*time.Hour), 30*time.Second, 10, 2, 100, 0, key, frontier); err != nil {
+			t.Fatal(err)
+		}
+		return buf.String()
+	}
+	idx := func(out, w string) int { return strings.Index(out, w+" ") }
+
+	// --sort pnl: A (10000) > C (5000) > B (100)
+	out := rank(SortPnl, false)
+	if !(idx(out, "W_A") < idx(out, "W_C") && idx(out, "W_C") < idx(out, "W_B")) {
+		t.Errorf("--sort pnl order wrong:\n%s", out)
+	}
+	// --sort replicability (consEV desc): B (+5) > A/C (-85, stable → A first)
+	out = rank(SortReplicability, false)
+	if !(idx(out, "W_B") < idx(out, "W_A") && idx(out, "W_A") < idx(out, "W_C")) {
+		t.Errorf("--sort replicability order wrong:\n%s", out)
+	}
+	// --frontier: C is strictly dominated by A (same consEV, lower quality)
+	out = rank(SortQuality, true)
+	if strings.Contains(out, "W_C") {
+		t.Errorf("--frontier must drop dominated actor W_C:\n%s", out)
+	}
+	if !strings.Contains(out, "W_A") || !strings.Contains(out, "W_B") {
+		t.Errorf("--frontier must keep W_A and W_B:\n%s", out)
 	}
 }

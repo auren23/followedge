@@ -61,9 +61,12 @@ type Engine struct {
 	horizons []time.Duration
 	log      *slog.Logger
 
-	// tokens whose kline came back empty (dead / not trading): retry no
-	// sooner than this. Prevents stale rows from burning the tick budget.
-	skipUntil map[string]time.Time
+	// tokens whose kline came back empty: retry no sooner than this, with
+	// an escalating backoff (15m → 1h). Prevents stale rows from burning
+	// the tick budget while still giving dead-looking tokens another chance
+	// — an empty GMGN kline is measurement uncertainty, not proof of death.
+	skipUntil   map[string]time.Time
+	emptyStreak map[string]int
 
 	resSecs int64 // kline resolution in seconds (for point-in-time entry bounds)
 }
@@ -77,7 +80,7 @@ func NewEngine(store *storage.Store, client *gmgn.Client, limiter weightLimiter,
 	}
 	return &Engine{store: store, client: client, limiter: limiter, chain: chain,
 		res: resolution, grace: grace, horizons: horizons, log: slog.With("pkg", "markout"),
-		skipUntil: map[string]time.Time{}, resSecs: resSecs}
+		skipUntil: map[string]time.Time{}, emptyStreak: map[string]int{}, resSecs: resSecs}
 }
 
 func (e *Engine) Horizons() []time.Duration { return e.horizons }
@@ -167,13 +170,20 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 		}
 		tokensDone++
 		if len(candles) == 0 {
-			// no kline at all — token likely dead; don't burn budget on it
-			// again for a while. Market outcome, not measurement failure:
-			// the token has no price stream at all.
-			e.skipUntil[token] = now.Add(15 * time.Minute)
-			e.markStatus(targets, storage.MarkoutStatusTokenInactive)
+			// empty kline: GMGN has no data for this token. That is a
+			// MEASUREMENT failure (no_kline_data), NOT proof the token is
+			// dead — the row stays retryable with an escalating backoff
+			// instead of becoming a terminal -100% market loss.
+			e.emptyStreak[token]++
+			backoff := time.Duration(e.emptyStreak[token]) * 15 * time.Minute
+			if backoff > time.Hour {
+				backoff = time.Hour // ponytail: cap at 1h; revisit if tokens genuinely resurrect
+			}
+			e.skipUntil[token] = now.Add(backoff)
+			e.markStatus(targets, storage.MarkoutStatusNoKlineData)
 			continue
 		}
+		e.emptyStreak[token] = 0 // kline came back — reset the backoff ladder
 		// candles with validity kept separate: an unparseable close is a
 		// measurement failure (price_parse_error), NOT a dead token.
 		scs := make([]sampledCandle, len(candles))

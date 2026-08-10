@@ -345,7 +345,7 @@ func TestSampleDueStatuses(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"TOKEN_A": storage.MarkoutStatusTokenInactive,
+		"TOKEN_A": storage.MarkoutStatusNoKlineData,
 		"TOKEN_B": storage.MarkoutStatusNoCandle,
 		"TOKEN_C": storage.MarkoutStatusLookbackMiss,
 	}
@@ -361,6 +361,24 @@ func TestSampleDueStatuses(t *testing.T) {
 		if got != st {
 			t.Errorf("%s status = %s, want %s", token, got, st)
 		}
+	}
+	// backoff: a second pass must NOT re-request the empty-kline token
+	// (no_kline_data is retryable in the queue but skipUntil gates it);
+	// TOKEN_C (lookback_miss) IS retried; TOKEN_D is already filled and
+	// correctly absent from the queue.
+	counted := &countingClient{c: eng.client}
+	eng.client = counted
+	if err := eng.SampleDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if counted.requests["TOKEN_A"] != 0 {
+		t.Errorf("empty-kline token re-requested within backoff: %d calls", counted.requests["TOKEN_A"])
+	}
+	if counted.requests["TOKEN_C"] != 1 {
+		t.Errorf("retryable TOKEN_C should be sampled again: %d calls", counted.requests["TOKEN_C"])
+	}
+	if counted.requests["TOKEN_D"] != 0 {
+		t.Errorf("filled TOKEN_D must not be resampled: %d calls", counted.requests["TOKEN_D"])
 	}
 	// control: TOKEN_D filled
 	rows, err := s.MarkoutsAt(storage.MarkoutLeader, 30*time.Second)
@@ -379,6 +397,20 @@ type tokenCannedClient struct {
 
 func (t *tokenCannedClient) Kline(ctx context.Context, chain, address, resolution string, from, to time.Time) ([]gmgn.Candle, error) {
 	return t.byToken[address], nil
+}
+
+// countingClient wraps a klineFetcher and records per-token request counts.
+type countingClient struct {
+	c        klineFetcher
+	requests map[string]int
+}
+
+func (c *countingClient) Kline(ctx context.Context, chain, address, resolution string, from, to time.Time) ([]gmgn.Candle, error) {
+	if c.requests == nil {
+		c.requests = map[string]int{}
+	}
+	c.requests[address]++
+	return c.c.Kline(ctx, chain, address, resolution, from, to)
 }
 
 // TestSampleDueFollower verifies the measurement split AND the P0.5 fix:

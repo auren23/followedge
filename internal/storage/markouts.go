@@ -75,9 +75,9 @@ func (s *Store) DueMarkouts(grace time.Duration, now time.Time, limit int) ([]Du
 		JOIN trade_events e ON e.event_id = m.event_id
 		WHERE m.observed_price IS NULL
 		  AND m.base_ms + m.horizon_ms/1000 <= ?
-		  AND m.status IN ('pending','lookback_miss','api_error','rate_limited','price_parse_error')
+		  AND m.status IN ('pending','lookback_miss','api_error','rate_limited','price_parse_error','no_kline_data')
 		ORDER BY (m.kind = 'follower') DESC,
-		         (m.status IN ('lookback_miss','api_error','rate_limited')) DESC,
+		         (m.status IN ('lookback_miss','api_error','rate_limited','no_kline_data')) DESC,
 		         m.base_ms + m.horizon_ms/1000 DESC
 		LIMIT ?`, cutoff, limit)
 	if err != nil {
@@ -119,8 +119,9 @@ const (
 	MarkoutStatusPending       = "pending"           // not yet due / not yet classified
 	MarkoutStatusFilled        = "filled"            // horizon price sampled
 	MarkoutStatusNoCandle      = "no_candle"         // candle stream ended before horizon (token stopped trading)
-	MarkoutStatusTokenInactive = "token_inactive"    // token has no kline at all
-	MarkoutStatusStaleOutcome  = "stale_outcome"     // stream continued but first candle at/after due opened later than due+res
+	MarkoutStatusTokenInactive = "token_inactive"    // confirmed dead token (currently reserved: needs on-chain evidence)
+	MarkoutStatusStaleOutcome  = "stale_outcome"     // stream continued but first candle close landed past due+res
+	MarkoutStatusNoKlineData   = "no_kline_data"     // GMGN returned an empty kline — measurement, NOT proof the token is dead
 	MarkoutStatusAPIError      = "api_error"         // kline request failed (non-429)
 	MarkoutStatusRateLimited   = "rate_limited"      // 429; gate closed
 	MarkoutStatusLookbackMiss  = "lookback_miss"     // entry candle out of fetched range
@@ -143,17 +144,18 @@ func (s *Store) FillMarkout(eventID, kind string, horizon time.Duration, observe
 // SetMarkoutStatus records why a row could not be filled.
 //
 // Statuses split into two dimensions (see MarkoutStatus* consts):
-//   - market outcome (no_candle, token_inactive) is STICKY — a dead token
-//     stays dead, and only a later successful fill overwrites it;
-//   - measurement failure (api_error, rate_limited, lookback_miss) is
-//     RETRYABLE — a later pass may recover (a fresh kline window, the 429
-//     gate reopening), so any of these can be overwritten by any other
-//     status, including another failure reason.
+//   - market outcome (no_candle, token_inactive, stale_outcome) is STICKY —
+//     a dead token stays dead, and only a later successful fill overwrites it;
+//   - measurement failure (api_error, rate_limited, lookback_miss,
+//     price_parse_error, no_kline_data) is RETRYABLE — a later pass may
+//     recover (a fresh kline window, the 429 gate reopening), so any of
+//     these can be overwritten by any other status, including another
+//     failure reason (e.g. price_parse_error → no_candle).
 func (s *Store) SetMarkoutStatus(eventID, kind string, horizon time.Duration, status string) error {
 	_, err := s.db.Exec(`
 		UPDATE markouts SET status = ?
 		WHERE event_id = ? AND kind = ? AND horizon_ms = ?
-		  AND status IN ('pending','lookback_miss','api_error','rate_limited')`,
+		  AND status IN ('pending','lookback_miss','api_error','rate_limited','price_parse_error','no_kline_data')`,
 		status, eventID, kind, horizon.Milliseconds())
 	return err
 }
@@ -338,4 +340,61 @@ func (s *Store) MarkoutCoverage(kind string, horizon time.Duration) (filled, tot
 		`SELECT COUNT(*) FROM markouts WHERE kind = ? AND horizon_ms = ? AND observed_price IS NOT NULL`,
 		kind, horizon.Milliseconds()).Scan(&filled)
 	return
+}
+
+// ReplicationRow is one wallet's coverage-aware replication census at one
+// horizon: EVERY due follower row bucketed, so survivor bias is visible —
+// a wallet with 10 great fills and 90 dead tokens shows coverage 10% and a
+// conservative EV dragged down by market loss, instead of a flattering
+// filled-only mean.
+type ReplicationRow struct {
+	Wallet     string
+	Due        int
+	Filled     int
+	MarketLoss int // no_candle + token_inactive + stale_outcome
+	MeasLoss   int // api_error + rate_limited + lookback_miss + price_parse_error + no_kline_data
+	Unresolved int // due but still pending (worker lag)
+	// ObservedEV = mean return of filled rows; Valid=false when no fills.
+	ObservedEV    float64
+	ObservedValid bool
+}
+
+// ReplicationCensus aggregates one horizon's due follower markouts per
+// wallet. Conservative EV is computed by the caller (it needs noExitLoss).
+func (s *Store) ReplicationCensus(horizon, grace time.Duration, now time.Time) ([]ReplicationRow, error) {
+	cutoff := now.Add(-grace).Unix()
+	rows, err := s.db.Query(`
+		SELECT e.wallet,
+		       COUNT(*) AS due,
+		       SUM(CASE WHEN m.observed_price IS NOT NULL AND m.base_price > 0 THEN 1 ELSE 0 END) AS filled,
+		       SUM(CASE WHEN m.status IN ('no_candle','token_inactive','stale_outcome') THEN 1 ELSE 0 END) AS market_loss,
+		       SUM(CASE WHEN m.status IN ('api_error','rate_limited','lookback_miss','price_parse_error','no_kline_data') THEN 1 ELSE 0 END) AS meas_loss,
+		       SUM(CASE WHEN m.status = 'pending' THEN 1 ELSE 0 END) AS unresolved,
+		       AVG(CASE WHEN m.observed_price IS NOT NULL AND m.base_price > 0
+		                THEN (m.observed_price / m.base_price - 1) * 100 END) AS obs_ev
+		FROM markouts m
+		JOIN trade_events e ON e.event_id = m.event_id
+		WHERE m.kind = 'follower' AND m.horizon_ms = ?
+		  AND m.base_ms + m.horizon_ms/1000 <= ?
+		GROUP BY e.wallet
+		ORDER BY e.wallet`, horizon.Milliseconds(), cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ReplicationRow
+	for rows.Next() {
+		var r ReplicationRow
+		var obsEV sql.NullFloat64
+		if err := rows.Scan(&r.Wallet, &r.Due, &r.Filled, &r.MarketLoss,
+			&r.MeasLoss, &r.Unresolved, &obsEV); err != nil {
+			return nil, err
+		}
+		if obsEV.Valid {
+			r.ObservedEV = obsEV.Float64
+			r.ObservedValid = true
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }

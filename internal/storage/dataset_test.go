@@ -2,6 +2,7 @@ package storage
 
 import (
 	"database/sql"
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
@@ -292,5 +293,82 @@ func TestLegacyV5Inference(t *testing.T) {
 	}
 	if st != MarkoutStatusFilled {
 		t.Errorf("v5-era priced row status = %q, want %q (007 backfill)", st, MarkoutStatusFilled)
+	}
+}
+
+// TestReplicationCensus pins the actor-level survivor-bias guard: a wallet's
+// census buckets EVERY due follower row (filled / market loss / measurement
+// loss / unresolved) and carries the observed EV — a filled-only mean can
+// no longer flatter an actor whose tokens mostly died.
+func TestReplicationCensus(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	ts := now.Add(-20 * time.Minute)
+	// Wallet W1: 4 due rows — 2 filled (+10%, +30%), 1 no_candle, 1 api_error
+	// Wallet W2: 2 due rows — 1 filled (+5%), 1 pending (unresolved)
+	mk := func(wallet, id string, ret *float64, status string) {
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, wallet, "T_"+id, "buy"),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: wallet, WalletType: domain.WalletSmartMoney,
+			TokenAddress: "T_" + id, Side: domain.Buy, AmountUSD: 10, PriceUSD: 1.0,
+			TradeTime: ts, ReceivedAt: ts,
+		}
+		if _, err := s.InsertEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+		entry := 1.0
+		if err := s.CreateMarkouts(ev, MarkoutFollower, &entry, []time.Duration{30 * time.Second}, now); err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case ret != nil:
+			if err := s.FillMarkout(ev.ID, MarkoutFollower, 30*time.Second, 1.0+*ret/100, 0); err != nil {
+				t.Fatal(err)
+			}
+		case status != "":
+			if err := s.SetMarkoutStatus(ev.ID, MarkoutFollower, 30*time.Second, status); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	p10, p30, p5 := 10.0, 30.0, 5.0
+	mk("W1", "a", &p10, "")
+	mk("W1", "b", &p30, "")
+	mk("W1", "c", nil, MarkoutStatusNoCandle)
+	mk("W1", "d", nil, MarkoutStatusAPIError)
+	mk("W2", "e", &p5, "")
+	mk("W2", "f", nil, "") // stays pending
+
+	rows, err := s.ReplicationCensus(30*time.Second, 0, now.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	byWallet := map[string]ReplicationRow{}
+	for _, r := range rows {
+		byWallet[r.Wallet] = r
+	}
+	w1, ok := byWallet["W1"]
+	if !ok {
+		t.Fatalf("W1 missing from census: %v", byWallet)
+	}
+	if w1.Due != 4 || w1.Filled != 2 || w1.MarketLoss != 1 || w1.MeasLoss != 1 || w1.Unresolved != 0 {
+		t.Errorf("W1 census = due%d filled%d mkt%d meas%d unres%d, want 4/2/1/1/0",
+			w1.Due, w1.Filled, w1.MarketLoss, w1.MeasLoss, w1.Unresolved)
+	}
+	if !w1.ObservedValid || math.Abs(w1.ObservedEV-20) > 0.001 {
+		t.Errorf("W1 observed EV = %v (valid %v), want +20", w1.ObservedEV, w1.ObservedValid)
+	}
+	w2 := byWallet["W2"]
+	if w2.Due != 2 || w2.Filled != 1 || w2.Unresolved != 1 {
+		t.Errorf("W2 census = due%d filled%d unres%d, want 2/1/1", w2.Due, w2.Filled, w2.Unresolved)
+	}
+	if !w2.ObservedValid || math.Abs(w2.ObservedEV-5) > 0.001 {
+		t.Errorf("W2 observed EV = %v, want +5", w2.ObservedEV)
 	}
 }

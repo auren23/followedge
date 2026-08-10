@@ -26,7 +26,7 @@ import (
 	"github.com/auren23/followedge/internal/storage"
 )
 
-const version = "0.1.3.3-measurement-freeze"
+const version = "0.1.4-actor-replication"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -69,6 +69,7 @@ usage:
   followedge collect [--config configs/observe.yaml] [--once]
   followedge status [--config configs/observe.yaml]
   followedge actors rank    [--config ...] [--since 24h] [--horizon 60s] [--limit 20] [--min-trades 3]
+                             [--sort quality|replicability|pnl|copy-ev] [--frontier]
   followedge actors inspect [--config ...] <wallet> [--since 24h]
   followedge analyze latency   [--config ...] [--since 1h]
   followedge analyze latency-ev [--config ...] [--horizon 5m] [--side buy] [--by-chase]
@@ -261,6 +262,9 @@ func cmdActors(ctx context.Context, args []string) error {
 	horizon := fs.String("horizon", "60s", "reference markout horizon for replicability")
 	limit := fs.Int("limit", 20, "max rows")
 	minTrades := fs.Int("min-trades", 3, "min trades per actor")
+	sortBy := fs.String("sort", "quality", "rank axis: quality|replicability|pnl|copy-ev")
+	frontier := fs.Bool("frontier", false, "keep only the Pareto frontier on (quality, conservative EV)")
+	noExitLoss := fs.Float64("noexit-loss", 100, "assumed loss %% for unpriced market-outcome rows in conservative EV")
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
@@ -287,7 +291,8 @@ func cmdActors(ctx context.Context, args []string) error {
 
 	switch sub {
 	case "rank":
-		return analyze.Rank(os.Stdout, store, sinceT, h, *limit, *minTrades)
+		return analyze.Rank(os.Stdout, store, sinceT, h, *limit, *minTrades,
+			*noExitLoss, cfg.Markout.Grace, analyze.ActorSortKey(*sortBy), *frontier)
 	case "inspect":
 		if fs.NArg() != 1 {
 			return fmt.Errorf("usage: followedge actors inspect <wallet> [--since 24h]")
@@ -296,7 +301,7 @@ func cmdActors(ctx context.Context, args []string) error {
 		if err != nil {
 			return err
 		}
-		return analyze.Inspect(os.Stdout, store, fs.Arg(0), sinceT, horizons)
+		return analyze.Inspect(os.Stdout, store, fs.Arg(0), sinceT, horizons, *noExitLoss, cfg.Markout.Grace)
 	default:
 		return fmt.Errorf("unknown actors subcommand %q", sub)
 	}

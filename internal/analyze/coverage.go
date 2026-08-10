@@ -37,6 +37,7 @@ func Coverage(w io.Writer, s *storage.Store, kind string, horizons []time.Durati
 			storage.MarkoutStatusRateLimited,
 			storage.MarkoutStatusLookbackMiss,
 			storage.MarkoutStatusParseError,
+			storage.MarkoutStatusNoKlineData,
 		}
 		for _, st := range order {
 			n := counts[st]
@@ -69,7 +70,8 @@ func Coverage(w io.Writer, s *storage.Store, kind string, horizons []time.Durati
 		// conservative EV denominator — a 429 is not a -100% trade.
 		market := counts[storage.MarkoutStatusNoCandle] + counts[storage.MarkoutStatusTokenInactive] + counts[storage.MarkoutStatusStaleOutcome]
 		meas := counts[storage.MarkoutStatusAPIError] + counts[storage.MarkoutStatusRateLimited] +
-			counts[storage.MarkoutStatusLookbackMiss] + counts[storage.MarkoutStatusParseError]
+			counts[storage.MarkoutStatusLookbackMiss] + counts[storage.MarkoutStatusParseError] +
+			counts[storage.MarkoutStatusNoKlineData]
 		fmt.Fprintf(w, "  %-16s %8d   %5.1f%%  (no_candle + token_inactive + stale_outcome → cons-EV denominator)\n",
 			"market_loss", market, pctOf(market, due))
 		fmt.Fprintf(w, "  %-16s %8d   %5.1f%%  (api/rate/parse/lookback → coverage loss only)\n",

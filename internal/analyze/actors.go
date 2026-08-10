@@ -12,14 +12,15 @@ import (
 
 // Actor is the ranked summary of one wallet.
 //
-// The two scores are deliberately separate:
+// Quality and Replication are deliberately separate axes:
 //   - Quality: did this actor actually make money (realized PnL from the
 //     GMGN feed, consistency, concentration, drawdown)?
-//   - Replicability: could a follower at our latency capture it (mean
-//     markout return of buys at a reference horizon, sample-adjusted)?
-//
-// A wallet can be rich but uncopyable, or modest but perfectly copyable —
-// the project only cares about the latter.
+//   - Replication: the coverage-aware census of what a follower at our
+//     latency would have captured (follower markouts at a reference
+//     horizon). No single 0-100 score: the facts are shown as-is
+//     (coverage, observed EV, conservative EV, loss decomposition), so a
+//     wallet with 10 great fills and 90 dead tokens can't masquerade as
+//     highly replicable.
 type Actor struct {
 	Wallet     string
 	WalletType string
@@ -35,8 +36,14 @@ type Actor struct {
 	Top1Share      float64 // top-1 token's share of realized PnL (0-1)
 	MaxDrawdown    float64 // USD, from the cumulative daily PnL curve
 
-	Quality       float64
-	Replicability float64
+	Quality float64
+
+	// replication census at the reference horizon (follower, coverage-aware)
+	Due, Filled, MarketLoss, MeasLoss, Unresolved int
+	ObservedEV                                    float64
+	ObservedValid                                 bool
+	ConsEV                                        float64
+	ConsValid                                     bool
 }
 
 // qualityScore combines v0.1 heuristics into 0-100. Formulas are deliberately
@@ -59,20 +66,10 @@ func qualityScore(a *Actor) float64 {
 		0.15*concentration + 0.15*dd
 }
 
-// replicabilityScore: mean buy-markout return at the reference horizon,
-// scaled (+10% = 100), sample-adjusted (20 fills = full), zero below break-even.
-func replicabilityScore(evMean float64, fills int) float64 {
-	if evMean <= 0 {
-		return 0
-	}
-	sampleFactor := math.Min(1, float64(fills)/20)
-	return clamp01(evMean/10) * 100 * sampleFactor
-}
-
 func clamp01(v float64) float64 { return math.Max(0, math.Min(1, v)) }
 
 // actorRows buckets storage.ActorGroups into per-wallet Actor summaries.
-func actorRows(groups []storage.ActorGroup, buys map[string][]float64) map[string]*Actor {
+func actorRows(groups []storage.ActorGroup) map[string]*Actor {
 	byWallet := map[string]*Actor{}
 	for _, g := range groups {
 		a := byWallet[g.Wallet]
@@ -130,40 +127,131 @@ func actorRows(groups []storage.ActorGroup, buys map[string][]float64) map[strin
 			a.Top1Share = top / a.RealizedPnL
 		}
 		a.Quality = qualityScore(a)
-		a.Replicability = replicabilityScore(mean(buys[wallet]), len(buys[wallet]))
 	}
 	return byWallet
 }
 
-// Rank prints the actor leaderboard: profitable + consistent + copyable.
-// Quality uses realized PnL facts; Replicability uses FOLLOWER markouts
-// (entry at ReceivedAt) — leader markouts would measure the wrong question.
-func Rank(w io.Writer, s *storage.Store, since time.Time, horizon time.Duration, limit int, minTrades int) error {
+// attachReplication fills the coverage-aware replication census facts. consEV
+// is computed like LatencyEV: unpriced MARKET-outcome rows (market loss)
+// assumed to lose noExitLoss%; measurement failures and unresolved rows are
+// excluded — a 429 or GMGN no-data is not a -100% trade.
+func attachReplication(a *Actor, r *storage.ReplicationRow, noExitLoss float64) {
+	if r == nil {
+		return
+	}
+	a.Due, a.Filled, a.MarketLoss, a.MeasLoss, a.Unresolved = r.Due, r.Filled, r.MarketLoss, r.MeasLoss, r.Unresolved
+	a.ObservedEV, a.ObservedValid = r.ObservedEV, r.ObservedValid
+	market := r.Filled + r.MarketLoss
+	if market > 0 {
+		a.ConsEV = (r.ObservedEV*float64(r.Filled) - float64(r.MarketLoss)*noExitLoss) / float64(market)
+		a.ConsValid = true
+	}
+}
+
+// ActorSortKey is the --sort axis for `actors rank`.
+type ActorSortKey string
+
+const (
+	SortQuality       ActorSortKey = "quality"
+	SortReplicability ActorSortKey = "replicability" // conservative EV desc
+	SortPnl           ActorSortKey = "pnl"
+	SortCopyEV        ActorSortKey = "copy-ev" // observed EV desc
+)
+
+// rankActors sorts by the requested axis, then applies the optional Pareto
+// frontier filter on (Quality, conservative EV).
+func rankActors(list []*Actor, sortKey ActorSortKey, frontier bool) []*Actor {
+	switch sortKey {
+	case SortReplicability:
+		sort.SliceStable(list, func(i, j int) bool {
+			vi, vj := -math.MaxFloat64, -math.MaxFloat64
+			if list[i].ConsValid {
+				vi = list[i].ConsEV
+			}
+			if list[j].ConsValid {
+				vj = list[j].ConsEV
+			}
+			return vi > vj
+		})
+	case SortPnl:
+		sort.SliceStable(list, func(i, j int) bool { return list[i].RealizedPnL > list[j].RealizedPnL })
+	case SortCopyEV:
+		sort.SliceStable(list, func(i, j int) bool {
+			vi, vj := -math.MaxFloat64, -math.MaxFloat64
+			if list[i].ObservedValid {
+				vi = list[i].ObservedEV
+			}
+			if list[j].ObservedValid {
+				vj = list[j].ObservedEV
+			}
+			return vi > vj
+		})
+	default: // quality
+		sort.SliceStable(list, func(i, j int) bool { return list[i].Quality > list[j].Quality })
+	}
+
+	if frontier {
+		// Pareto frontier on (Quality, consEV): keep only actors not strictly
+		// dominated — nobody else has BOTH more quality AND more conservative
+		// replication EV. ponytail: O(n²), fine at hundreds of actors.
+		cons := func(a *Actor) float64 {
+			if !a.ConsValid {
+				return -math.MaxFloat64
+			}
+			return a.ConsEV
+		}
+		out := list[:0]
+		for i, a := range list {
+			dominated := false
+			for j, b := range list {
+				if i == j {
+					continue
+				}
+				if b.Quality >= a.Quality && cons(b) >= cons(a) &&
+					(b.Quality > a.Quality || cons(b) > cons(a)) {
+					dominated = true
+					break
+				}
+			}
+			if !dominated {
+				out = append(out, a)
+			}
+		}
+		list = out
+	}
+	return list
+}
+
+// Rank prints the actor leaderboard with the coverage-aware replication
+// census: every due follower row is bucketed (filled / market loss /
+// measurement loss / unresolved), so a flattering filled-only mean can't
+// hide survivor bias. Sorting and the Pareto frontier are user-selectable.
+func Rank(w io.Writer, s *storage.Store, since time.Time, horizon time.Duration,
+	limit, minTrades int, noExitLoss float64, grace time.Duration, sortKey ActorSortKey, frontier bool) error {
 	groups, err := s.ActorGroups(since)
 	if err != nil {
 		return err
 	}
-	// follower buy returns per wallet at the reference horizon
-	markouts, err := s.MarkoutsAt(storage.MarkoutFollower, horizon)
+	actors := actorRows(groups)
+
+	// coverage-aware replication census per wallet at the reference horizon
+	census, err := s.ReplicationCensus(horizon, grace, time.Now().UTC())
 	if err != nil {
 		return err
 	}
-	buys := map[string][]float64{}
-	for _, m := range markouts {
-		if m.Side != "buy" || !m.ReturnPct.Valid {
-			continue
+	for _, r := range census {
+		if a := actors[r.Wallet]; a != nil {
+			attachReplication(a, &r, noExitLoss)
 		}
-		buys[m.Wallet] = append(buys[m.Wallet], m.ReturnPct.Float64)
 	}
 
-	actors := actorRows(groups, buys)
 	list := make([]*Actor, 0, len(actors))
 	for _, a := range actors {
 		if a.Trades >= minTrades {
 			list = append(list, a)
 		}
 	}
-	sort.Slice(list, func(i, j int) bool { return list[i].Quality > list[j].Quality })
+	list = rankActors(list, sortKey, frontier)
 	if limit > 0 && len(list) > limit {
 		list = list[:limit]
 	}
@@ -178,16 +266,28 @@ func Rank(w io.Writer, s *storage.Store, since time.Time, horizon time.Duration,
 		}
 	}
 
-	fmt.Fprintf(w, "ACTORS (since %s, markout horizon %v) — Quality vs Replicability are separate axes\n",
+	fmt.Fprintf(w, "ACTORS (since %s, markout horizon %v) — Quality vs Replication are separate axes; replication is coverage-aware\n",
 		since.Format("2006-01-02"), horizon)
-	fmt.Fprintf(w, "%-46s %6s %6s %6s %10s %10s %6s %6s %8s %8s\n",
-		"wallet", "trades", "buys", "sells", "real_pnl", "consist", "top1%", "dd", "quality", "repl")
+	if frontier {
+		fmt.Fprintf(w, "Pareto frontier on (quality, consEV) — nobody strictly dominates another actor on both axes\n")
+	}
+	fmt.Fprintf(w, "%-46s %6s %6s %6s %10s %9s %6s %7s %7s %6s %7s %7s %9s %10s\n",
+		"wallet", "trades", "buys", "sells", "real_pnl", "consist", "top1%", "dd",
+		"quality", "due", "filled", "cov%", "obsEV", "consEV")
 	for _, a := range list {
 		top1 := math.Min(100, a.Top1Share*100) // lottery winners can exceed 100% of net
-		fmt.Fprintf(w, "%-46s %6d %6d %6d %10.0f %9.0f%% %5.0f%% %6.0f %7.1f %7.1f\n",
+		obsEV := "-"
+		if a.ObservedValid {
+			obsEV = fmt.Sprintf("%+8.2f%%", a.ObservedEV)
+		}
+		consEV := "n/a"
+		if a.ConsValid {
+			consEV = fmt.Sprintf("%+9.2f%%", a.ConsEV)
+		}
+		fmt.Fprintf(w, "%-46s %6d %6d %6d %10.0f %8.0f%% %5.0f%% %6.0f %7.1f %6d %7d %6.1f%% %9s %10s\n",
 			a.Wallet, a.Trades, a.Buys, a.Sells, a.RealizedPnL,
 			pct(a.ProfitableDays, a.ActiveDays), top1, a.MaxDrawdown,
-			a.Quality, a.Replicability)
+			a.Quality, a.Due, a.Filled, pct(a.Filled, a.Due), obsEV, consEV)
 	}
 	if len(list) == 0 {
 		fmt.Fprintln(w, "(no actors with enough data yet — keep collecting)")
@@ -202,8 +302,10 @@ func pct(n, d int) float64 {
 	return float64(n) / float64(d) * 100
 }
 
-// Inspect prints one actor's full research card: PnL facts + alpha decay.
-func Inspect(w io.Writer, s *storage.Store, wallet string, since time.Time, horizons []time.Duration) error {
+// Inspect prints one actor's full research card: PnL facts + alpha decay +
+// the coverage-aware replication census at each configured horizon.
+func Inspect(w io.Writer, s *storage.Store, wallet string, since time.Time,
+	horizons []time.Duration, noExitLoss float64, grace time.Duration) error {
 	groups, err := s.ActorGroups(since)
 	if err != nil {
 		return err
@@ -217,7 +319,7 @@ func Inspect(w io.Writer, s *storage.Store, wallet string, since time.Time, hori
 	if len(filtered) == 0 {
 		return fmt.Errorf("no trades for %s in window", wallet)
 	}
-	actors := actorRows(filtered, nil)
+	actors := actorRows(filtered)
 	a := actors[wallet]
 	if a == nil {
 		return fmt.Errorf("no data for %s", wallet)
@@ -270,6 +372,43 @@ func Inspect(w io.Writer, s *storage.Store, wallet string, since time.Time, hori
 		}
 		fmt.Fprintf(w, "%-10s %8d %+7.2f%% %7.1f%%\n", h.String(), len(rets), mean(rets),
 			float64(wins)/float64(len(rets))*100)
+	}
+
+	// coverage-aware replication census per horizon — the survivor-bias guard
+	now := time.Now().UTC()
+	for _, h := range horizons {
+		census, err := s.ReplicationCensus(h, grace, now)
+		if err != nil {
+			return err
+		}
+		var r *storage.ReplicationRow
+		for i := range census {
+			if census[i].Wallet == wallet {
+				r = &census[i]
+				break
+			}
+		}
+		if r == nil || r.Due == 0 {
+			continue
+		}
+		consStr := "n/a"
+		market := r.Filled + r.MarketLoss
+		if market > 0 {
+			cons := (r.ObservedEV*float64(r.Filled) - float64(r.MarketLoss)*noExitLoss) / float64(market)
+			consStr = fmt.Sprintf("%+9.2f%%", cons)
+		}
+		obsStr := "-"
+		if r.ObservedValid {
+			obsStr = fmt.Sprintf("%+9.2f%%", r.ObservedEV)
+		}
+		fmt.Fprintf(w, "\nREPLICATION @%v (follower — coverage-aware census)\n", h)
+		fmt.Fprintf(w, "  due:              %d\n", r.Due)
+		fmt.Fprintf(w, "  filled:           %d    coverage %.1f%%\n", r.Filled, pct(r.Filled, r.Due))
+		fmt.Fprintf(w, "  observed EV:      %s\n", obsStr)
+		fmt.Fprintf(w, "  conservative EV:  %s  (unpriced market-outcome rows assumed -%.0f%%)\n", consStr, noExitLoss)
+		fmt.Fprintf(w, "  market loss:      %d  (no_candle/token_inactive/stale_outcome)\n", r.MarketLoss)
+		fmt.Fprintf(w, "  measurement loss: %d  (api/rate/lookback/parse/no_kline)\n", r.MeasLoss)
+		fmt.Fprintf(w, "  unresolved:       %d  (worker lag)\n", r.Unresolved)
 	}
 
 	// the EV cliff in one line: does chasing kill this actor's edge?
