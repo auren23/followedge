@@ -110,6 +110,7 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 			TradeTime:        ce.TradeTime,
 			ReceivedAt:       ce.ReceivedAt,
 			SinceInitialSecs: ce.SinceInitialSecs,
+			OriginKnown:      ce.OriginKnown,
 		}
 		if ch, ok := chaseByEvent[ce.EventID]; ok {
 			f.ChasePct, f.HasChase = ch, true
@@ -128,7 +129,8 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 
 	fmt.Fprintf(w, "\nBEHAVIOR COHORT — positions opened since %s\n", since.Format("2006-01-02"))
 	fmt.Fprintf(w, "\nENTRY\n")
-	fmt.Fprintf(w, "  initial buys    %d\n", prof.Entry.InitialCount)
+	fmt.Fprintf(w, "  initial buys    %d  (%d origin-known, %d left-censored)\n",
+		prof.Entry.InitialCount, prof.Entry.InitialKnown, prof.Entry.InitialCensored)
 	fmt.Fprintf(w, "  add buys        %d\n", prof.Entry.AddCount)
 	fmt.Fprintf(w, "  reentry rate    %.0f%%\n", prof.Entry.ReentryRate*100)
 	fmt.Fprintf(w, "  initial buy     %s\n", usd(prof.Entry.MedianInitialBuy))

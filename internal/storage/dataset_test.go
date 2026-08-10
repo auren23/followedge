@@ -782,3 +782,136 @@ func TestPositionBookEpsilon(t *testing.T) {
 		t.Errorf("classification = initial %d adds %d, want 2/2 (shared epsilon)", initials, adds)
 	}
 }
+
+// TestPositionBookPeakReset pins the P1-high lifecycle fix: a full close
+// must reset the book's PEAK. Otherwise the next episode inherits a huge
+// epsilon (1e12 peak → eps 1000), a 10-token opening buy looks empty, and
+// the following 5-token buy is misclassified as initial instead of add.
+func TestPositionBookPeakReset(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	base := now.Add(-1 * time.Hour).Truncate(30 * time.Second)
+	mk := func(id, side string, ts time.Time, qty float64) {
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W_PK", "TOKEN_PK", side),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W_PK", WalletType: domain.WalletSmartMoney,
+			TokenAddress: "TOKEN_PK", Side: domain.Side(side), AmountUSD: qty,
+			TokenAmount: qty, PriceUSD: 1.0, BuyCostUSD: 0,
+			TradeTime: ts, ReceivedAt: ts,
+		}
+		if _, err := s.InsertEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("b1", "buy", base, 1e12)                      // huge episode
+	mk("s1", "sell", base.Add(30*time.Second), 1e12) // full close (peak must reset)
+	mk("b2", "buy", base.Add(60*time.Second), 10)    // new episode opening → initial
+	mk("b3", "buy", base.Add(90*time.Second), 5)     // MUST be an add
+
+	classified, err := s.ClassifiedEntries("W_PK")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var initials, adds int
+	for _, ce := range classified {
+		if ce.Initial {
+			initials++
+		} else {
+			adds++
+		}
+	}
+	if initials != 2 || adds != 1 { // b1, b2 initial; b3 add
+		t.Errorf("classification = initial %d add %d, want 2/1 (b3 must be an add — leaked peak would say initial)", initials, adds)
+	}
+
+	eps, err := s.ReconstructEpisodesFor("W_PK", now.Add(-2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eps) != 2 || eps[1].Adds != 1 {
+		t.Errorf("episodes = %+v, want 2 episodes with the second having 1 add (b3)", eps)
+	}
+}
+
+// TestOriginKnownLifecycle pins the P0.5 left-censoring rule: the first
+// observed episode of a (wallet, token) is not provably an initial entry
+// (collector may have missed an earlier position); after a CONFIRMED full
+// close, later opening buys are origin-known.
+func TestOriginKnownLifecycle(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	base := now.Add(-1 * time.Hour).Truncate(30 * time.Second)
+	mk := func(id, token, side string, ts time.Time, qty float64) {
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W_OR", token, side),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W_OR", WalletType: domain.WalletSmartMoney,
+			TokenAddress: token, Side: domain.Side(side), AmountUSD: qty,
+			TokenAmount: qty, PriceUSD: 1.0, BuyCostUSD: 0,
+			TradeTime: ts, ReceivedAt: ts,
+		}
+		if _, err := s.InsertEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// TOKEN_A: first observed buy is left-censored, even though it looks
+	// like a clean opening (no sell before it). After a full close, the
+	// second episode's opening buy is origin-known.
+	mk("a1", "TOKEN_A", "buy", base, 100)
+	mk("a2", "TOKEN_A", "sell", base.Add(30*time.Second), 100) // confirmed full close
+	mk("a3", "TOKEN_A", "buy", base.Add(60*time.Second), 50)   // origin-known opening
+	// TOKEN_B: never closes — its single opening buy stays censored.
+	mk("b1", "TOKEN_B", "buy", base, 200)
+
+	eps, err := s.ReconstructEpisodesFor("W_OR", now.Add(-2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	byToken := map[string][]Episode{}
+	for _, e := range eps {
+		byToken[e.Token] = append(byToken[e.Token], e)
+	}
+	a := byToken["TOKEN_A"]
+	if len(a) != 2 {
+		t.Fatalf("TOKEN_A episodes = %+v, want 2", a)
+	}
+	if a[0].OriginKnown {
+		t.Errorf("first observed episode must be left-censored (OriginKnown=false): %+v", a[0])
+	}
+	if !a[1].OriginKnown {
+		t.Errorf("post-full-close episode must be origin-known: %+v", a[1])
+	}
+	b := byToken["TOKEN_B"]
+	if len(b) != 1 || b[0].OriginKnown {
+		t.Errorf("never-closed token's episode must stay censored: %+v", b)
+	}
+
+	// classification agrees
+	classified, err := s.ClassifiedEntries("W_OR")
+	if err != nil {
+		t.Fatal(err)
+	}
+	originByID := map[string]bool{}
+	for _, ce := range classified {
+		originByID[ce.EventID] = ce.OriginKnown
+	}
+	a1 := domain.EventID("sol", "a1", "W_OR", "TOKEN_A", "buy")
+	a3 := domain.EventID("sol", "a3", "W_OR", "TOKEN_A", "buy")
+	if originByID[a1] {
+		t.Errorf("a1 (first observed buy) must be censored in classification too")
+	}
+	if !originByID[a3] {
+		t.Errorf("a3 (post-close opening) must be origin-known in classification")
+	}
+}

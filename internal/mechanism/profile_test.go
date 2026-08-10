@@ -18,45 +18,46 @@ func TestBuildProfile(t *testing.T) {
 			CapitalIn: 150, CapitalOut: 200, RealizedPnL: 50, HoldDurationS: 180,
 			Status:      storage.EpisodeClosed,
 			FirstSellAt: 160, InitialBuyUSD: 100, AddBuyUSD: 50,
-			SellLegs: 2, PartialExitLegs: 1, DataGap: false},
+			SellLegs: 2, PartialExitLegs: 1, DataGap: false, OriginKnown: true},
 		// closed, losing, no partial exit
 		{Wallet: "W", Token: "T2", OpenedAt: 500, ClosedAt: 800, Adds: 0, Reduces: 1,
 			CapitalIn: 200, CapitalOut: 100, RealizedPnL: -100, HoldDurationS: 300,
 			Status:      storage.EpisodeClosed,
 			FirstSellAt: 800, InitialBuyUSD: 200, AddBuyUSD: 0,
-			SellLegs: 1, PartialExitLegs: 0, DataGap: false},
+			SellLegs: 1, PartialExitLegs: 0, DataGap: false, OriginKnown: true},
 		// data-gap: InitialBuyUSD=0 must NOT enter size medians
 		{Wallet: "W", Token: "T3", OpenedAt: 900, ClosedAt: 960, Adds: 0, Reduces: 1,
 			CapitalIn: 50, CapitalOut: 80, RealizedPnL: 30, HoldDurationS: 60,
 			Status:      storage.EpisodePartial,
 			FirstSellAt: 960, InitialBuyUSD: 0, AddBuyUSD: 0,
-			SellLegs: 1, PartialExitLegs: 0, DataGap: true},
+			SellLegs: 1, PartialExitLegs: 0, DataGap: true, OriginKnown: false},
 		// open, re-entry on T1
 		{Wallet: "W", Token: "T1", OpenedAt: 1000, ClosedAt: 0, Adds: 0, Reduces: 0,
 			CapitalIn: 30, CapitalOut: 0, RealizedPnL: 0, HoldDurationS: 0,
 			Status:      storage.EpisodeOpen,
 			FirstSellAt: 0, InitialBuyUSD: 30, AddBuyUSD: 0,
-			SellLegs: 0, PartialExitLegs: 0, DataGap: false},
+			SellLegs: 0, PartialExitLegs: 0, DataGap: false, OriginKnown: true},
 	}
 	// entries: T1 initial (+chase, valid prior), T1 add (+chase, since 60s),
 	// T2 initial (+chase, prior INVALID — window before dataset start),
 	// T1 re-entry initial
 	entries := []EntryFact{
-		{Initial: true, TradeTime: 100, ReceivedAt: 130,
+		{Initial: true, TradeTime: 100, ReceivedAt: 130, OriginKnown: true,
 			ChasePct: 1, HasChase: true, SmartPrior: 2, KOLPrior: 0, PriorValid: true},
 		{Initial: false, TradeTime: 150, ReceivedAt: 190,
-			ChasePct: 3, HasChase: true, SinceInitialSecs: 50},
-		{Initial: true, TradeTime: 500, ReceivedAt: 560,
+			ChasePct: 3, HasChase: true, SinceInitialSecs: 50, OriginKnown: true},
+		{Initial: true, TradeTime: 500, ReceivedAt: 560, OriginKnown: true,
 			ChasePct: 2, HasChase: true, SmartPrior: 9, KOLPrior: 1, PriorValid: false},
-		{Initial: true, TradeTime: 1000, ReceivedAt: 1010,
+		{Initial: true, TradeTime: 1000, ReceivedAt: 1010, OriginKnown: true,
 			ChasePct: 4, HasChase: true, SmartPrior: 4, KOLPrior: 1, PriorValid: true},
 	}
 
 	p := BuildProfile("W", episodes, entries)
 
 	// ENTRY — initial vs add
-	if p.Entry.InitialCount != 3 || p.Entry.AddCount != 1 {
-		t.Errorf("initial/add = %d/%d, want 3/1", p.Entry.InitialCount, p.Entry.AddCount)
+	if p.Entry.InitialCount != 3 || p.Entry.InitialKnown != 3 || p.Entry.InitialCensored != 0 || p.Entry.AddCount != 1 {
+		t.Errorf("initial = %d (known %d, censored %d) add %d, want 3 (3/0)/1",
+			p.Entry.InitialCount, p.Entry.InitialKnown, p.Entry.InitialCensored, p.Entry.AddCount)
 	}
 	if math.Abs(p.Entry.ReentryRate-0.25) > 0.001 { // 4 episodes, 3 tokens
 		t.Errorf("reentry = %.2f, want 0.25", p.Entry.ReentryRate)
@@ -135,7 +136,7 @@ func TestBuildProfileLeftTruncation(t *testing.T) {
 			CapitalIn: 150, CapitalOut: 140, RealizedPnL: -10, HoldDurationS: 0,
 			Status:      storage.EpisodeOpen,
 			FirstSellAt: 0, InitialBuyUSD: 100, AddBuyUSD: 50,
-			SellLegs: 0, PartialExitLegs: 0, DataGap: false},
+			SellLegs: 0, PartialExitLegs: 0, DataGap: false, OriginKnown: true},
 	}
 	entries := []EntryFact{
 		{Initial: false, TradeTime: 100, ReceivedAt: 130, SinceInitialSecs: 100}, // the add

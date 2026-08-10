@@ -42,12 +42,24 @@ type Episode struct {
 	SellLegs        int     // total sell legs
 	PartialExitLegs int     // sell legs that left visible qty > 0 (real partial exit)
 	DataGap         bool    // opening buy (or part of the position) unseen
+
+	// OriginKnown is false while the FIRST observed episode of a
+	// (wallet, token) is open: the collector may have missed an earlier
+	// position, so the first visible buy could be an add. Clears only after
+	// a confirmed full close. Mechanism analysis must only consume
+	// initial-entry features of origin-known episodes.
+	OriginKnown bool
 }
 
 // RebuildEpisodes reconstructs ALL wallets' position episodes since `since`
-// and materializes them into position_episodes. Deterministic and idempotent
-// (table wiped and rebuilt). Same-second trades are ordered by
-// received_at then event_id — approximate without a chain tx index.
+// and materializes them into position_episodes.
+//
+// LEGACY/DEBUG CACHE: left-truncated at `since` and only used by the
+// `analyze episodes` debug command. Mechanism analysis MUST use the
+// on-demand ReconstructEpisodesFor (full history + cohort filter) — never
+// this table. Deterministic and idempotent (table wiped and rebuilt).
+// Same-second trades are ordered by received_at then event_id (approximate
+// without a chain tx index).
 func (s *Store) RebuildEpisodes(since time.Time) (int, error) {
 	rows, err := s.db.Query(`
 		SELECT wallet, token_address, side, token_amount, amount_usd,
@@ -129,6 +141,15 @@ func (s *Store) ReconstructEpisodesFor(wallet string, since time.Time) ([]Episod
 	return out, nil
 }
 
+// PositionState is what a sell leg left behind.
+type PositionState int
+
+const (
+	Remaining PositionState = iota // qty > eps: position still open
+	Closed                         // |qty| <= eps: full close, snapped to zero
+	Oversold                       // qty < -eps: sold more than visible (data gap)
+)
+
 // positionBook tracks a (wallet, token) visible quantity with a RELATIVE
 // epsilon (1e-9 of peak): float64 residue on large meme-token counts must
 // not flip a full close into a data gap. Single source of truth for both
@@ -152,40 +173,40 @@ func (b *positionBook) add(amount float64) {
 	}
 }
 
-// sell subtracts and snaps to zero when |remaining| <= eps (full close).
-// Residuals beyond -eps stay negative so episode reconstruction can detect
-// the data gap; classification callers snap those away explicitly.
-func (b *positionBook) sell(amount float64) {
+// sell subtracts and reports the resulting state. A full close RESETS the
+// peak — otherwise the next episode would inherit the previous episode's
+// epsilon and small opening buys would look empty (misclassified as
+// initial when they are adds).
+func (b *positionBook) sell(amount float64) PositionState {
 	b.qty -= amount
-	if math.Abs(b.qty) <= b.eps() {
-		b.qty = 0
+	switch {
+	case math.Abs(b.qty) <= b.eps():
+		b.qty, b.peak = 0, 0
+		return Closed
+	case b.qty < -b.eps():
+		return Oversold
 	}
 	if b.qty > b.peak {
 		b.peak = b.qty
 	}
+	return Remaining
 }
 
-func (b *positionBook) isEmpty() bool   { return b.qty <= b.eps() }
-func (b *positionBook) atZero() bool    { return math.Abs(b.qty) <= b.eps() }
-func (b *positionBook) belowZero() bool { return b.qty < -b.eps() }
-func (b *positionBook) reset()          { b.qty, b.peak = 0, 0 }
+func (b *positionBook) isEmpty() bool { return b.qty <= b.eps() }
+func (b *positionBook) reset()        { b.qty, b.peak = 0, 0 }
 
-// reconstructEpisodes builds episodes from an ordered event stream
-// (wallet, token, side, token_amount, amount_usd, buy_cost_usd, trade_time,
-// received_at, event_id — ascending by time). Shared by the global rebuild
-// and the per-wallet on-demand reconstruction.
-//
-// Quantity arithmetic uses a RELATIVE epsilon (1e-9 of the peak visible
-// quantity): large meme-token counts with float64 residue must not turn a
-// perfect full close into a data-gap partial.
 func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 	var eps []Episode
 	var cur *Episode
 	var curWallet, curToken string
 	book := &positionBook{}
+	seenFullClose := false // per token group: only a confirmed full close clears left censorship
 
 	flush := func() {
 		if cur != nil {
+			if cur.Status == EpisodeClosed {
+				seenFullClose = true
+			}
 			eps = append(eps, *cur)
 			cur = nil
 		}
@@ -202,8 +223,16 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 		}
 		if cur == nil || wallet != curWallet || token != curToken {
 			flush()
+			if wallet != curWallet || token != curToken {
+				seenFullClose = false // new (wallet, token) group: censored again
+			}
 			curWallet, curToken = wallet, token
 			cur = &Episode{Wallet: wallet, Token: token, OpenedAt: int64(ts), Status: EpisodeOpen}
+			// The first observed episode of a (wallet, token) is left-censored:
+			// the collector may have missed an earlier position, so the first
+			// visible buy could be an add. OriginKnown stays false until a
+			// confirmed full close proves the position reached zero.
+			cur.OriginKnown = seenFullClose && side != "sell"
 			cur.DataGap = side == "sell" // window opened on a sell: opening buy unseen
 		}
 		if side == "buy" {
@@ -228,23 +257,21 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 			}
 			cur.SellLegs++
 			cur.Reduces++
-			book.sell(tokenAmount)
 			cur.CapitalOut += amountUSD
 			if buyCost.Valid && buyCost.Float64 > 0 {
 				cur.RealizedPnL += amountUSD - buyCost.Float64
 			}
-			if !book.atZero() && !book.belowZero() {
+			switch book.sell(tokenAmount) {
+			case Remaining:
 				cur.PartialExitLegs++ // position remains: a REAL partial exit
-			}
-			if book.atZero() {
+			case Closed:
 				cur.Status = EpisodeClosed
 				cur.ClosedAt = int64(ts)
 				cur.HoldDurationS = cur.ClosedAt - cur.OpenedAt
 				flush()
-			} else if book.belowZero() {
+			case Oversold:
 				cur.Status = EpisodePartial // sold more than visible position
 				cur.DataGap = true
-				book.reset()
 				cur.ClosedAt = int64(ts)
 				cur.HoldDurationS = cur.ClosedAt - cur.OpenedAt
 				flush()

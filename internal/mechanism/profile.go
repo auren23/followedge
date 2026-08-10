@@ -39,32 +39,42 @@ type EntryFact struct {
 	KOLPrior         int
 	PriorValid       bool  // prior-flow window lies inside the dataset (not truncated)
 	SinceInitialSecs int64 // adds only: time since the episode's opening buy
+	// OriginKnown: the opening buy is provably an initial entry (a
+	// confirmed full close was observed before it). Initial-entry features
+	// (chase, prior flow, size) are only meaningful for origin-known buys.
+	OriginKnown bool
 }
 
 // EntryStats are facts about HOW the actor enters positions.
 type EntryStats struct {
 	InitialCount int // opening buys
 	AddCount     int // add buys
+	// OriginKnown/InitialCensored split the opening buys: the first observed
+	// episode of a (wallet, token) may really be an add to a position the
+	// collector never saw — initial-entry features below only consume the
+	// origin-known subset.
+	InitialKnown    int
+	InitialCensored int
 
 	// ReentryRate: (episodes - distinct tokens) / episodes — how often the
 	// actor comes back to a token it already traded (scale-ins are counted
 	// separately as adds, not as re-entry).
 	ReentryRate float64
 
-	MedianInitialBuy MedianStat // opening buy notional per COMPLETE episode
+	MedianInitialBuy MedianStat // opening buy notional per COMPLETE, origin-known episode
 	MedianAddBuy     MedianStat // add notional per episode THAT ADDED (Adds > 0)
 	AddEpisodeRate   float64    // episodes with adds / episodes
-	MedianCapitalIn  MedianStat // total capital in per COMPLETE episode
+	MedianCapitalIn  MedianStat // total capital in per COMPLETE, origin-known episode
 
 	MedianAge              MedianStat // initial entries only: source age (received - trade)
 	MedianChase            MedianStat // initial entries only (entry observations)
 	MedianAddChase         MedianStat // adds only
 	MedianSinceInitialSecs MedianStat // adds only: seconds after the opening buy
 
-	SmartPriorP50 MedianStat // initial entries with a valid prior-flow window
+	SmartPriorP50 MedianStat // origin-known initial entries with a valid prior-flow window
 	KOLPriorP50   MedianStat
 	Cluster3Plus  float64 // share of valid-prior initial entries with >= 3 prior smart buyers
-	PriorFlowN    int     // initial entries with valid prior flow
+	PriorFlowN    int     // origin-known initial entries with valid prior flow
 }
 
 // PositionStats are facts about how the actor manages positions.
@@ -114,13 +124,18 @@ func BuildProfile(wallet string, episodes []storage.Episode, entries []EntryFact
 	for _, e := range entries {
 		if e.Initial {
 			p.Entry.InitialCount++
-			ages = append(ages, float64(e.ReceivedAt-e.TradeTime))
-			if e.HasChase {
-				chases = append(chases, e.ChasePct)
-			}
-			if e.PriorValid {
-				smartPrior = append(smartPrior, float64(e.SmartPrior))
-				kolPrior = append(kolPrior, float64(e.KOLPrior))
+			if e.OriginKnown {
+				p.Entry.InitialKnown++
+				ages = append(ages, float64(e.ReceivedAt-e.TradeTime))
+				if e.HasChase {
+					chases = append(chases, e.ChasePct)
+				}
+				if e.PriorValid {
+					smartPrior = append(smartPrior, float64(e.SmartPrior))
+					kolPrior = append(kolPrior, float64(e.KOLPrior))
+				}
+			} else {
+				p.Entry.InitialCensored++
 			}
 		} else {
 			p.Entry.AddCount++
@@ -153,9 +168,10 @@ func BuildProfile(wallet string, episodes []storage.Episode, entries []EntryFact
 	for _, e := range episodes {
 		tokens[e.Token] = true
 		episodeN++
-		// data-gap episodes have no visible opening buy: their InitialBuyUSD
-		// (0) must NOT enter the median as a fabricated $0.
-		if !e.DataGap {
+		// data-gap episodes have no visible opening buy, and left-censored
+		// episodes' opening buy may really be an add: neither may enter the
+		// initial-size medians as if it were a true initial entry.
+		if !e.DataGap && e.OriginKnown {
 			initBuys = append(initBuys, e.InitialBuyUSD)
 			capIn = append(capIn, e.CapitalIn)
 		}

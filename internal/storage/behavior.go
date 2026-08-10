@@ -9,14 +9,20 @@ import (
 // the episode's OPENING buy or an ADD, plus the seconds since the episode
 // opened (adds only). This separates "why does he open" from "why does he
 // add" — the two questions mechanism mining must not conflate.
+//
+// OriginKnown is false for the first observed opening buy of a (wallet,
+// token) until a confirmed full close — that buy may really be an add to a
+// position the collector never saw.
 type ClassifiedEntry struct {
 	EventID          string
 	Token            string
+	TokenAmount      float64
 	AmountUSD        float64
 	TradeTime        int64
 	ReceivedAt       int64
 	Initial          bool  // opening buy of an episode vs an add
 	SinceInitialSecs int64 // adds only: trade_time - episode opening time
+	OriginKnown      bool  // opening buy is provably an initial entry
 }
 
 // ClassifiedEntries walks the wallet's full event stream (all sides, for
@@ -24,7 +30,7 @@ type ClassifiedEntry struct {
 // full history so a window edge never mislabels an add as an opening buy.
 func (s *Store) ClassifiedEntries(wallet string) ([]ClassifiedEntry, error) {
 	rows, err := s.db.Query(`
-		SELECT event_id, token_address, side, token_amount, trade_time, received_at
+		SELECT event_id, token_address, side, token_amount, amount_usd, trade_time, received_at
 		FROM trade_events
 		WHERE wallet = ?
 		ORDER BY token_address, trade_time, received_at, event_id`, wallet)
@@ -36,29 +42,37 @@ func (s *Store) ClassifiedEntries(wallet string) ([]ClassifiedEntry, error) {
 	var curToken string
 	book := &positionBook{}
 	openTime := int64(0)
+	seenFullClose := false // per token: first observed episode is left-censored
 	for rows.Next() {
 		var id, token, side string
-		var amt, ts, received float64
-		if err := rows.Scan(&id, &token, &side, &amt, &ts, &received); err != nil {
+		var tokenAmt, usd, ts, received float64
+		if err := rows.Scan(&id, &token, &side, &tokenAmt, &usd, &ts, &received); err != nil {
 			return nil, err
 		}
 		if token != curToken {
 			curToken, openTime = token, int64(ts)
 			book.reset()
+			seenFullClose = false
 		}
 		if side == "buy" {
 			initial := book.isEmpty()
 			if initial {
 				openTime = int64(ts)
 			}
-			book.add(amt)
+			book.add(tokenAmt)
 			out = append(out, ClassifiedEntry{
 				EventID: id, Token: token, TradeTime: int64(ts), ReceivedAt: int64(received),
-				AmountUSD: amt, Initial: initial, SinceInitialSecs: int64(ts) - openTime,
+				TokenAmount: tokenAmt, AmountUSD: usd,
+				Initial: initial, SinceInitialSecs: int64(ts) - openTime,
+				// same left-censoring rule as episode reconstruction
+				OriginKnown: initial && seenFullClose,
 			})
 		} else {
-			book.sell(amt)
-			if book.belowZero() {
+			switch book.sell(tokenAmt) {
+			case Closed:
+				seenFullClose = true
+				book.reset()
+			case Oversold:
 				book.reset() // classification has no negative positions: next buy reopens
 			}
 		}
