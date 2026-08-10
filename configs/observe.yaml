@@ -1,0 +1,35 @@
+# FollowEdge observe-mode config (v0.1.0-observe)
+mode: observe
+chain: sol
+
+db_path: data/followedge.db
+
+gmgn:
+  base_url: https://openapi.gmgn.ai
+
+  smart_money:
+    enabled: true
+    poll_interval: 1s
+    limit: 200
+
+  kol:
+    enabled: true
+    poll_interval: 2s
+    limit: 200
+
+  limiter:
+    # shared token bucket + 429 cooldown gate.
+    # GMGN documents rate=20/capacity=20 (RPS = 20/weight) but bans the IP
+    # for minutes when exceeded (each retry inside the ban is +5s). We run
+    # conservative on purpose.
+    weight_per_second: 3
+    burst: 6
+
+cluster:
+  windows: ["30s", "60s", "5m", "15m"]
+
+markout:
+  tick: 30s        # sampling pass interval
+  grace: 30s       # extra wait past horizon before sampling
+  resolution: 30s  # kline resolution (finest the API offers)
+  horizons: ["30s", "1m", "3m", "5m", "15m", "1h"]

@@ -1,0 +1,163 @@
+# FollowEdge
+
+**Profit Actor Discovery & Strategy Replication Engine.**
+
+核心问题不是"哪些信号可以买"，而是：
+
+> 谁真实赚到了钱 → 他靠什么赚钱 → 这个 edge 是否可复制 → 我们能否在自己的延迟/资金/成本下复现？
+
+```text
+GMGN
+ │
+ ▼
+Collector (poll + dedup + restart-safe + IP-ban-safe)
+ │
+ ▼
+Event Database (SQLite, WAL)
+ │
+ ├──────────────► Actor Discovery  (谁在交易？)
+ │                    └── realized PnL / consistency / concentration / drawdown
+ │
+ ├──────────────► Actor Intelligence (Quality score)
+ │
+ ├──────────────► Markout Engine  (每笔交易的 forward return @ 30s..1h)
+ │                    └── Alpha Decay / chase / Replicability score
+ │
+ └──────────────► Cluster Engine (rolling windows, 供未来 mechanism mining)
+```
+
+**v0.1 定位：GMGN Profit Actor Research Engine。** 只做一件事：找到
+`profitable + consistent + copyable` 的 actor，用 `followedge actors rank`
+输出。不产生任何交易。
+
+## 两个分数，必须分开看
+
+| | 回答的问题 | 依据 |
+|---|---|---|
+| **Quality** (0-100) | 他赚到钱了吗？ | realized PnL（卖单 `amount_usd − buy_cost_usd`）、盈利日占比、top-1 代币集中度、日 PnL 曲线回撤 |
+| **Replicability** (0-100) | 我们晚 N 秒进场还能赚吗？ | 买单 markout 平均收益（参考 horizon）+ 样本量调整 |
+
+**Quality 高 ≠ 可以跟。** 彩票选手（一个代币赚 90% 的利润）会被
+concentration 降权；EV 已衰减的 wallet 会被 replicability 归零。
+
+## Quickstart
+
+```bash
+# 1. API key: $GMGN_API_KEY，或复用 ~/.config/gmgn/.env（gmgn-cli 的配置）
+export GMGN_API_KEY=...
+
+# 2. Build & collect（Ctrl-C 停止；--once 只跑一轮）
+make build
+bin/followedge collect --config configs/observe.yaml
+
+# 3. 研究
+bin/followedge status
+bin/followedge actors rank --horizon 60s          # 核心输出：找可复制 actor
+bin/followedge actors inspect <wallet>            # 单个 actor：PnL 事实 + alpha decay
+bin/followedge analyze latency                    # 数据源延迟分布（P50/P90/P95/P99）
+bin/followedge analyze chase --horizon 30s        # EV cliff 表
+bin/followedge analyze clusters --window 60s      # 钱包汇聚分布
+```
+
+## 命令
+
+| 命令 | 用途 |
+|---|---|
+| `collect` | 采集 smart money + KOL，去重入库，聚类，采样 markout |
+| `collect --once` | 每源单轮轮询（冒烟测试） |
+| `status` | 行数统计 |
+| `actors rank` | Actor 排行榜：Quality 与 Replicability 双轴 |
+| `actors inspect <wallet>` | 单个 actor 研究卡：PnL 事实 + 各 horizon EV 衰减 |
+| `analyze latency` | 源延迟分布（trade_time → received_at） |
+| `analyze chase` | 追价桶 vs 前向收益 —— EV cliff 表 |
+| `analyze clusters` | 窗口内 distinct wallet 汇聚分布 |
+| `version` | 版本 |
+
+## 真实数据长什么样（2 小时采集，Solana）
+
+```text
+SOURCE AGE (seconds: TradeTime -> ReceivedAt)
+wallet_type        N     mean      P50      P90      P95      P99
+kol              107    415.1    501.0    745.8    829.6    899.3
+smart_money      102    137.8    141.0    237.7    242.9    251.0
+
+CHASE @ 30s (markout return vs leader price)
+chase           N       WR        avg     median
+<0%           145     0.0%    -14.74%    -12.10%
+0-2%            9   100.0%     +1.12%     +1.20%
+2-5%           12   100.0%     +3.65%     +3.85%
+5-10%          18   100.0%     +7.66%     +7.67%
+10-20%         17   100.0%    +14.12%    +14.43%
+20%+           32   100.0%    +90.45%    +42.48%
+```
+
+注意：GMGN REST smart-money feed 中位延迟 **~140s**。任何"跟单"edge 都必须
+扛住这个延迟 —— 这正是 chase 表要量化的。当前样本量远不够下结论，先积累
+5,000+ events。
+
+## 与 GMGN API 相处的实测经验（2026-08 实测）
+
+1. **限流是 IP 级 ban**：`RATE_LIMIT_BANNED`（`"IP is temporarily banned
+   due to repeated rate limit..."`）。文档口径 rate=20/capacity=20（漏桶，
+   RPS = 20 ÷ weight；kline weight 2），但**冷却期内每个请求 +5s 延长**
+   封禁，最多 5 分钟。不要在 429 后重试。
+2. **全管线共享冷却闸**：任何请求 429 → 闸门关闭到 `reset_at`（未知则至少
+   30s），collector 和 markout worker 全部冻结。默认限速 3 weight/s（保守）。
+3. **kline 的 `from`/`to` 单位是毫秒**（skill 文档写秒是错的，传秒返回空
+   列表）。不传 from/to 时只返回最近 50 根蜡烛（30s 分辨率 ≈ 25 分钟）。
+4. IPv6 请求会被拒，client 强制 tcp4。
+
+## 设计决策（v0.1）
+
+| 灰区 | 决策 |
+|---|---|
+| realized PnL | GMGN 卖单自带 `buy_cost_usd`（原买入成本）→ `amount_usd − buy_cost_usd`，零额外 API 调用 |
+| markout 价格源 | GMGN 30s kline（公开 API 最细粒度），horizon ≥ 30s；更细需要链上价格源（v0.2 研究问题） |
+| dedup | 内存 TTL + DB `UNIQUE(event_id)` 双闸；只有 `created=true` 事件进管线 → 重启安全 |
+| cluster 状态 | 每次事件从 DB 重算并 append 快照，无内存态漂移 |
+| Quality/Replicability 公式 | v0.1 显式启发式（无 ML）：profit 线性到 $10k、盈利日占比、样本量、top1 集中度、日曲线回撤；EV 线性到 +10%、20 fills 满样本 |
+| event_id | `sha256(chain\|tx_hash\|wallet\|token\|side)[:16]` |
+
+## Roadmap
+
+| 版本 | 内容 |
+|---|---|
+| `v0.1.0-observe`（本版） | Actor 采集/排名（Quality+Replicability）、markout、chase、cluster、延迟分析 |
+| `v0.2.0-mechanism` | Mechanism Analyzer（他靠什么赚钱）、Hypothesis 注册、archetype 聚类 |
+| `v0.3.0-experiment` | Replay/Experiment Engine（train/val/test）、Strategy 血缘注册 |
+| `v0.4.0-shadow` | 实时 Shadow Copy + Strategy Clone |
+| `v0.5.0-paper` | PaperBroker、PositionManager、退出实验 |
+| `v0.6.0-live` | RiskEngine、kill switch、Tiny Live（`origin_*` 齐全才允许） |
+
+**纪律：** 任何策略必须带 `origin_actor / origin_evidence / origin_hypothesis /
+origin_experiment / historical / out_of_sample / shadow / paper` 结果，
+缺任何一环禁止 live。
+
+## 项目结构
+
+```text
+cmd/followedge/       CLI
+internal/domain/      归一化模型（source 无关）
+internal/source/gmgn/ GMGN OpenAPI adapter（全仓库唯一认识 GMGN 的地方）
+internal/collector/   轮询、限流（token bucket + 冷却闸）、dedup
+internal/cluster/     rolling-window 汇聚（未来 mechanism 特征输入）
+internal/markout/     forward-return 采样（alpha decay 原料）
+internal/analyze/     actors rank/inspect、latency、chase、clusters
+internal/storage/     SQLite (WAL) + 版本化迁移
+configs/              YAML 配置
+docs/                 架构与数据模型
+```
+
+## Testing
+
+```bash
+make test
+```
+
+覆盖：normalize（真实抓包 fixture）、dedup TTL、限流器（含冷却闸）、
+distinct-wallet 聚类、markout 采样、429 冻结管线、actor 聚合与评分。
+
+## Disclaimer
+
+研究工具。不构成投资建议。v0.1 不下任何订单 —— 在 markout 数据证明 edge
+扛得住延迟、滑点和手续费之前，也不应该下。
