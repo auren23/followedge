@@ -26,7 +26,7 @@ import (
 	"github.com/auren23/followedge/internal/storage"
 )
 
-const version = "0.1.0-observe"
+const version = "0.1.1-measurement"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -133,8 +133,15 @@ func cmdCollect(ctx context.Context, args []string) error {
 
 	pipeline := func(ctx context.Context, e domain.TradeEvent) error {
 		if e.PriceUSD > 0 {
-			if err := store.CreateMarkouts(e, horizons, time.Now().UTC()); err != nil {
-				slog.Warn("create markouts failed", "event", e.ID, "err", err)
+			// leader rows: base = trade_time, entry = leader's price
+			price := e.PriceUSD
+			if err := store.CreateMarkouts(e, storage.MarkoutLeader, &price, horizons, time.Now().UTC()); err != nil {
+				slog.Warn("create leader markouts failed", "event", e.ID, "err", err)
+			}
+			// follower rows: base = received_at, entry price sampled later —
+			// this is the measurement that replicability/chase must use
+			if err := store.CreateMarkouts(e, storage.MarkoutFollower, nil, horizons, time.Now().UTC()); err != nil {
+				slog.Warn("create follower markouts failed", "event", e.ID, "err", err)
 			}
 		}
 		if err := store.UpsertActor(e); err != nil {

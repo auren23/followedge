@@ -136,13 +136,15 @@ func actorRows(groups []storage.ActorGroup, buys map[string][]float64) map[strin
 }
 
 // Rank prints the actor leaderboard: profitable + consistent + copyable.
+// Quality uses realized PnL facts; Replicability uses FOLLOWER markouts
+// (entry at ReceivedAt) — leader markouts would measure the wrong question.
 func Rank(w io.Writer, s *storage.Store, since time.Time, horizon time.Duration, limit int, minTrades int) error {
 	groups, err := s.ActorGroups(since)
 	if err != nil {
 		return err
 	}
-	// buy markout returns per wallet at the reference horizon
-	markouts, err := s.MarkoutsAt(horizon)
+	// follower buy returns per wallet at the reference horizon
+	markouts, err := s.MarkoutsAt(storage.MarkoutFollower, horizon)
 	if err != nil {
 		return err
 	}
@@ -220,7 +222,7 @@ func Inspect(w io.Writer, s *storage.Store, wallet string, since time.Time, hori
 	fmt.Fprintf(w, "  top1 share:  %.0f%%   max drawdown: $%.0f\n", a.Top1Share*100, a.MaxDrawdown)
 	fmt.Fprintf(w, "  quality:     %.1f\n\n", a.Quality)
 
-	fmt.Fprintf(w, "ALPHA DECAY (mean markout return of buys, sample = fills)\n")
+	fmt.Fprintf(w, "ALPHA DECAY (follower: entry at ReceivedAt, mean return of buys)\n")
 	fmt.Fprintf(w, "%-10s %8s %8s %8s\n", "horizon", "fills", "avg", "WR")
 	for _, h := range horizons {
 		rets := buysAt(s, wallet, h)
@@ -236,12 +238,27 @@ func Inspect(w io.Writer, s *storage.Store, wallet string, since time.Time, hori
 		fmt.Fprintf(w, "%-10s %8d %+7.2f%% %7.1f%%\n", h.String(), len(rets), mean(rets),
 			float64(wins)/float64(len(rets))*100)
 	}
+
+	// the EV cliff in one line: does chasing kill this actor's edge?
+	const refHorizon = 5 * time.Minute
+	low := chaseConditionedEV(s, wallet, refHorizon, func(c float64) bool { return c <= 5 })
+	high := chaseConditionedEV(s, wallet, refHorizon, func(c float64) bool { return c > 10 })
+	if low.n > 0 || high.n > 0 {
+		fmt.Fprintf(w, "\nCHASE-CONDITIONED EV @ %v (follower)\n", refHorizon)
+		fmt.Fprintf(w, "%-14s %8s %10s\n", "condition", "N", "avg")
+		if low.n > 0 {
+			fmt.Fprintf(w, "%-14s %8d %+9.2f%%\n", "chase <= 5%", low.n, low.mean)
+		}
+		if high.n > 0 {
+			fmt.Fprintf(w, "%-14s %8d %+9.2f%%\n", "chase > 10%", high.n, high.mean)
+		}
+	}
 	return nil
 }
 
-// buysAt collects one wallet's filled buy markouts at a horizon.
+// buysAt collects one wallet's filled FOLLOWER buy markouts at a horizon.
 func buysAt(s *storage.Store, wallet string, horizon time.Duration) []float64 {
-	rows, err := s.MarkoutsAt(horizon)
+	rows, err := s.MarkoutsAt(storage.MarkoutFollower, horizon)
 	if err != nil {
 		return nil
 	}
@@ -252,4 +269,28 @@ func buysAt(s *storage.Store, wallet string, horizon time.Duration) []float64 {
 		}
 	}
 	return out
+}
+
+// chaseConditionedEV is the follower EV of a wallet's buys whose entry chase
+// satisfies the condition — "when I enter cheaply vs late, what happens".
+type condEV struct {
+	n    int
+	mean float64
+}
+
+func chaseConditionedEV(s *storage.Store, wallet string, horizon time.Duration, cond func(float64) bool) condEV {
+	rows, err := s.MarkoutsAt(storage.MarkoutFollower, horizon)
+	if err != nil {
+		return condEV{}
+	}
+	var rets []float64
+	for _, m := range rows {
+		if m.Wallet != wallet || m.Side != "buy" || !m.ReturnPct.Valid {
+			continue
+		}
+		if cond(m.ChasePct) {
+			rets = append(rets, m.ReturnPct.Float64)
+		}
+	}
+	return condEV{n: len(rets), mean: mean(rets)}
 }

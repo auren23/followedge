@@ -2,6 +2,8 @@
 
 **Profit Actor Discovery & Strategy Replication Engine.**
 
+版本：`v0.1.1-measurement`。
+
 核心问题不是"哪些信号可以买"，而是：
 
 > 谁真实赚到了钱 → 他靠什么赚钱 → 这个 edge 是否可复制 → 我们能否在自己的延迟/资金/成本下复现？
@@ -73,7 +75,7 @@ bin/followedge analyze clusters --window 60s      # 钱包汇聚分布
 | `analyze clusters` | 窗口内 distinct wallet 汇聚分布 |
 | `version` | 版本 |
 
-## 真实数据长什么样（2 小时采集，Solana）
+## 真实数据长什么样（2026-08-10 实测，Solana）
 
 ```text
 SOURCE AGE (seconds: TradeTime -> ReceivedAt)
@@ -81,19 +83,21 @@ wallet_type        N     mean      P50      P90      P95      P99
 kol              107    415.1    501.0    745.8    829.6    899.3
 smart_money      102    137.8    141.0    237.7    242.9    251.0
 
-CHASE @ 30s (markout return vs leader price)
+CHASE @ 30s — follower EV vs entry chase (entry = price at ReceivedAt)
 chase           N       WR        avg     median
-<0%           145     0.0%    -14.74%    -12.10%
-0-2%            9   100.0%     +1.12%     +1.20%
-2-5%           12   100.0%     +3.65%     +3.85%
-5-10%          18   100.0%     +7.66%     +7.67%
-10-20%         17   100.0%    +14.12%    +14.43%
-20%+           32   100.0%    +90.45%    +42.48%
+<0%            95    41.1%     -5.26%     -2.09%
+0-2%            3    66.7%    +18.22%     +3.31%
+2-5%            6    50.0%    +16.66%     +5.44%
+5-10%           5    40.0%     +0.86%     -0.03%
+10-20%          5    40.0%    -13.22%     -3.39%
+20%+            8    37.5%     -2.28%    -18.35%
 ```
 
-注意：GMGN REST smart-money feed 中位延迟 **~140s**。任何"跟单"edge 都必须
-扛住这个延迟 —— 这正是 chase 表要量化的。当前样本量远不够下结论，先积累
-5,000+ events。
+**测量口径（v0.1.1 起，见 docs/v0.1.1-measurement.md）**：`chase =
+入场价/leader价 − 1`（入场价 = 收到消息时刻的 kline 价格），`follower
+EV = horizon 后价格/入场价 − 1`。两个变量分离：分桶按 chase，统计按
+follower EV —— 回答"追多高就晚了"。GMGN REST 中位延迟 ~140s，任何
+edge 都必须扛住它。样本量远不够下结论，继续积累 5,000+ events。
 
 ## 与 GMGN API 相处的实测经验（2026-08 实测）
 
@@ -122,7 +126,8 @@ chase           N       WR        avg     median
 
 | 版本 | 内容 |
 |---|---|
-| `v0.1.0-observe`（本版） | Actor 采集/排名（Quality+Replicability）、markout、chase、cluster、延迟分析 |
+| `v0.1.0-observe` | Actor 采集/排名（Quality+Replicability）、markout、chase、cluster、延迟分析 |
+| `v0.1.1-measurement`（本版） | 测量口径修复：leader/follower markout 分离、chase 重定义、follower EV、buy_cost_usd 自洽性 |
 | `v0.2.0-mechanism` | Mechanism Analyzer（他靠什么赚钱）、Hypothesis 注册、archetype 聚类 |
 | `v0.3.0-experiment` | Replay/Experiment Engine（train/val/test）、Strategy 血缘注册 |
 | `v0.4.0-shadow` | 实时 Shadow Copy + Strategy Clone |

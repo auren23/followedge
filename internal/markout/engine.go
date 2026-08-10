@@ -60,12 +60,17 @@ type Engine struct {
 	grace    time.Duration
 	horizons []time.Duration
 	log      *slog.Logger
+
+	// tokens whose kline came back empty (dead / not trading): retry no
+	// sooner than this. Prevents stale rows from burning the tick budget.
+	skipUntil map[string]time.Time
 }
 
 func NewEngine(store *storage.Store, client *gmgn.Client, limiter weightLimiter,
 	chain, resolution string, grace time.Duration, horizons []time.Duration) *Engine {
 	return &Engine{store: store, client: client, limiter: limiter, chain: chain,
-		res: resolution, grace: grace, horizons: horizons, log: slog.With("pkg", "markout")}
+		res: resolution, grace: grace, horizons: horizons, log: slog.With("pkg", "markout"),
+		skipUntil: map[string]time.Time{}}
 }
 
 func (e *Engine) Horizons() []time.Duration { return e.horizons }
@@ -100,14 +105,19 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 
 	// group by token, keep per-markout due times
 	type target struct {
-		due     time.Time
-		event   string
-		horizon time.Duration
+		due       time.Time
+		event     string
+		kind      string
+		horizon   time.Duration
+		basePrice float64
+		baseMs    int64
 	}
 	byToken := map[string][]target{}
 	earliest := map[string]time.Time{}
 	for _, d := range due {
-		byToken[d.Token] = append(byToken[d.Token], target{d.DueAt, d.EventID, d.Horizon})
+		byToken[d.Token] = append(byToken[d.Token], target{
+			d.DueAt, d.EventID, d.Kind, d.Horizon, d.BasePrice, d.BaseMs,
+		})
 		if t, ok := earliest[d.Token]; !ok || d.DueAt.Before(t) {
 			earliest[d.Token] = d.DueAt
 		}
@@ -118,6 +128,9 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 	for token, targets := range byToken {
 		if tokensDone >= maxTokensPerTick {
 			break // rest retried next tick
+		}
+		if skip := e.skipUntil[token]; now.Before(skip) {
+			continue // dead token, backoff not elapsed
 		}
 		if err := e.limiter.Take(ctx, 2); err != nil { // kline weight = 2
 			return err
@@ -137,6 +150,12 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 			continue
 		}
 		tokensDone++
+		if len(candles) == 0 {
+			// no kline at all — token likely dead; don't burn budget on it
+			// again for a while
+			e.skipUntil[token] = now.Add(15 * time.Minute)
+			continue
+		}
 		// candle open times in unix seconds, ascending
 		times := make([]int64, len(candles))
 		closes := make([]float64, len(candles))
@@ -148,11 +167,25 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 			}
 		}
 		for _, t := range targets {
+			// follower rows need their ReceivedAt entry price first: the close
+			// of the candle IN PROGRESS at base_ms (what you could actually
+			// have traded at the moment you learned about the trade).
+			if t.kind == storage.MarkoutFollower && t.basePrice == 0 {
+				if p, ok := lastCloseAtOrBefore(times, closes, t.baseMs); ok && p > 0 {
+					if err := e.store.SetEntryPrice(t.event, t.kind, t.horizon, p); err != nil {
+						e.log.Warn("set entry price failed", "event", t.event, "err", err)
+					}
+					t.basePrice = p
+				}
+			}
+			if t.basePrice <= 0 {
+				continue // entry unknown; horizon return would be meaningless
+			}
 			obs, ok := firstCloseAtOrAfter(times, closes, t.due.Unix())
 			if !ok || obs <= 0 {
 				continue // no candle yet; next tick retries
 			}
-			if err := e.store.FillMarkout(t.event, t.horizon, obs); err != nil {
+			if err := e.store.FillMarkout(t.event, t.kind, t.horizon, obs); err != nil {
 				e.log.Warn("fill markout failed", "event", t.event, "horizon", t.horizon, "err", err)
 			}
 		}
@@ -168,4 +201,15 @@ func firstCloseAtOrAfter(times []int64, closes []float64, ts int64) (float64, bo
 		return 0, false
 	}
 	return closes[i], closes[i] > 0
+}
+
+// lastCloseAtOrBefore returns the close of the last candle opening at or
+// before ts — the candle in progress at ts. Used for follower entry prices:
+// the price you could actually have traded when the trade reached you.
+func lastCloseAtOrBefore(times []int64, closes []float64, ts int64) (float64, bool) {
+	i := sort.Search(len(times), func(i int) bool { return times[i] > ts })
+	if i == 0 {
+		return 0, false
+	}
+	return closes[i-1], closes[i-1] > 0
 }

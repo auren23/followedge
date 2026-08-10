@@ -2,6 +2,7 @@ package markout
 
 import (
 	"context"
+	"math"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -47,7 +48,7 @@ func TestSampleDueRateLimitFreezesPipeline(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("insert: %v %v", created, err)
 	}
-	if err := s.CreateMarkouts(ev, []time.Duration{30 * time.Second}, now); err != nil {
+	if err := s.CreateMarkouts(ev, storage.MarkoutLeader, &ev.PriceUSD, []time.Duration{30 * time.Second}, now); err != nil {
 		t.Fatal(err)
 	}
 
@@ -140,7 +141,8 @@ func TestSampleDue(t *testing.T) {
 	if err != nil || !created {
 		t.Fatalf("insert: %v %v", created, err)
 	}
-	if err := s.CreateMarkouts(ev, []time.Duration{30 * time.Second, 1 * time.Minute}, now); err != nil {
+	price := ev.PriceUSD
+	if err := s.CreateMarkouts(ev, storage.MarkoutLeader, &price, []time.Duration{30 * time.Second, 1 * time.Minute}, now); err != nil {
 		t.Fatal(err)
 	}
 
@@ -162,12 +164,12 @@ func TestSampleDue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rows, err := s.MarkoutsAt(30 * time.Second)
+	rows, err := s.MarkoutsAt(storage.MarkoutLeader, 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(rows) != 1 || !rows[0].ReturnPct.Valid {
-		t.Fatalf("expected 1 filled 30s markout, got %+v", rows)
+		t.Fatalf("expected 1 filled 30s leader markout, got %+v", rows)
 	}
 	// due = trade_time+30s; observed = close of first candle at/after due.
 	// Recompute the expectation from the same arrays instead of hardcoding
@@ -179,5 +181,72 @@ func TestSampleDue(t *testing.T) {
 	wantRet := (want/ev.PriceUSD - 1) * 100
 	if got := rows[0].ReturnPct.Float64; got != wantRet {
 		t.Errorf("30s markout return = %.2f%%, want %.2f%%", got, wantRet)
+	}
+}
+
+// TestSampleDueFollower verifies the v0.1.1 measurement split: follower rows
+// base at ReceivedAt (entry price sampled from klines → chase), and their
+// return is measured from THAT entry, not the leader's price.
+func TestSampleDueFollower(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	tradeTime := now.Add(-7 * time.Minute)
+	received := now.Add(-5 * time.Minute) // 2-minute GMGN delay
+	ev := domain.TradeEvent{
+		ID:     domain.EventID("sol", "txf", "W1", "TOKEN_F", "buy"),
+		Source: "gmgn_smartmoney", Chain: "sol", TxHash: "txf",
+		Wallet: "W1", WalletType: domain.WalletSmartMoney,
+		TokenAddress: "TOKEN_F", Side: domain.Buy, AmountUSD: 100, PriceUSD: 1.00,
+		TradeTime: tradeTime, ReceivedAt: received,
+	}
+	created, err := s.InsertEvent(ev)
+	if err != nil || !created {
+		t.Fatalf("insert: %v %v", created, err)
+	}
+	if err := s.CreateMarkouts(ev, storage.MarkoutFollower, nil, []time.Duration{30 * time.Second}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// candles every 30s: base(1.00) → recv-aligned(1.10, entry) → +30s(1.20) → +60s(1.30, exit)
+	// entry = last candle open <= received (the one in progress), 1.10
+	// 30s exit = first candle open >= received+30s → 1.30
+	base := received.Truncate(30 * time.Second).Add(-30 * time.Second)
+	fc := &fakeClient{candles: []gmgn.Candle{
+		{Time: base.UnixMilli(), Close: "1.00"},
+		{Time: base.Add(30 * time.Second).UnixMilli(), Close: "1.10"},
+		{Time: base.Add(60 * time.Second).UnixMilli(), Close: "1.20"},
+		{Time: base.Add(90 * time.Second).UnixMilli(), Close: "1.30"},
+	}}
+	eng := NewEngine(s, nil, noopLimiter{}, "sol", "30s", 0, []time.Duration{30 * time.Second})
+	eng.client = fc
+	if err := eng.SampleDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.MarkoutsAt(storage.MarkoutFollower, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || !rows[0].ReturnPct.Valid {
+		t.Fatalf("expected 1 filled follower markout, got %+v", rows)
+	}
+	m := rows[0]
+	if m.BasePrice != 1.10 {
+		t.Errorf("follower entry price = %v, want 1.10 (price at ReceivedAt)", m.BasePrice)
+	}
+	if math.Abs(m.ChasePct-10) > 0.001 {
+		t.Errorf("chase = %.4f%%, want ~10%% (entry 1.10 vs leader 1.00)", m.ChasePct)
+	}
+	wantRet := (1.30/1.10 - 1) * 100
+	if math.Abs(m.ReturnPct.Float64-wantRet) > 0.001 {
+		t.Errorf("follower return = %.4f%%, want ~%.4f%% (from entry, not leader price)", m.ReturnPct.Float64, wantRet)
+	}
+	if m.LeaderPrice != 1.00 {
+		t.Errorf("leader price = %v, want 1.00", m.LeaderPrice)
 	}
 }

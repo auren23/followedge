@@ -8,12 +8,13 @@ import (
 	"github.com/auren23/followedge/internal/storage"
 )
 
-// Chase prints the core research table: for each chase bucket (how much the
-// price had already moved by the time a copy-trader could enter), the sample
-// size, win rate and average/median forward return. The EV cliff — where the
-// bucket stops paying — is the project's central finding.
+// Chase prints the core research table: chase bucket (how much the price had
+// already moved by the time a follower could enter — entry/leader − 1) vs
+// the follower's forward return at that horizon. The two variables are
+// deliberately distinct: bucketing by chase and averaging the follower
+// return answers "how late is too late?" (the EV cliff).
 func Chase(w io.Writer, s *storage.Store, horizon time.Duration, side string) error {
-	rows, err := s.MarkoutsAt(horizon)
+	rows, err := s.MarkoutsAt(storage.MarkoutFollower, horizon)
 	if err != nil {
 		return err
 	}
@@ -25,11 +26,11 @@ func Chase(w io.Writer, s *storage.Store, horizon time.Duration, side string) er
 		if side != "" && m.Side != side {
 			continue
 		}
-		b := Bucket(m.ReturnPct.Float64)
+		b := Bucket(m.ChasePct)
 		buckets[b] = append(buckets[b], m.ReturnPct.Float64)
 	}
 	order := []string{"<0%", "0-2%", "2-5%", "5-10%", "10-20%", "20%+"}
-	fmt.Fprintf(w, "CHASE @ %v (markout return vs leader price)\n", horizon)
+	fmt.Fprintf(w, "CHASE @ %v — follower EV vs entry chase (entry = price at ReceivedAt)\n", horizon)
 	fmt.Fprintf(w, "%-8s %8s %8s %10s %10s\n", "chase", "N", "WR", "avg", "median")
 	totalN := 0
 	for _, b := range order {
@@ -47,7 +48,7 @@ func Chase(w io.Writer, s *storage.Store, horizon time.Duration, side string) er
 		fmt.Fprintf(w, "%-8s %8d %7.1f%% %+9.2f%% %+9.2f%%\n",
 			b, len(a), float64(wins)/float64(len(a))*100, mean(a), median(a))
 	}
-	fmt.Fprintf(w, "\n%d filled markouts at %v\n", totalN, horizon)
+	fmt.Fprintf(w, "\n%d filled follower markouts at %v\n", totalN, horizon)
 	return nil
 }
 
