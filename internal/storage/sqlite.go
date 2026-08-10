@@ -68,15 +68,11 @@ func Open(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// DB exposes the raw handle for tests and diagnostics.
+func (s *Store) DB() *sql.DB { return s.db }
+
 func (s *Store) migrate() error {
 	if _, err := s.db.Exec("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)"); err != nil {
-		return err
-	}
-	var cur int
-	err := s.db.QueryRow("SELECT version FROM schema_version").Scan(&cur)
-	if err == sql.ErrNoRows {
-		cur = 0
-	} else if err != nil {
 		return err
 	}
 
@@ -87,10 +83,40 @@ func (s *Store) migrate() error {
 		return err
 	}
 	names := make([]string, 0, len(dirs))
+	maxVer := 0
 	for _, d := range dirs {
 		names = append(names, d.Name())
+		if ver, err := strconv.Atoi(d.Name()[:3]); err == nil && ver > maxVer {
+			maxVer = ver
+		}
 	}
 	sort.Strings(names)
+
+	var cur int
+	err = s.db.QueryRow("SELECT version FROM schema_version").Scan(&cur)
+	if err == sql.ErrNoRows {
+		// no version row: seed it. Without a row every UPDATE below affects
+		// 0 rows and the whole set re-runs on every Open, crashing on
+		// "table already exists" the second time a db is opened.
+		// A pre-existing db (trade_events present) was built in that buggy
+		// era and already has every migration applied — pin it to maxVer.
+		var n int
+		if err := s.db.QueryRow(
+			"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='trade_events'").Scan(&n); err != nil {
+			return err
+		}
+		if n > 0 {
+			cur = maxVer
+		} else {
+			cur = 0
+		}
+		if _, err := s.db.Exec("INSERT INTO schema_version (version) VALUES (?)", cur); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+
 	for _, name := range names {
 		ver, err := strconv.Atoi(name[:3])
 		if err != nil {

@@ -82,6 +82,17 @@ func NewEngine(store *storage.Store, client *gmgn.Client, limiter weightLimiter,
 
 func (e *Engine) Horizons() []time.Duration { return e.horizons }
 
+// target is one (event, kind, horizon) waiting for a price in the current
+// pass. Package-level because Engine.markStatus consumes it.
+type target struct {
+	due       time.Time
+	event     string
+	kind      string
+	horizon   time.Duration
+	basePrice float64
+	baseMs    int64
+}
+
 // Run ticks forever: sample everything that became due since the last tick.
 func (e *Engine) Run(ctx context.Context, tick time.Duration) {
 	for {
@@ -110,15 +121,6 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 	// kline requests per tick — a batch of stale events must not spike the API.
 	const maxTokensPerTick = 25
 
-	// group by token, keep per-markout due times
-	type target struct {
-		due       time.Time
-		event     string
-		kind      string
-		horizon   time.Duration
-		basePrice float64
-		baseMs    int64
-	}
 	byToken := map[string][]target{}
 	earliest := map[string]time.Time{}
 	for _, d := range due {
@@ -143,7 +145,11 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 		if err := e.limiter.Take(ctx, 2); err != nil { // kline weight = 2
 			return err
 		}
-		candles, err := e.client.Kline(ctx, e.chain, token, e.res, earliest[token].Add(-30*time.Second), now)
+		// kline window starts 2 resolutions before the earliest due time of
+		// this token: the minimum horizon (1 res) + 1 closed candle for the
+		// follower entry (lastCloseAtOrBefore needs open <= baseMs − res).
+		lookback := 2 * time.Duration(e.resSecs) * time.Second
+		candles, err := e.client.Kline(ctx, e.chain, token, e.res, earliest[token].Add(-lookback), now)
 		if err != nil {
 			if rl, ok := err.(*gmgn.RateLimitError); ok {
 				// freeze the entire pipeline until the ban lifts; do NOT retry
@@ -151,17 +157,21 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 				e.limiter.MarkCooldown(rl.ResetAt)
 				e.log.Warn("kline rate limited, cooling down", "token", token,
 					"reset", rl.ResetAt.Format(time.RFC3339))
+				e.markStatus(targets, storage.MarkoutStatusRateLimited)
 				break // gate is shut; no point fetching more tokens this tick
 			} else {
 				e.log.Warn("kline fetch failed", "token", token, "err", err)
+				e.markStatus(targets, storage.MarkoutStatusAPIError)
 			}
 			continue
 		}
 		tokensDone++
 		if len(candles) == 0 {
 			// no kline at all — token likely dead; don't burn budget on it
-			// again for a while
+			// again for a while. Market outcome, not measurement failure:
+			// the token has no price stream at all.
 			e.skipUntil[token] = now.Add(15 * time.Minute)
+			e.markStatus(targets, storage.MarkoutStatusTokenInactive)
 			continue
 		}
 		// candle open times in unix seconds, ascending
@@ -184,6 +194,9 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 				if !ok {
 					p, open, found := lastCloseAtOrBefore(times, closes, t.baseMs-e.resSecs)
 					if !found || p <= 0 {
+						// entry candle out of the fetched window (or unparseable) —
+						// retryable: a later pass fetches a longer window.
+						e.markStatus([]target{t}, storage.MarkoutStatusLookbackMiss)
 						continue
 					}
 					ep = entryPrice{price: p, observedAt: time.Unix(open+e.resSecs, 0).UTC()}
@@ -195,11 +208,16 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 				t.basePrice = ep.price
 			}
 			if t.basePrice <= 0 {
+				e.markStatus([]target{t}, storage.MarkoutStatusLookbackMiss)
 				continue // entry unknown; horizon return would be meaningless
 			}
 			obs, ok := firstCloseAtOrAfter(times, closes, t.due.Unix())
 			if !ok || obs <= 0 {
-				continue // no candle yet; next tick retries
+				// the kline window covers the due time (it starts 2 res before
+				// the earliest due) but no candle opens there — the candle
+				// stream ended before the horizon: the token stopped trading.
+				e.markStatus([]target{t}, storage.MarkoutStatusNoCandle)
+				continue
 			}
 			if err := e.store.FillMarkout(t.event, t.kind, t.horizon, obs); err != nil {
 				e.log.Warn("fill markout failed", "event", t.event, "horizon", t.horizon, "err", err)
@@ -207,6 +225,17 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// markStatus labels rows with why they could not be filled. Sticky market
+// statuses (no_candle, token_inactive) survive later transient failures;
+// transient ones get overwritten by whatever the next pass observes.
+func (e *Engine) markStatus(targets []target, status string) {
+	for _, t := range targets {
+		if err := e.store.SetMarkoutStatus(t.event, t.kind, t.horizon, status); err != nil {
+			e.log.Warn("set markout status failed", "event", t.event, "status", status, "err", err)
+		}
+	}
 }
 
 // entryPrice is a follower entry sampled from klines, with the instant it

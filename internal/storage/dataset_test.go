@@ -158,3 +158,96 @@ func TestRebuildEpisodes(t *testing.T) {
 		t.Errorf("W pnl = %v, want -100", pnlW)
 	}
 }
+
+// TestMigration007BackfillsFilled simulates the v0.1.3 → v0.1.3.1 upgrade:
+// rows already priced before v6's status column existed were left 'pending'
+// and must be backfilled to 'filled', or coverage numerators undercount.
+func TestMigration007BackfillsFilled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "upgrade.db")
+
+	// 1. build a current schema db with a priced row
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	ev := domain.TradeEvent{
+		ID:     domain.EventID("sol", "upg", "W", "TOKEN_UP", "buy"),
+		Source: "gmgn_smartmoney", Chain: "sol", TxHash: "upg",
+		Wallet: "W", WalletType: domain.WalletSmartMoney,
+		TokenAddress: "TOKEN_UP", Side: domain.Buy, AmountUSD: 10, PriceUSD: 1.0,
+		TradeTime: now.Add(-5 * time.Minute), ReceivedAt: now.Add(-5 * time.Minute),
+	}
+	created, err := s.InsertEvent(ev)
+	if err != nil || !created {
+		t.Fatalf("insert: %v %v", created, err)
+	}
+	price := 1.0
+	if err := s.CreateMarkouts(ev, MarkoutLeader, &price, []time.Duration{30 * time.Second}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.FillMarkout(ev.ID, MarkoutLeader, 30*time.Second, 1.1); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. simulate the v6-era state: status stuck on 'pending' for already
+	//    priced rows, schema_version rolled back so 007 re-runs on reopen
+	if _, err := s.db.Exec(`UPDATE markouts SET status = 'pending'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE schema_version SET version = 6`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	// 3. reopen: migration 007 must backfill the priced row to 'filled'
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	var st string
+	if err := s2.db.QueryRow(`SELECT status FROM markouts WHERE event_id = ?`, ev.ID).Scan(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st != MarkoutStatusFilled {
+		t.Errorf("pre-v6 priced row status = %q after upgrade, want %q", st, MarkoutStatusFilled)
+	}
+	// and coverage must count it as filled
+	filled, due, err := s2.DueCoverage(MarkoutLeader, 30*time.Second, 0, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filled != 1 || due != 1 {
+		t.Errorf("coverage after upgrade = %d/%d, want 1/1", filled, due)
+	}
+}
+
+// TestOpenBugEraDB pins the migration-bug fix: a db created before version
+// tracking worked has tables but NO schema_version row. Opening it must pin
+// the version to the latest migration (all were applied in that era), not
+// re-run everything and crash on "table already exists".
+func TestOpenBugEraDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "bugera.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM schema_version`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	s2, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen bug-era db: %v", err)
+	}
+	defer s2.Close()
+	var ver int
+	if err := s2.db.QueryRow(`SELECT version FROM schema_version`).Scan(&ver); err != nil {
+		t.Fatal(err)
+	}
+	if ver != 7 {
+		t.Errorf("bug-era db pinned to version %d, want 7", ver)
+	}
+}

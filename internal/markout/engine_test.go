@@ -122,6 +122,19 @@ func (f *fakeClient) Kline(ctx context.Context, chain, address, resolution strin
 	return f.candles, nil
 }
 
+// recordingClient wraps fakeClient and records the kline window it was asked
+// for, so tests can assert the lookback starts exactly 2 resolutions before
+// the earliest due time.
+type recordingClient struct {
+	fake fakeClient
+	from time.Time
+}
+
+func (r *recordingClient) Kline(ctx context.Context, chain, address, resolution string, from, to time.Time) ([]gmgn.Candle, error) {
+	r.from = from
+	return r.fake.Kline(ctx, chain, address, resolution, from, to)
+}
+
 func TestSampleDue(t *testing.T) {
 	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -182,6 +195,171 @@ func TestSampleDue(t *testing.T) {
 	if got := rows[0].ReturnPct.Float64; got != wantRet {
 		t.Errorf("30s markout return = %.2f%%, want %.2f%%", got, wantRet)
 	}
+}
+
+// TestSampleDueLookback pins the P1 fix: the kline window must start 2
+// resolutions before the earliest due time (min horizon 1 res + 1 closed
+// candle for the follower entry), not the hardcoded 1 resolution.
+func TestSampleDueLookback(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	received := now.Add(-5 * time.Minute)
+	ev := domain.TradeEvent{
+		ID:     domain.EventID("sol", "txlb", "W1", "TOKEN_LB", "buy"),
+		Source: "gmgn_smartmoney", Chain: "sol", TxHash: "txlb",
+		Wallet: "W1", WalletType: domain.WalletSmartMoney,
+		TokenAddress: "TOKEN_LB", Side: domain.Buy, AmountUSD: 100, PriceUSD: 1.00,
+		TradeTime: received, ReceivedAt: received,
+	}
+	created, err := s.InsertEvent(ev)
+	if err != nil || !created {
+		t.Fatalf("insert: %v %v", created, err)
+	}
+	if err := s.CreateMarkouts(ev, storage.MarkoutFollower, nil, []time.Duration{30 * time.Second}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// entry candle at ReceivedAt-30s (closes at ReceivedAt), exit candle at
+	// ReceivedAt+30s (due).
+	b := received.Truncate(30 * time.Second)
+	rc := &recordingClient{fake: fakeClient{candles: []gmgn.Candle{
+		{Time: b.Add(-30 * time.Second).UnixMilli(), Close: "1.00"},
+		{Time: b.UnixMilli(), Close: "1.00"},
+		{Time: b.Add(30 * time.Second).UnixMilli(), Close: "1.10"},
+	}}}
+	eng := NewEngine(s, nil, noopLimiter{}, "sol", "30s", 0, []time.Duration{30 * time.Second})
+	eng.client = rc
+	if err := eng.SampleDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// earliest due = ReceivedAt(sec-truncated) + 30s → window starts at
+	// ReceivedAt(sec-truncated) − 30s (2 resolutions before earliest due)
+	wantFrom := time.Unix(received.Unix()-30, 0)
+	if !rc.from.Equal(wantFrom) {
+		t.Errorf("kline window starts %v, want %v (2 resolutions before earliest due)", rc.from, wantFrom)
+	}
+}
+
+// TestSampleDueStatuses pins every failure branch classifies its rows:
+// empty candles → token_inactive, candle stream ending before the horizon →
+// no_candle, follower entry out of window → lookback_miss.
+func TestSampleDueStatuses(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	mkLeader := func(id, token string) {
+		base := now.Add(-5 * time.Minute).Truncate(30 * time.Second).Add(15 * time.Second)
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W1", token, "buy"),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W1", WalletType: domain.WalletSmartMoney,
+			TokenAddress: token, Side: domain.Buy, AmountUSD: 100, PriceUSD: 1.00,
+			TradeTime: base, ReceivedAt: base,
+		}
+		created, err := s.InsertEvent(ev)
+		if err != nil || !created {
+			t.Fatalf("insert %s: %v %v", id, created, err)
+		}
+		price := ev.PriceUSD
+		if err := s.CreateMarkouts(ev, storage.MarkoutLeader, &price, []time.Duration{30 * time.Second}, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mkFollower := func(id, token string) {
+		base := now.Add(-5 * time.Minute).Truncate(30 * time.Second).Add(15 * time.Second)
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W1", token, "buy"),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W1", WalletType: domain.WalletSmartMoney,
+			TokenAddress: token, Side: domain.Buy, AmountUSD: 100, PriceUSD: 1.00,
+			TradeTime: base, ReceivedAt: base,
+		}
+		created, err := s.InsertEvent(ev)
+		if err != nil || !created {
+			t.Fatalf("insert %s: %v %v", id, created, err)
+		}
+		if err := s.CreateMarkouts(ev, storage.MarkoutFollower, nil, []time.Duration{30 * time.Second}, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// TOKEN_A: no kline at all → token_inactive
+	mkLeader("a1", "TOKEN_A")
+	// TOKEN_B: candle stream ends before the horizon → no_candle
+	mkLeader("b1", "TOKEN_B")
+	b := now.Add(-5 * time.Minute).Truncate(30 * time.Second)
+	// TOKEN_C: follower entry candle out of window → lookback_miss
+	mkFollower("c1", "TOKEN_C")
+	// TOKEN_D: healthy → filled (control)
+	mkLeader("d1", "TOKEN_D")
+
+	eng := NewEngine(s, nil, noopLimiter{}, "sol", "30s", 0, []time.Duration{30 * time.Second})
+	eng.client = &tokenCannedClient{byToken: map[string][]gmgn.Candle{
+		// B: opens at b and b+30s; due = base+30s = b+45s → no candle at/after due
+		"TOKEN_B": {
+			{Time: b.UnixMilli(), Close: "1.00"},
+			{Time: b.Add(30 * time.Second).UnixMilli(), Close: "1.10"},
+		},
+		// C: candles only start at base+60s → entry (needs open <= base−30s) missing
+		"TOKEN_C": {
+			{Time: b.Add(60 * time.Second).UnixMilli(), Close: "1.20"},
+		},
+		// D: full stream, fills normally
+		"TOKEN_D": {
+			{Time: b.UnixMilli(), Close: "1.00"},
+			{Time: b.Add(30 * time.Second).UnixMilli(), Close: "1.10"},
+			{Time: b.Add(60 * time.Second).UnixMilli(), Close: "1.20"},
+		},
+	}}
+	if err := eng.SampleDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	want := map[string]string{
+		"TOKEN_A": storage.MarkoutStatusTokenInactive,
+		"TOKEN_B": storage.MarkoutStatusNoCandle,
+		"TOKEN_C": storage.MarkoutStatusLookbackMiss,
+	}
+	for token, st := range want {
+		var got string
+		err := s.DB().QueryRow(`
+			SELECT m.status FROM markouts m
+			JOIN trade_events e ON e.event_id = m.event_id
+			WHERE e.token_address = ? AND m.horizon_ms = 30000`, token).Scan(&got)
+		if err != nil {
+			t.Fatalf("%s: %v", token, err)
+		}
+		if got != st {
+			t.Errorf("%s status = %s, want %s", token, got, st)
+		}
+	}
+	// control: TOKEN_D filled
+	rows, err := s.MarkoutsAt(storage.MarkoutLeader, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || !rows[0].ReturnPct.Valid {
+		t.Errorf("control TOKEN_D not filled: %+v", rows)
+	}
+}
+
+// tokenCannedClient serves per-token candle sets (empty map entry = empty stream).
+type tokenCannedClient struct {
+	byToken map[string][]gmgn.Candle
+}
+
+func (t *tokenCannedClient) Kline(ctx context.Context, chain, address, resolution string, from, to time.Time) ([]gmgn.Candle, error) {
+	return t.byToken[address], nil
 }
 
 // TestSampleDueFollower verifies the measurement split AND the P0.5 fix:

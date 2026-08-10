@@ -60,9 +60,10 @@ type DueMarkout struct {
 //     horizon price
 func (s *Store) DueMarkouts(grace time.Duration, now time.Time, limit int) ([]DueMarkout, error) {
 	cutoff := now.Add(-grace).Unix()
-	// follower rows first (the measurement that matters), retryable misses
-	// next (they can still recover), then newest first — stale leader rows
-	// from dead tokens must not starve fresh data.
+	// follower rows first (the measurement that matters), transient failures
+	// next (api_error/rate_limited/lookback_miss can still recover, and a
+	// fresh kline window is most likely to fix them), then newest first —
+	// stale leader rows from dead tokens must not starve fresh data.
 	rows, err := s.db.Query(`
 		SELECT m.event_id, m.kind, m.horizon_ms, m.base_price, m.base_ms,
 		       e.token_address
@@ -70,7 +71,8 @@ func (s *Store) DueMarkouts(grace time.Duration, now time.Time, limit int) ([]Du
 		JOIN trade_events e ON e.event_id = m.event_id
 		WHERE m.observed_price IS NULL
 		  AND m.base_ms + m.horizon_ms/1000 <= ?
-		ORDER BY (m.kind = 'follower') DESC, (m.status = 'lookback_miss') DESC,
+		ORDER BY (m.kind = 'follower') DESC,
+		         (m.status IN ('lookback_miss','api_error','rate_limited')) DESC,
 		         m.base_ms + m.horizon_ms/1000 DESC
 		LIMIT ?`, cutoff, limit)
 	if err != nil {
@@ -130,15 +132,20 @@ func (s *Store) FillMarkout(eventID, kind string, horizon time.Duration, observe
 	return err
 }
 
-// SetMarkoutStatus records why a row could not be filled. Terminal statuses
-// (no_candle, token_inactive, ...) are sticky; lookback_miss is RETRYABLE —
-// the kline window may simply have been too short, and a later pass can
-// succeed (the horizon price then fills and overwrites the status).
+// SetMarkoutStatus records why a row could not be filled.
+//
+// Statuses split into two dimensions (see MarkoutStatus* consts):
+//   - market outcome (no_candle, token_inactive) is STICKY — a dead token
+//     stays dead, and only a later successful fill overwrites it;
+//   - measurement failure (api_error, rate_limited, lookback_miss) is
+//     RETRYABLE — a later pass may recover (a fresh kline window, the 429
+//     gate reopening), so any of these can be overwritten by any other
+//     status, including another failure reason.
 func (s *Store) SetMarkoutStatus(eventID, kind string, horizon time.Duration, status string) error {
 	_, err := s.db.Exec(`
 		UPDATE markouts SET status = ?
 		WHERE event_id = ? AND kind = ? AND horizon_ms = ?
-		  AND status IN ('pending','lookback_miss')`,
+		  AND status IN ('pending','lookback_miss','api_error','rate_limited')`,
 		status, eventID, kind, horizon.Milliseconds())
 	return err
 }
@@ -198,7 +205,7 @@ func (s *Store) MarkoutsAt(kind string, horizon time.Duration) ([]MarkoutStat, e
 	return out, rows.Err()
 }
 
-// CensusRow is one markout row regardless of fill status — the input for
+// CensusRow is one DUE markout row regardless of fill status — the input for
 // coverage-aware EV (selection bias guard).
 type CensusRow struct {
 	EventID       string
@@ -211,18 +218,23 @@ type CensusRow struct {
 	Status        string
 	BasePrice     float64
 	LeaderPrice   float64
+	Side          string
 }
 
-// MarkoutCensus returns every row of one kind at one horizon, filled or not.
-func (s *Store) MarkoutCensus(kind string, horizon time.Duration) ([]CensusRow, error) {
+// MarkoutCensus returns every DUE row of one kind at one horizon, filled or
+// not. Rows whose sampling time (plus grace) has not passed are excluded —
+// counting them would dilute coverage with rows that are simply not ripe yet.
+func (s *Store) MarkoutCensus(kind string, horizon, grace time.Duration, now time.Time) ([]CensusRow, error) {
+	cutoff := now.Add(-grace).Unix()
 	rows, err := s.db.Query(`
 		SELECT m.event_id, e.wallet_type, e.trade_time, e.received_at,
 		       m.base_ms, m.horizon_ms, m.observed_price, m.status,
-		       m.base_price, e.price_usd
+		       m.base_price, e.price_usd, e.side
 		FROM markouts m
 		JOIN trade_events e ON e.event_id = m.event_id
-		WHERE m.kind = ? AND m.horizon_ms = ?`,
-		kind, horizon.Milliseconds())
+		WHERE m.kind = ? AND m.horizon_ms = ?
+		  AND m.base_ms + m.horizon_ms/1000 <= ?`,
+		kind, horizon.Milliseconds(), cutoff)
 	if err != nil {
 		return nil, err
 	}
@@ -233,7 +245,8 @@ func (s *Store) MarkoutCensus(kind string, horizon time.Duration) ([]CensusRow, 
 		var obs sql.NullFloat64
 		var base sql.NullFloat64
 		if err := rows.Scan(&r.EventID, &r.WalletType, &r.TradeTime, &r.ReceivedAt,
-			&r.BaseMs, &r.HorizonMs, &obs, &r.Status, &base, &r.LeaderPrice); err != nil {
+			&r.BaseMs, &r.HorizonMs, &obs, &r.Status, &base, &r.LeaderPrice,
+			&r.Side); err != nil {
 			return nil, err
 		}
 		if obs.Valid {

@@ -29,7 +29,10 @@ func ageBucket(secs float64) string {
 
 var ageOrder = []string{"0-30s", "30-60s", "60-120s", "120-180s", "180-300s", "300s+"}
 
-var chaseCols = []string{"<0%", "0-5%", "5-10%", "10-20%", "20%+"}
+var chaseCols = []string{"<0%", "0-5%", "5-10%", "10-20%", "20%+", "n/a"}
+
+// n/a marks rows whose chase is not computable (entry price unknown) — they
+// must stay visible in the by-chase matrix, not vanish from its totals.
 
 // chaseCol maps a chase percentage to the matrix column.
 func chaseCol(pct float64) string {
@@ -52,17 +55,29 @@ func chaseCol(pct float64) string {
 // (filled or not), so coverage and a conservative EV (unpriced samples
 // assumed to lose noExitLoss%) are reported alongside the observed EV.
 // This is the selection-bias guard — excluding dead tokens silently would
-// flatter the edge.
+// LatencyEV answers the project's central open question: does any copyable
+// edge survive a 140s REST feed? Census-driven: EVERY due row is bucketed
+// (filled or not), so coverage and a conservative EV are reported alongside
+// the observed EV. This is the selection-bias guard — excluding dead tokens
+// silently would flatter the edge.
+//
+// Statuses split into two dimensions: MARKET outcome (filled, no_candle,
+// token_inactive — and due-but-unclassified rows, conservatively) enters the
+// cons-EV denominator; MEASUREMENT failure (api_error, rate_limited,
+// lookback_miss, parse_error) is coverage loss, not trade loss, and is
+// reported in the meas column instead. A 429 is not a -100% trade.
 func LatencyEV(w io.Writer, s *storage.Store, horizon time.Duration, side string,
-	byChase bool, noExitLoss float64) error {
-	rows, err := s.MarkoutCensus(storage.MarkoutFollower, horizon)
+	byChase bool, noExitLoss float64, grace time.Duration) error {
+	rows, err := s.MarkoutCensus(storage.MarkoutFollower, horizon, grace, time.Now().UTC())
 	if err != nil {
 		return err
 	}
 
 	type cell struct {
-		due    int
-		filled int
+		due    int // all due rows (denominator of coverage)
+		filled int // priced with a computable return
+		market int // market-outcome rows (filled + dead tokens + unclassified)
+		meas   int // measurement failures (excluded from cons EV)
 		rets   []float64
 	}
 
@@ -71,14 +86,16 @@ func LatencyEV(w io.Writer, s *storage.Store, horizon time.Duration, side string
 	cells := map[key]*cell{}
 	types := []string{}
 	for _, r := range rows {
-		if side != "" {
-			// census is side-blind; side filtering happens at query time for
-			// the returns, but coverage must count ALL rows regardless
-			_ = side
+		if side != "" && r.Side != side {
+			continue // --side is a real filter: the whole bucket is side-only
 		}
 		k := key{r.WalletType, ageBucket(float64(r.ReceivedAt - r.TradeTime)), ""}
-		if byChase && r.BasePrice > 0 && r.LeaderPrice > 0 {
-			k.col = chaseCol((r.BasePrice/r.LeaderPrice - 1) * 100)
+		if byChase {
+			if r.BasePrice > 0 && r.LeaderPrice > 0 {
+				k.col = chaseCol((r.BasePrice/r.LeaderPrice - 1) * 100)
+			} else {
+				k.col = "n/a" // entry unknown: chase not computable, keep visible
+			}
 		}
 		cl := cells[k]
 		if cl == nil {
@@ -89,9 +106,17 @@ func LatencyEV(w io.Writer, s *storage.Store, horizon time.Duration, side string
 			}
 		}
 		cl.due++
-		if r.ObservedPrice != nil && r.BasePrice > 0 {
-			cl.filled++
-			cl.rets = append(cl.rets, (*r.ObservedPrice/r.BasePrice-1)*100)
+		switch r.Status {
+		case storage.MarkoutStatusFilled:
+			cl.market++
+			if r.ObservedPrice != nil && r.BasePrice > 0 {
+				cl.filled++
+				cl.rets = append(cl.rets, (*r.ObservedPrice/r.BasePrice-1)*100)
+			}
+		case storage.MarkoutStatusNoCandle, storage.MarkoutStatusTokenInactive, storage.MarkoutStatusPending:
+			cl.market++ // dead / unclassified due rows: conservative loss
+		default: // api_error, rate_limited, lookback_miss, price_parse_error
+			cl.meas++ // measurement loss — NOT a trade outcome
 		}
 	}
 	sort.Strings(types)
@@ -104,8 +129,8 @@ func LatencyEV(w io.Writer, s *storage.Store, horizon time.Duration, side string
 		fmt.Fprintf(w, "\nSOURCE AGE × FOLLOWER EV @ %v — %s (entry = last closed candle at reception)\n",
 			horizon, t)
 		if byChase {
-			fmt.Fprintf(w, "%-10s %10s %10s %10s %10s %10s %10s %10s\n", "age", "due", "fill", "<0%", "0-5%", "5-10%", "10-20%", "20%+")
-			fmt.Fprintf(w, "%-10s %10s %10s %10s %10s %10s %10s %10s\n", "", "", "cov%", "avg", "avg", "avg", "avg", "avg")
+			fmt.Fprintf(w, "%-10s %10s %10s %10s %10s %10s %10s %10s %10s\n", "age", "due", "fill", "<0%", "0-5%", "5-10%", "10-20%", "20%+", "n/a")
+			fmt.Fprintf(w, "%-10s %10s %10s %10s %10s %10s %10s %10s %10s\n", "", "", "cov%", "avg", "avg", "avg", "avg", "avg", "avg")
 			for _, b := range ageOrder {
 				var totalN int
 				for _, col := range chaseCols {
@@ -134,8 +159,8 @@ func LatencyEV(w io.Writer, s *storage.Store, horizon time.Duration, side string
 			continue
 		}
 
-		fmt.Fprintf(w, "%-10s %8s %8s %9s %8s %10s %10s %10s\n",
-			"age", "due", "fill", "cover", "WR", "obs EV", "median", "cons EV")
+		fmt.Fprintf(w, "%-10s %8s %8s %9s %8s %10s %10s %10s %8s\n",
+			"age", "due", "fill", "cover", "WR", "obs EV", "median", "cons EV", "meas")
 		for _, b := range ageOrder {
 			c := cells[key{t, b, ""}]
 			if c == nil || c.due == 0 {
@@ -147,18 +172,22 @@ func LatencyEV(w io.Writer, s *storage.Store, horizon time.Duration, side string
 					wins++
 				}
 			}
-			// conservative EV: every unpriced due row assumed to lose noExitLoss%
-			cons := float64(-noExitLoss) // placeholder for no fills
-			if c.due > 0 {
-				loss := float64(c.due-c.filled) * -noExitLoss
-				cons = (sum(c.rets) + loss) / float64(c.due)
+			// conservative EV: every unpriced MARKET-outcome due row assumed
+			// to lose noExitLoss%; measurement failures are excluded — a 429
+			// is not a trade that lost 100%.
+			consStr := "n/a"
+			if c.market > 0 {
+				loss := float64(c.market-c.filled) * -noExitLoss
+				cons := (sum(c.rets) + loss) / float64(c.market)
+				consStr = fmt.Sprintf("%+9.2f%%", cons)
 			}
-			fmt.Fprintf(w, "%-10s %8d %8d %8.1f%% %7.1f%% %+9.2f%% %+9.2f%% %+9.2f%%\n",
+			fmt.Fprintf(w, "%-10s %8d %8d %8.1f%% %7.1f%% %+9.2f%% %+9.2f%% %10s %8d\n",
 				b, c.due, c.filled, pctOf(c.filled, c.due),
-				pctOf(wins, c.filled), mean(c.rets), median(c.rets), cons)
+				pctOf(wins, c.filled), mean(c.rets), median(c.rets), consStr, c.meas)
 		}
 	}
-	fmt.Fprintf(w, "\ncons EV assumes every unpriced due row loses %.0f%% (--noexit-loss).\n", noExitLoss)
+	fmt.Fprintf(w, "\ncons EV: unpriced MARKET-outcome rows (no_candle/token_inactive/pending) assumed to lose %.0f%%;\n", noExitLoss)
+	fmt.Fprintf(w, "measurement failures (api_error/rate_limited/lookback_miss/parse_error) excluded — coverage loss, not trade loss.\n")
 	return nil
 }
 

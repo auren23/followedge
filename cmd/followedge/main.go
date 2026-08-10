@@ -26,7 +26,7 @@ import (
 	"github.com/auren23/followedge/internal/storage"
 )
 
-const version = "0.1.3-dataset"
+const version = "0.1.3.1-measurement-integrity"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -349,7 +349,7 @@ func cmdAnalyze(ctx context.Context, args []string) error {
 		return analyze.Latency(os.Stdout, store, sinceT)
 	case "latency-ev":
 		noExitLoss := fs.Float64("noexit-loss", 100, "assumed loss %% for unpriced rows in conservative EV")
-		return analyze.LatencyEV(os.Stdout, store, h, *side, *byChase, *noExitLoss)
+		return analyze.LatencyEV(os.Stdout, store, h, *side, *byChase, *noExitLoss, cfg.Markout.Grace)
 	case "chase":
 		return analyze.Chase(os.Stdout, store, h, *side)
 	case "coverage":
