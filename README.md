@@ -23,7 +23,10 @@ Event Database (SQLite, WAL)
  ├──────────────► Actor Intelligence (Quality score)
  │
  ├──────────────► Markout Engine  (每笔交易的 forward return @ 30s..1h)
- │                    └── Alpha Decay / chase / Replicability score
+ │                    └── Alpha Decay / chase / coverage-aware EV
+ │
+ ├──────────────► Replication Census (coverage-aware, per actor)
+ │                    └── due / filled / coverage / obsEV / consEV / effective N
  │
  └──────────────► Cluster Engine (rolling windows, 供未来 mechanism mining)
 ```
@@ -32,15 +35,17 @@ Event Database (SQLite, WAL)
 `profitable + consistent + copyable` 的 actor，用 `followedge actors rank`
 输出。不产生任何交易。
 
-## 两个分数，必须分开看
+## 两个轴，必须分开看
 
 | | 回答的问题 | 依据 |
 |---|---|---|
 | **Quality** (0-100) | 他赚到钱了吗？ | realized PnL（卖单 `amount_usd − buy_cost_usd`）、盈利日占比、top-1 代币集中度、日 PnL 曲线回撤 |
-| **Replicability** (0-100) | 我们晚 N 秒进场还能赚吗？ | 买单 markout 平均收益（参考 horizon）+ 样本量调整 |
+| **Replication** (census) | 我们晚 N 秒进场还能赚吗？ | coverage-aware replication census：due / filled / coverage / observed EV / conservative EV / market loss / measurement loss / unresolved / effective market N |
 
 **Quality 高 ≠ 可以跟。** 彩票选手（一个代币赚 90% 的利润）会被
-concentration 降权；EV 已衰减的 wallet 会被 replicability 归零。
+concentration 降权。Replication **不压成单一 0–100 分数**——直接展示
+census 事实，survivor bias 可见：一个 10 笔 fill 全赚但 90 个 token 死掉的
+actor 会显示低 coverage 和被 market loss 拖低的 conservative EV。
 
 ## Quickstart
 
@@ -68,7 +73,7 @@ bin/followedge analyze clusters --window 60s      # 钱包汇聚分布
 | `collect` | 采集 smart money + KOL，去重入库，聚类，采样 markout |
 | `collect --once` | 每源单轮轮询（冒烟测试） |
 | `status` | 行数统计 |
-| `actors rank` | Actor 排行榜：Quality 与 Replicability 双轴 |
+| `actors rank` | Actor 排行榜：Quality + coverage-aware Replication census（`--sort` / `--frontier`） |
 | `actors inspect <wallet>` | 单个 actor 研究卡：PnL 事实 + 证据等级 + 各 horizon EV 衰减 |
 | `analyze latency` | 源延迟分布（trade_time → received_at） |
 | `analyze latency-ev` | **source-age × follower EV**（DUE/FILLED/COVER + 保守 EV；`--by-chase` 二维矩阵）|
@@ -122,14 +127,14 @@ edge 都必须扛住它。样本量远不够下结论，继续积累 5,000+ even
 | markout 价格源 | GMGN 30s kline（公开 API 最细粒度），horizon ≥ 30s；更细需要链上价格源（v0.2 研究问题） |
 | dedup | 内存 TTL + DB `UNIQUE(event_id)` 双闸；只有 `created=true` 事件进管线 → 重启安全 |
 | cluster 状态 | 每次事件从 DB 重算并 append 快照，无内存态漂移 |
-| Quality/Replicability 公式 | v0.1 显式启发式（无 ML）：profit 线性到 $10k、盈利日占比、样本量、top1 集中度、日曲线回撤；EV 线性到 +10%、20 fills 满样本 |
+| Quality 公式 / Replication census | Quality：显式启发式（无 ML）：profit 线性到 $10k、盈利日占比、样本量、top1 集中度、日曲线回撤；Replication：coverage-aware census（filled+market loss 为 cons-EV 分母，sample gate 默认 20/5） |
 | event_id | `sha256(chain\|tx_hash\|wallet\|token\|side)[:16]` |
 
 ## Roadmap
 
 | 版本 | 内容 |
 |---|---|
-| `v0.1.0-observe` | Actor 采集/排名（Quality+Replicability）、markout、chase、cluster、延迟分析 |
+| `v0.1.0-observe` | Actor 采集/排名（Quality + Replication census）、markout、chase、cluster、延迟分析 |
 | `v0.1.1-measurement` | 测量口径修复：leader/follower markout 分离、chase 重定义、follower EV、buy_cost_usd 自洽性 |
 | `v0.1.2-entry-pit` | entry point-in-time（无 look-ahead）、source-age×EV 分析、ActorEvidence E0-E4、survival 指标 |
 | `v0.1.3-dataset` | markout status 分类 + coverage 表、coverage-aware EV、conservative EV、position episodes、mechanism 数据契约 |

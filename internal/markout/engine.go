@@ -150,13 +150,16 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 		}
 	}
 
-	tokensDone := 0
+	tokensAttempted := 0
 	entryCache := map[string]entryPrice{} // event → entry (shared across its 6 horizon rows)
 	for _, token := range tokenOrder {
 		targets := byToken[token]
-		if tokensDone >= maxTokensPerTick {
+		if tokensAttempted >= maxTokensPerTick {
 			break // rest retried next tick
 		}
+		tokensAttempted++ // count BEFORE the request: API errors must also
+		// respect the per-tick cap, or a 5xx storm would loop through every
+		// queued token in one SampleDue call.
 		if skip := e.skipUntil[token]; now.Before(skip) {
 			continue // dead token, backoff not elapsed
 		}
@@ -183,7 +186,6 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 			}
 			continue
 		}
-		tokensDone++
 		if len(candles) == 0 {
 			// empty kline: GMGN has no data for this token. That is a
 			// MEASUREMENT failure (no_kline_data), NOT proof the token is

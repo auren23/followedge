@@ -245,3 +245,53 @@ func TestRankSampleGate(t *testing.T) {
 		t.Errorf("eligible actor W_N must stay in frontier:\n%s", out)
 	}
 }
+
+// TestRankEffectiveSampleGate pins the effective-N trap: an actor with
+// Due=100 but 95 measurement failures (api_error) has only Filled+MarketLoss
+// = 5 effective market samples — the cons-EV denominator — and must fail the
+// gate even though Due looks healthy. Guards against someone "simplifying"
+// the gate back to Due.
+func TestRankEffectiveSampleGate(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	ts := now.Add(-20 * time.Minute)
+	// W_M: Due=100, Filled=5, MarketLoss=0, MeasLoss=95 → effective N = 5 < 20
+	p50 := 50.0
+	for i := 0; i < 95; i++ {
+		mkReplEvent(t, s, "W_M", fmt.Sprintf("m%d", i), ts, 0, nil, storage.MarkoutStatusAPIError)
+	}
+	for i := 0; i < 5; i++ {
+		mkReplEvent(t, s, "W_M", fmt.Sprintf("mf%d", i), ts, 0, &p50, "")
+	}
+	// W_N: 30 fills +5% → effective N = 30 ≥ 20
+	p5 := 5.0
+	for i := 0; i < 30; i++ {
+		mkReplEvent(t, s, "W_N", fmt.Sprintf("n%d", i), ts, 0, &p5, "")
+	}
+
+	rank := func(key ActorSortKey, frontier bool) string {
+		var buf sink
+		if err := Rank(&buf, s, now.Add(-24*time.Hour), 30*time.Second, 10, 1, 100, 0,
+			key, frontier, 20, 5); err != nil {
+			t.Fatal(err)
+		}
+		return buf.String()
+	}
+	idx := func(out, w string) int { return strings.Index(out, w+" ") }
+
+	// Due=100 passes a Due-based gate, but effective N=5 must fail it:
+	// W_M sorts after W_N on replicability and never enters the frontier.
+	out := rank(SortReplicability, false)
+	if !(idx(out, "W_N") < idx(out, "W_M")) {
+		t.Errorf("effective-N=5 actor must not outrank N=30 actor:\n%s", out)
+	}
+	out = rank(SortQuality, true)
+	if strings.Contains(out, "W_M") {
+		t.Errorf("effective-N=5 actor must not enter the frontier:\n%s", out)
+	}
+}
