@@ -168,6 +168,16 @@ func Rank(w io.Writer, s *storage.Store, since time.Time, horizon time.Duration,
 		list = list[:limit]
 	}
 
+	// persist E1 evidence (GMGN-derived) for every ranked actor: the table
+	// keeps period history even as windows move
+	for _, a := range list {
+		pnl := a.RealizedPnL
+		if err := s.UpsertEvidence(a.Wallet, "realized_pnl", storage.EvidenceE1, "gmgn_feed",
+			since, time.Now().UTC(), a.Trades, &pnl, nil); err != nil {
+			fmt.Fprintf(w, "(evidence upsert failed for %s: %v)\n", a.Wallet, err)
+		}
+	}
+
 	fmt.Fprintf(w, "ACTORS (since %s, markout horizon %v) — Quality vs Replicability are separate axes\n",
 		since.Format("2006-01-02"), horizon)
 	fmt.Fprintf(w, "%-46s %6s %6s %6s %10s %10s %6s %6s %8s %8s\n",
@@ -220,9 +230,32 @@ func Inspect(w io.Writer, s *storage.Store, wallet string, since time.Time, hori
 	fmt.Fprintf(w, "  consistency: %d/%d profitable days (%.0f%%)\n",
 		a.ProfitableDays, a.ActiveDays, pct(a.ProfitableDays, a.ActiveDays))
 	fmt.Fprintf(w, "  top1 share:  %.0f%%   max drawdown: $%.0f\n", a.Top1Share*100, a.MaxDrawdown)
-	fmt.Fprintf(w, "  quality:     %.1f\n\n", a.Quality)
+	fmt.Fprintf(w, "  quality:     %.1f\n", a.Quality)
 
-	fmt.Fprintf(w, "ALPHA DECAY (follower: entry at ReceivedAt, mean return of buys)\n")
+	// evidence card: best level + all rows
+	rows, err := s.EvidenceFor(wallet)
+	if err == nil && len(rows) > 0 {
+		best := rows[0]
+		for _, r := range rows[1:] {
+			if storage.EvidenceRank[r.Level] > storage.EvidenceRank[best.Level] {
+				best = r
+			}
+		}
+		fmt.Fprintf(w, "  best evidence: %s (%s)\n", best.Level, best.Source)
+		for _, r := range rows {
+			pnlStr := "-"
+			if r.RealizedPnL != nil {
+				pnlStr = fmt.Sprintf("$%.0f", *r.RealizedPnL)
+			}
+			fmt.Fprintf(w, "    %s %s %-8s %s → %s  n=%d pnl=%s\n", r.Level, r.Source, "period",
+				time.Unix(r.PeriodStart, 0).Format("2006-01-02"),
+				time.Unix(r.PeriodEnd, 0).Format("2006-01-02"), r.TradeCount, pnlStr)
+		}
+	} else if err != nil {
+		fmt.Fprintf(w, "  (evidence query failed: %v)\n", err)
+	}
+
+	fmt.Fprintf(w, "\nALPHA DECAY (follower: entry at ReceivedAt, mean return of buys)\n")
 	fmt.Fprintf(w, "%-10s %8s %8s %8s\n", "horizon", "fills", "avg", "WR")
 	for _, h := range horizons {
 		rets := buysAt(s, wallet, h)

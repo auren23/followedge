@@ -64,13 +64,20 @@ type Engine struct {
 	// tokens whose kline came back empty (dead / not trading): retry no
 	// sooner than this. Prevents stale rows from burning the tick budget.
 	skipUntil map[string]time.Time
+
+	resSecs int64 // kline resolution in seconds (for point-in-time entry bounds)
 }
 
 func NewEngine(store *storage.Store, client *gmgn.Client, limiter weightLimiter,
 	chain, resolution string, grace time.Duration, horizons []time.Duration) *Engine {
+	d, err := time.ParseDuration(resolution)
+	resSecs := int64(30)
+	if err == nil {
+		resSecs = int64(d.Seconds())
+	}
 	return &Engine{store: store, client: client, limiter: limiter, chain: chain,
 		res: resolution, grace: grace, horizons: horizons, log: slog.With("pkg", "markout"),
-		skipUntil: map[string]time.Time{}}
+		skipUntil: map[string]time.Time{}, resSecs: resSecs}
 }
 
 func (e *Engine) Horizons() []time.Duration { return e.horizons }
@@ -125,6 +132,7 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 
 	now := time.Now().UTC()
 	tokensDone := 0
+	entryCache := map[string]entryPrice{} // event → entry (shared across its 6 horizon rows)
 	for token, targets := range byToken {
 		if tokensDone >= maxTokensPerTick {
 			break // rest retried next tick
@@ -167,16 +175,24 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 			}
 		}
 		for _, t := range targets {
-			// follower rows need their ReceivedAt entry price first: the close
-			// of the candle IN PROGRESS at base_ms (what you could actually
-			// have traded at the moment you learned about the trade).
+			// follower rows need their entry price: the close of the last
+			// candle ALREADY CLOSED at ReceivedAt (base_ms − res). The candle
+			// in progress at base_ms is off-limits — its close contains up to
+			// res of future information (P0.5 fix).
 			if t.kind == storage.MarkoutFollower && t.basePrice == 0 {
-				if p, ok := lastCloseAtOrBefore(times, closes, t.baseMs); ok && p > 0 {
-					if err := e.store.SetEntryPrice(t.event, t.kind, t.horizon, p); err != nil {
-						e.log.Warn("set entry price failed", "event", t.event, "err", err)
+				ep, ok := entryCache[t.event]
+				if !ok {
+					p, open, found := lastCloseAtOrBefore(times, closes, t.baseMs-e.resSecs)
+					if !found || p <= 0 {
+						continue
 					}
-					t.basePrice = p
+					ep = entryPrice{price: p, observedAt: time.Unix(open+e.resSecs, 0).UTC()}
+					entryCache[t.event] = ep
 				}
+				if err := e.store.SetEntryPrice(t.event, t.kind, t.horizon, ep.price, ep.observedAt); err != nil {
+					e.log.Warn("set entry price failed", "event", t.event, "err", err)
+				}
+				t.basePrice = ep.price
 			}
 			if t.basePrice <= 0 {
 				continue // entry unknown; horizon return would be meaningless
@@ -193,6 +209,13 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 	return nil
 }
 
+// entryPrice is a follower entry sampled from klines, with the instant it
+// actually represents.
+type entryPrice struct {
+	price      float64
+	observedAt time.Time
+}
+
 // firstCloseAtOrAfter returns the close of the first candle opening at or
 // after ts. times must be ascending.
 func firstCloseAtOrAfter(times []int64, closes []float64, ts int64) (float64, bool) {
@@ -203,13 +226,13 @@ func firstCloseAtOrAfter(times []int64, closes []float64, ts int64) (float64, bo
 	return closes[i], closes[i] > 0
 }
 
-// lastCloseAtOrBefore returns the close of the last candle opening at or
-// before ts — the candle in progress at ts. Used for follower entry prices:
-// the price you could actually have traded when the trade reached you.
-func lastCloseAtOrBefore(times []int64, closes []float64, ts int64) (float64, bool) {
+// lastCloseAtOrBefore returns the close and open time of the last candle
+// opening at or before ts — used for follower entries: the newest candle
+// whose close (open+res) is already known at ts, i.e. NO future info.
+func lastCloseAtOrBefore(times []int64, closes []float64, ts int64) (price float64, open int64, ok bool) {
 	i := sort.Search(len(times), func(i int) bool { return times[i] > ts })
 	if i == 0 {
-		return 0, false
+		return 0, 0, false
 	}
-	return closes[i-1], closes[i-1] > 0
+	return closes[i-1], times[i-1], closes[i-1] > 0
 }

@@ -91,13 +91,15 @@ func (s *Store) DueMarkouts(grace time.Duration, now time.Time, limit int) ([]Du
 	return out, rows.Err()
 }
 
-// SetEntryPrice fills a follower row's base_price with the price at ReceivedAt
-// (the entry a real follower would have paid). No-op if already set.
-func (s *Store) SetEntryPrice(eventID, kind string, horizon time.Duration, entryPrice float64) error {
+// SetEntryPrice fills a follower row's base_price with the price a follower
+// could have traded at reception: the close of the last candle ALREADY
+// CLOSED at ReceivedAt (never look-ahead — see migration 004). observedAt is
+// the instant that price actually represents (candle open + resolution).
+func (s *Store) SetEntryPrice(eventID, kind string, horizon time.Duration, entryPrice float64, observedAt time.Time) error {
 	_, err := s.db.Exec(`
-		UPDATE markouts SET base_price = ?
+		UPDATE markouts SET base_price = ?, entry_observed_at = ?
 		WHERE event_id = ? AND kind = ? AND horizon_ms = ? AND base_price IS NULL`,
-		entryPrice, eventID, kind, horizon.Milliseconds())
+		entryPrice, observedAt.Unix(), eventID, kind, horizon.Milliseconds())
 	return err
 }
 
@@ -113,18 +115,19 @@ func (s *Store) FillMarkout(eventID, kind string, horizon time.Duration, observe
 
 // MarkoutStat is one analyzed markout, with the chase number attached.
 type MarkoutStat struct {
-	EventID     string
-	Wallet      string
-	WalletType  string
-	Side        string
-	AmountUSD   float64
-	TradeTime   int64
-	ReceivedAt  int64
-	Horizon     time.Duration
-	ReturnPct   sql.NullFloat64 // follower/leader forward return at horizon
-	BasePrice   float64         // entry price (leader: price_usd; follower: ReceivedAt price)
-	LeaderPrice float64         // leader's price_usd, for chase
-	ChasePct    float64         // (BasePrice/LeaderPrice - 1) * 100 — how much the
+	EventID         string
+	Wallet          string
+	WalletType      string
+	Side            string
+	AmountUSD       float64
+	TradeTime       int64
+	ReceivedAt      int64
+	Horizon         time.Duration
+	ReturnPct       sql.NullFloat64 // follower/leader forward return at horizon
+	BasePrice       float64         // entry price (leader: price_usd; follower: ReceivedAt price)
+	LeaderPrice     float64         // leader's price_usd, for chase
+	EntryObservedAt int64           // instant the entry price represents (follower), 0 if unknown
+	ChasePct        float64         // (BasePrice/LeaderPrice - 1) * 100 — how much the
 	// price moved before we could enter (follower rows; ~0 for leader)
 }
 
@@ -134,7 +137,7 @@ func (s *Store) MarkoutsAt(kind string, horizon time.Duration) ([]MarkoutStat, e
 	rows, err := s.db.Query(`
 		SELECT m.event_id, e.wallet, e.wallet_type, e.side, e.amount_usd,
 		       e.trade_time, e.received_at, m.horizon_ms, m.return_pct,
-		       m.base_price, e.price_usd
+		       m.base_price, e.price_usd, m.entry_observed_at
 		FROM markouts m
 		JOIN trade_events e ON e.event_id = m.event_id
 		WHERE m.kind = ? AND m.horizon_ms = ? AND m.observed_price IS NOT NULL`,
@@ -148,10 +151,13 @@ func (s *Store) MarkoutsAt(kind string, horizon time.Duration) ([]MarkoutStat, e
 		var m MarkoutStat
 		var hms int64
 		var base sql.NullFloat64
+		var eoa sql.NullInt64
 		if err := rows.Scan(&m.EventID, &m.Wallet, &m.WalletType, &m.Side, &m.AmountUSD,
-			&m.TradeTime, &m.ReceivedAt, &hms, &m.ReturnPct, &base, &m.LeaderPrice); err != nil {
+			&m.TradeTime, &m.ReceivedAt, &hms, &m.ReturnPct, &base, &m.LeaderPrice,
+			&eoa); err != nil {
 			return nil, err
 		}
+		m.EntryObservedAt = eoa.Int64
 		m.Horizon = time.Duration(hms) * time.Millisecond
 		m.BasePrice = base.Float64
 		if m.BasePrice > 0 && m.LeaderPrice > 0 {
@@ -160,6 +166,29 @@ func (s *Store) MarkoutsAt(kind string, horizon time.Duration) ([]MarkoutStat, e
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// DueCoverage counts filled vs DUE rows for one kind at one horizon — the
+// fraction of due rows that actually got a price. It is the v0.1 proxy for
+// survival/retention: a row stays NULL when the token stopped trading before
+// its horizon, so filled/due ≈ "price still available at H".
+func (s *Store) DueCoverage(kind string, horizon time.Duration, grace time.Duration, now time.Time) (filled, due int64, err error) {
+	cutoff := now.Add(-grace).Unix()
+	err = s.db.QueryRow(`
+		SELECT COUNT(*) FROM markouts
+		WHERE kind = ? AND horizon_ms = ?
+		  AND base_ms + horizon_ms/1000 <= ?`,
+		kind, horizon.Milliseconds(), cutoff).Scan(&due)
+	if err != nil {
+		return
+	}
+	err = s.db.QueryRow(`
+		SELECT COUNT(*) FROM markouts
+		WHERE kind = ? AND horizon_ms = ?
+		  AND base_ms + horizon_ms/1000 <= ?
+		  AND observed_price IS NOT NULL`,
+		kind, horizon.Milliseconds(), cutoff).Scan(&filled)
+	return
 }
 
 // MarkoutCoverage counts filled vs total rows at a horizon for one kind.

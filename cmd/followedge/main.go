@@ -26,7 +26,7 @@ import (
 	"github.com/auren23/followedge/internal/storage"
 )
 
-const version = "0.1.1-measurement"
+const version = "0.1.2-entry-pit"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -71,6 +71,7 @@ usage:
   followedge actors rank    [--config ...] [--since 24h] [--horizon 60s] [--limit 20] [--min-trades 3]
   followedge actors inspect [--config ...] <wallet> [--since 24h]
   followedge analyze latency   [--config ...] [--since 1h]
+  followedge analyze latency-ev [--config ...] [--horizon 5m] [--side buy] [--by-chase]
   followedge analyze chase     [--config ...] [--horizon 30s] [--side buy]
   followedge analyze clusters  [--config ...] [--window 60s] [--limit 20]
   followedge version
@@ -310,8 +311,9 @@ func cmdAnalyze(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("analyze "+sub, flag.ExitOnError)
 	cfgPath := fs.String("config", "configs/observe.yaml", "config file")
 	sinceStr := fs.String("since", "24h", "lookback window (e.g. 1h, 24h, 7d)")
-	horizon := fs.String("horizon", "30s", "markout horizon (chase)")
-	side := fs.String("side", "", "filter by side: buy|sell (chase)")
+	horizon := fs.String("horizon", "30s", "markout horizon (chase/latency-ev)")
+	side := fs.String("side", "", "filter by side: buy|sell")
+	byChase := fs.Bool("by-chase", false, "latency-ev: two-dimensional age × chase matrix")
 	window := fs.String("window", "60s", "cluster window (clusters)")
 	limit := fs.Int("limit", 20, "max rows (clusters)")
 	if err := fs.Parse(rest); err != nil {
@@ -345,6 +347,8 @@ func cmdAnalyze(ctx context.Context, args []string) error {
 	switch sub {
 	case "latency":
 		return analyze.Latency(os.Stdout, store, sinceT)
+	case "latency-ev":
+		return analyze.LatencyEV(os.Stdout, store, h, *side, *byChase)
 	case "chase":
 		return analyze.Chase(os.Stdout, store, h, *side)
 	case "clusters":

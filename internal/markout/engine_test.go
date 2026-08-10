@@ -184,9 +184,11 @@ func TestSampleDue(t *testing.T) {
 	}
 }
 
-// TestSampleDueFollower verifies the v0.1.1 measurement split: follower rows
-// base at ReceivedAt (entry price sampled from klines → chase), and their
-// return is measured from THAT entry, not the leader's price.
+// TestSampleDueFollower verifies the measurement split AND the P0.5 fix:
+// the entry must be the last candle ALREADY CLOSED at ReceivedAt. The candle
+// in progress at reception (close = 1.10) contains up to 30s of future info
+// and must NOT be used — a look-ahead would make chase +10% and fail this
+// test.
 func TestSampleDueFollower(t *testing.T) {
 	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -212,15 +214,16 @@ func TestSampleDueFollower(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// candles every 30s: base(1.00) → recv-aligned(1.10, entry) → +30s(1.20) → +60s(1.30, exit)
-	// entry = last candle open <= received (the one in progress), 1.10
-	// 30s exit = first candle open >= received+30s → 1.30
-	base := received.Truncate(30 * time.Second).Add(-30 * time.Second)
+	// 30s candles around reception (received = 16:50:07 in the comment grid):
+	//   c0 open=16:49:30 close=1.00  → closed at 16:50:00 <= received ✓ (entry)
+	//   c1 open=16:50:00 close=1.10  → closes at 16:50:30 > received ✗ in progress
+	//   c3 open=16:51:00 close=1.30  → first candle >= due(16:50:37) ✓ (exit)
+	boundary := received.Truncate(30 * time.Second)
+	c0 := boundary.Add(-30 * time.Second)
 	fc := &fakeClient{candles: []gmgn.Candle{
-		{Time: base.UnixMilli(), Close: "1.00"},
-		{Time: base.Add(30 * time.Second).UnixMilli(), Close: "1.10"},
-		{Time: base.Add(60 * time.Second).UnixMilli(), Close: "1.20"},
-		{Time: base.Add(90 * time.Second).UnixMilli(), Close: "1.30"},
+		{Time: c0.UnixMilli(), Close: "1.00"},
+		{Time: boundary.UnixMilli(), Close: "1.10"}, // trap: must NOT be used
+		{Time: boundary.Add(60 * time.Second).UnixMilli(), Close: "1.30"},
 	}}
 	eng := NewEngine(s, nil, noopLimiter{}, "sol", "30s", 0, []time.Duration{30 * time.Second})
 	eng.client = fc
@@ -236,15 +239,18 @@ func TestSampleDueFollower(t *testing.T) {
 		t.Fatalf("expected 1 filled follower markout, got %+v", rows)
 	}
 	m := rows[0]
-	if m.BasePrice != 1.10 {
-		t.Errorf("follower entry price = %v, want 1.10 (price at ReceivedAt)", m.BasePrice)
+	if m.BasePrice != 1.00 {
+		t.Errorf("follower entry price = %v, want 1.00 (last closed candle at reception, NOT the in-progress 1.10)", m.BasePrice)
 	}
-	if math.Abs(m.ChasePct-10) > 0.001 {
-		t.Errorf("chase = %.4f%%, want ~10%% (entry 1.10 vs leader 1.00)", m.ChasePct)
+	if math.Abs(m.ChasePct) > 0.001 {
+		t.Errorf("chase = %.4f%%, want ~0%% (entry 1.00 vs leader 1.00)", m.ChasePct)
 	}
-	wantRet := (1.30/1.10 - 1) * 100
+	wantRet := (1.30/1.00 - 1) * 100
 	if math.Abs(m.ReturnPct.Float64-wantRet) > 0.001 {
 		t.Errorf("follower return = %.4f%%, want ~%.4f%% (from entry, not leader price)", m.ReturnPct.Float64, wantRet)
+	}
+	if m.EntryObservedAt != boundary.Unix() {
+		t.Errorf("entry observed at = %d, want %d (candle close instant, no future info)", m.EntryObservedAt, boundary.Unix())
 	}
 	if m.LeaderPrice != 1.00 {
 		t.Errorf("leader price = %v, want 1.00", m.LeaderPrice)

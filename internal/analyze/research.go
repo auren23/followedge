@@ -49,6 +49,14 @@ func Chase(w io.Writer, s *storage.Store, horizon time.Duration, side string) er
 			b, len(a), float64(wins)/float64(len(a))*100, mean(a), median(a))
 	}
 	fmt.Fprintf(w, "\n%d filled follower markouts at %v\n", totalN, horizon)
+
+	// survival proxy: of the rows whose horizon has passed, how many still
+	// had a price? NULL observed_price means the token stopped trading.
+	filled, due, err := s.DueCoverage(storage.MarkoutFollower, horizon, 30*time.Second, time.Now().UTC())
+	if err == nil && due > 0 {
+		fmt.Fprintf(w, "survival@%v: %.0f%% (%d/%d due rows had a price — token alive at horizon)\n",
+			horizon, float64(filled)/float64(due)*100, filled, due)
+	}
 	return nil
 }
 
