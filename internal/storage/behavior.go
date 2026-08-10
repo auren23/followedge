@@ -76,7 +76,8 @@ func (s *Store) ClassifiedEntries(wallet string) ([]ClassifiedEntry, error) {
 				origin = OriginVisibleZero
 				book.reset()
 			case Oversold:
-				book.reset() // classification has no negative positions: next buy reopens
+				origin = OriginCensored // gap in the trajectory: confidence drops back
+				book.reset()            // classification has no negative positions: next buy reopens
 			}
 		}
 	}

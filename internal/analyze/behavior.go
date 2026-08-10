@@ -128,45 +128,44 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 	prof := mechanism.BuildProfile(wallet, episodes, facts)
 
 	fmt.Fprintf(w, "\nBEHAVIOR COHORT — positions opened since %s\n", since.Format("2006-01-02"))
+	fmt.Fprintf(w, "\n                         confirmed   inferred\n")
 	fmt.Fprintf(w, "\nENTRY\n")
-	fmt.Fprintf(w, "  initial buys    %d  (confirmed %d · inferred-zero %d · censored %d)\n",
-		prof.Entry.InitialCount, prof.Entry.InitialConfirmed, prof.Entry.InitialVisible, prof.Entry.InitialCensored)
-	fmt.Fprintf(w, "  add buys        %d\n", prof.Entry.AddCount)
-	fmt.Fprintf(w, "  reentry rate    %.0f%%\n", prof.Entry.ReentryRate*100)
-	fmt.Fprintf(w, "  initial buy     %s\n", usd(prof.Entry.MedianInitialBuy))
-	fmt.Fprintf(w, "  add buy         %s (%.0f%% of episodes add)\n",
-		usd(prof.Entry.MedianAddBuy), prof.Entry.AddEpisodeRate*100)
-	fmt.Fprintf(w, "  total capital   %s\n", usd(prof.Entry.MedianCapitalIn))
-	fmt.Fprintf(w, "  median age      %s\n", secs(prof.Entry.MedianAge))
-	fmt.Fprintf(w, "  median chase    %s (initial only)\n", pctMed(prof.Entry.MedianChase))
-	fmt.Fprintf(w, "  median add chase %s\n", pctMed(prof.Entry.MedianAddChase))
-	fmt.Fprintf(w, "  add since open  %s\n", secs(prof.Entry.MedianSinceInitialSecs))
-	fmt.Fprintf(w, "  prior smart P50 %s\n", num(prof.Entry.SmartPriorP50))
-	fmt.Fprintf(w, "  prior KOL P50   %s\n", num(prof.Entry.KOLPriorP50))
-	fmt.Fprintf(w, "  cluster >=3     %.0f%% (%d confirmed, valid prior windows)\n",
-		prof.Entry.Cluster3Plus*100, prof.Entry.PriorFlowN)
+	fmt.Fprintf(w, "  initial buys        %-11s %-11s (%d censored, origin unknown)\n",
+		fmt.Sprintf("%d", prof.Entry.InitialConfirmed),
+		fmt.Sprintf("%d", prof.Entry.InitialVisible),
+		prof.Entry.InitialCensored)
+	fmt.Fprintf(w, "  add buys            %-11s %-11s\n",
+		fmt.Sprintf("%d", prof.Entry.AddCount), "—")
+	fmt.Fprintf(w, "  reentry rate        %s\n", twoPct(prof.Entry.ReentryRate))
+	fmt.Fprintf(w, "  initial buy         %s\n", twoUsd(prof.Entry.MedianInitialBuy))
+	fmt.Fprintf(w, "  add buy             %s\n", twoUsd(prof.Entry.MedianAddBuy))
+	fmt.Fprintf(w, "  add episode rate    %s\n", twoPct(prof.Entry.AddEpisodeRate))
+	fmt.Fprintf(w, "  total capital       %s\n", twoUsd(prof.Entry.MedianCapitalIn))
+	fmt.Fprintf(w, "  median age          %s\n", twoSecs(prof.Entry.MedianAge))
+	fmt.Fprintf(w, "  median chase        %s\n", twoPct(prof.Entry.MedianChase))
+	fmt.Fprintf(w, "  median add chase    %s\n", twoPct(prof.Entry.MedianAddChase))
+	fmt.Fprintf(w, "  add since open      %s\n", twoSecs(prof.Entry.MedianSinceInitialSecs))
+	fmt.Fprintf(w, "  prior smart P50     %s\n", twoNum(prof.Entry.SmartPriorP50))
+	fmt.Fprintf(w, "  prior KOL P50       %s\n", twoNum(prof.Entry.KOLPriorP50))
+	fmt.Fprintf(w, "  cluster >=3         %s\n", twoPct(prof.Entry.Cluster3Plus))
 	fmt.Fprintf(w, "\nPOSITION\n")
-	fmt.Fprintf(w, "  episodes        %d  (trusted %d · censored %d)\n",
+	fmt.Fprintf(w, "  episodes            %d  (confirmed %d · censored %d)\n",
 		prof.Position.Episodes, prof.Position.Trusted, prof.Position.Censored)
-	fmt.Fprintf(w, "  median adds     %s\n", num(prof.Position.MedianAdds))
-	fmt.Fprintf(w, "  median reduces  %s\n", num(prof.Position.MedianReduces))
-	fmt.Fprintf(w, "  median hold     %s\n", secs(prof.Position.MedianHoldSecs))
+	fmt.Fprintf(w, "  median adds         %s\n", twoNum(prof.Position.MedianAdds))
+	fmt.Fprintf(w, "  median reduces      %s\n", twoNum(prof.Position.MedianReduces))
+	fmt.Fprintf(w, "  median hold         %s\n", twoSecs(prof.Position.MedianHoldSecs))
 	fmt.Fprintf(w, "\nEXIT\n")
-	if prof.Exit.ObservableN > 0 {
-		fmt.Fprintf(w, "  partial exits   %.0f%% (%d of %d observable)\n",
-			prof.Exit.PartialExitRatio*100, prof.Exit.PartialExitN, prof.Exit.ObservableN)
-	} else {
-		fmt.Fprintf(w, "  partial exits   n/a (no observable exits)\n")
-	}
-	fmt.Fprintf(w, "  first sell P50  %s\n", secs(prof.Exit.FirstSellP50))
-	fmt.Fprintf(w, "  full close P50  %s\n", secs(prof.Exit.CloseP50))
-	fmt.Fprintf(w, "  closed pnl      $%.0f  (%.0f%% win rate, %d closed, confirmed)\n",
-		prof.Exit.ClosedPnl, prof.Exit.ClosedWinRate*100, prof.Exit.CloseP50.N)
-	if prof.Exit.CensoredPnl != 0 {
-		fmt.Fprintf(w, "  censored pnl    $%.0f  (inferred/unknown origin — research only)\n", prof.Exit.CensoredPnl)
-	}
-	fmt.Fprintf(w, "  incomplete      %.0f%%  (data gap: opening buys unseen) pnl $%.0f\n",
+	fmt.Fprintf(w, "  partial exits       %s\n", twoPct(prof.Exit.PartialExitRatio))
+	fmt.Fprintf(w, "  first sell P50      %s\n", twoSecs(prof.Exit.FirstSellP50))
+	fmt.Fprintf(w, "  full close P50      %s\n", twoSecs(prof.Exit.CloseP50))
+	fmt.Fprintf(w, "  closed pnl          %s\n", twoPnl(prof.Exit.ClosedPnl, prof.Exit.ClosedWinRate))
+	fmt.Fprintf(w, "  incomplete          %.0f%% episodes (data gap) pnl $%.0f\n",
 		prof.Exit.IncompleteRatio*100, prof.Exit.IncompletePnl)
+	if prof.Exit.CensoredPnl != 0 {
+		fmt.Fprintf(w, "  censored pnl        $%.0f (origin unknown, complete data)\n", prof.Exit.CensoredPnl)
+	}
+	fmt.Fprintf(w, "\n  confirmed = independently proven zero balance (no source yet → n/a)\n")
+	fmt.Fprintf(w, "  inferred  = visible ledger zero — research use only, never fact\n")
 	return nil
 }
 
@@ -181,6 +180,51 @@ func inCohort(ce storage.ClassifiedEntry, sinceUnix int64) bool {
 		opening = ce.TradeTime - ce.SinceInitialSecs
 	}
 	return opening >= sinceUnix
+}
+
+// two* helpers render the dual evidence columns: confirmed | inferred.
+func twoCells(strict, research mechanism.MedianStat, fmtFn func(mechanism.MedianStat) string) string {
+	s := "n/a"
+	if strict.N > 0 {
+		s = fmtFn(strict)
+	}
+	r := "n/a"
+	if research.N > 0 {
+		r = fmtFn(research)
+	}
+	return fmt.Sprintf("%-11s %-11s", s, r)
+}
+
+func twoPct(t mechanism.TwoStat) string  { return twoCells(t.Strict, t.Research, pctMed) }
+func twoUsd(t mechanism.TwoStat) string  { return twoCells(t.Strict, t.Research, usdMed) }
+func twoSecs(t mechanism.TwoStat) string { return twoCells(t.Strict, t.Research, secsMed) }
+func twoNum(t mechanism.TwoStat) string  { return twoCells(t.Strict, t.Research, numMed) }
+
+func twoPnl(pnl, win mechanism.TwoStat) string {
+	s, r := "n/a", "n/a"
+	if pnl.Strict.N > 0 {
+		s = fmt.Sprintf("$%.0f (%.0f%% win, %d)", pnl.Strict.Value, win.Strict.Value*100, pnl.Strict.N)
+	}
+	if pnl.Research.N > 0 {
+		r = fmt.Sprintf("$%.0f (%.0f%% win, %d)", pnl.Research.Value, win.Research.Value*100, pnl.Research.N)
+	}
+	return fmt.Sprintf("%-11s %-11s", s, r)
+}
+
+func usdMed(m mechanism.MedianStat) string {
+	return fmt.Sprintf("$%.0f (%d)", m.Value, m.N)
+}
+
+func secsMed(m mechanism.MedianStat) string {
+	return fmt.Sprintf("%.0fs (%d)", m.Value, m.N)
+}
+
+func numMed(m mechanism.MedianStat) string {
+	return fmt.Sprintf("%.1f (%d)", m.Value, m.N)
+}
+
+func pctMed(m mechanism.MedianStat) string {
+	return fmt.Sprintf("%+.1f%% (%d)", m.Value, m.N)
 }
 
 func usd(m mechanism.MedianStat) string {
@@ -202,11 +246,4 @@ func num(m mechanism.MedianStat) string {
 		return "n/a"
 	}
 	return fmt.Sprintf("%.1f (%d)", m.Value, m.N)
-}
-
-func pctMed(m mechanism.MedianStat) string {
-	if m.N == 0 {
-		return "n/a"
-	}
-	return fmt.Sprintf("%+.1f%% (%d)", m.Value, m.N)
 }

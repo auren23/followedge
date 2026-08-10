@@ -2,7 +2,7 @@
 
 **Profit Actor Discovery & Strategy Replication Engine.**
 
-版本：`v0.2.0.5-censoring-semantics`。
+版本：`v0.2.1-mechanism-evidence`。
 
 核心问题不是"哪些信号可以买"，而是：
 
@@ -149,7 +149,8 @@ edge 都必须扛住它。样本量远不够下结论，继续积累 5,000+ even
 | `v0.2.0.2-entry-observation-integrity` | follower entry 事件级传播（SetFollowerEntry，多 horizon 不再 lookback_miss）、chase 去 horizon、episode 全历史重建防左截断、qty 相对 epsilon、prior-flow dataset 边界 validity、initial/add entry context 分离 |
 | `v0.2.0.3-cohort-backfill-integrity` | migration 009 历史 entry backfill（旧库长 horizon 恢复可填）、behavior 统一 entry-cohort（adds 按 opening 时间纳入）、positionBook 共享相对 epsilon（episode/分类同一账本） |
 | `v0.2.0.4-behavior-freeze` | positionBook 生命周期（full close 重置 peak）、OriginKnown 左审查、ClassifiedEntry 拆 TokenAmount/AmountUSD、RebuildEpisodes 明确 legacy/debug 缓存 |
-| `v0.2.0.5-censoring-semantics`（本版） | OriginKnown bool → OriginQuality 三态（Censored/VisibleZero/ConfirmedZero）：可见账本归零 ≠ 真实仓位归零（隐藏 pre-dataset 持仓），Confirmed 目前无数据源可达；add/position/exit 统计默认只消费 Confirmed，censored pnl 单列 |
+| `v0.2.0.5-censoring-semantics` | OriginKnown bool → OriginQuality 三态（Censored/VisibleZero/ConfirmedZero）：可见账本归零 ≠ 真实仓位归零，Confirmed 目前无数据源可达 |
+| `v0.2.1-mechanism-evidence`（本版） | 双证据通道：全部统计以 confirmed / inferred 双列输出（Strict=ConfirmedZero，Research=VisibleZero+ConfirmedZero 排除 Censored/DataGap）；Oversold 降级 origin 回 Censored；pnl 拆互斥三桶（research / censored-complete / data-gap）；trap：生产路径永不产生 Confirmed |
 | `v0.2.1-mechanism` | Mechanism Analyzer（他靠什么赚钱）、Hypothesis 注册、archetype 聚类 |
 | `v0.3.0-experiment` | Replay/Experiment Engine（train/val/test）、Strategy 血缘注册 |
 | `v0.4.0-shadow` | 实时 Shadow Copy + Strategy Clone |

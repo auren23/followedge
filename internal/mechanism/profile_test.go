@@ -2,8 +2,11 @@ package mechanism
 
 import (
 	"math"
+	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/auren23/followedge/internal/domain"
 	"github.com/auren23/followedge/internal/storage"
 )
 
@@ -63,36 +66,36 @@ func TestBuildProfile(t *testing.T) {
 		t.Errorf("initial = %d (conf %d, vis %d, cens %d) add %d, want 3 (3/0/0)/1",
 			p.Entry.InitialCount, p.Entry.InitialConfirmed, p.Entry.InitialVisible, p.Entry.InitialCensored, p.Entry.AddCount)
 	}
-	if math.Abs(p.Entry.ReentryRate-0.25) > 0.001 { // 4 episodes, 3 tokens
-		t.Errorf("reentry = %.2f, want 0.25", p.Entry.ReentryRate)
+	if math.Abs(p.Entry.ReentryRate.Strict.Value-(1.0/3.0)) > 0.001 { // 3 confirmed episodes, 2 tokens
+		t.Errorf("reentry (strict) = %.2f, want 0.33", p.Entry.ReentryRate.Strict.Value)
 	}
 	// median chase: INITIAL entries only → [1,2,4] (add's 3 excluded)
-	if p.Entry.MedianChase.Value != 2 || p.Entry.MedianChase.N != 3 {
-		t.Errorf("median chase = %.0f (n%d), want 2 (n3, initial only)", p.Entry.MedianChase.Value, p.Entry.MedianChase.N)
+	if p.Entry.MedianChase.Strict.Value != 2 || p.Entry.MedianChase.Strict.N != 3 {
+		t.Errorf("median chase = %.0f (n%d), want 2 (n3, initial only)", p.Entry.MedianChase.Strict.Value, p.Entry.MedianChase.Strict.N)
 	}
-	if p.Entry.MedianAddChase.Value != 3 || p.Entry.MedianAddChase.N != 1 {
-		t.Errorf("median add chase = %.0f (n%d), want 3 (n1)", p.Entry.MedianAddChase.Value, p.Entry.MedianAddChase.N)
+	if p.Entry.MedianAddChase.Strict.Value != 3 || p.Entry.MedianAddChase.Strict.N != 1 {
+		t.Errorf("median add chase = %.0f (n%d), want 3 (n1)", p.Entry.MedianAddChase.Strict.Value, p.Entry.MedianAddChase.Strict.N)
 	}
-	if p.Entry.MedianSinceInitialSecs.Value != 50 || p.Entry.MedianSinceInitialSecs.N != 1 {
-		t.Errorf("since initial = %.0f (n%d), want 50 (n1)", p.Entry.MedianSinceInitialSecs.Value, p.Entry.MedianSinceInitialSecs.N)
+	if p.Entry.MedianSinceInitialSecs.Strict.Value != 50 || p.Entry.MedianSinceInitialSecs.Strict.N != 1 {
+		t.Errorf("since initial = %.0f (n%d), want 50 (n1)", p.Entry.MedianSinceInitialSecs.Strict.Value, p.Entry.MedianSinceInitialSecs.Strict.N)
 	}
 	// prior flow: only VALID windows → [2,4] (the T2 window predates the dataset)
-	if p.Entry.SmartPriorP50.Value != 3 || p.Entry.SmartPriorP50.N != 2 || p.Entry.PriorFlowN != 2 {
-		t.Errorf("prior smart = %.0f (n%d, flowN %d), want 3 (n2)", p.Entry.SmartPriorP50.Value, p.Entry.SmartPriorP50.N, p.Entry.PriorFlowN)
+	if p.Entry.SmartPriorP50.Strict.Value != 3 || p.Entry.SmartPriorP50.Strict.N != 2 {
+		t.Errorf("prior smart = %.0f (n%d, flowN %d), want 3 (n2)", p.Entry.SmartPriorP50.Strict.Value, p.Entry.SmartPriorP50.Strict.N, p.Entry.SmartPriorP50.Strict.N)
 	}
-	if math.Abs(p.Entry.Cluster3Plus-0.50) > 0.001 { // 4 of [2,4] >= 3
-		t.Errorf("cluster3plus = %.2f, want 0.50", p.Entry.Cluster3Plus)
+	if math.Abs(p.Entry.Cluster3Plus.Strict.Value-0.50) > 0.001 { // 4 of [2,4] >= 3
+		t.Errorf("cluster3plus = %.2f, want 0.50", p.Entry.Cluster3Plus.Strict.Value)
 	}
 	// sizes: gap episode's $0 must NOT enter — initial buys [100,200,30] → 100
-	if p.Entry.MedianInitialBuy.Value != 100 || p.Entry.MedianInitialBuy.N != 3 {
-		t.Errorf("initial buy = %.0f (n%d), want 100 (n3, gap excluded)", p.Entry.MedianInitialBuy.Value, p.Entry.MedianInitialBuy.N)
+	if p.Entry.MedianInitialBuy.Strict.Value != 100 || p.Entry.MedianInitialBuy.Strict.N != 3 {
+		t.Errorf("initial buy = %.0f (n%d), want 100 (n3, gap excluded)", p.Entry.MedianInitialBuy.Strict.Value, p.Entry.MedianInitialBuy.Strict.N)
 	}
 	// add capital: only episodes that added → [50]
-	if p.Entry.MedianAddBuy.Value != 50 || p.Entry.MedianAddBuy.N != 1 {
-		t.Errorf("add buy = %.0f (n%d), want 50 (n1)", p.Entry.MedianAddBuy.Value, p.Entry.MedianAddBuy.N)
+	if p.Entry.MedianAddBuy.Strict.Value != 50 || p.Entry.MedianAddBuy.Strict.N != 1 {
+		t.Errorf("add buy = %.0f (n%d), want 50 (n1)", p.Entry.MedianAddBuy.Strict.Value, p.Entry.MedianAddBuy.Strict.N)
 	}
-	if math.Abs(p.Entry.AddEpisodeRate-0.25) > 0.001 {
-		t.Errorf("add episode rate = %.2f, want 0.25", p.Entry.AddEpisodeRate)
+	if math.Abs(p.Entry.AddEpisodeRate.Strict.Value-(1.0/3.0)) > 0.001 { // 1 of 3 confirmed episodes added
+		t.Errorf("add episode rate (strict) = %.2f, want 0.33", p.Entry.AddEpisodeRate.Strict.Value)
 	}
 
 	// POSITION — hold median only over closed (180, 300)
@@ -100,25 +103,29 @@ func TestBuildProfile(t *testing.T) {
 		t.Errorf("episodes = %d (trusted %d censored %d), want 4 (3/1)",
 			p.Position.Episodes, p.Position.Trusted, p.Position.Censored)
 	}
-	if p.Position.MedianHoldSecs.Value != 240 || p.Position.MedianHoldSecs.N != 2 {
-		t.Errorf("median hold = %.0f (n%d), want 240 (n2, closed only)", p.Position.MedianHoldSecs.Value, p.Position.MedianHoldSecs.N)
+	if p.Position.MedianHoldSecs.Strict.Value != 240 || p.Position.MedianHoldSecs.Strict.N != 2 {
+		t.Errorf("median hold = %.0f (n%d), want 240 (n2, closed only)", p.Position.MedianHoldSecs.Strict.Value, p.Position.MedianHoldSecs.Strict.N)
 	}
 
-	// EXIT — real partial exits: only T1 (1 of 2 fully-visible observable)
-	if math.Abs(p.Exit.PartialExitRatio-0.50) > 0.001 || p.Exit.PartialExitN != 1 || p.Exit.ObservableN != 2 {
-		t.Errorf("partial exits = %.2f (%d of %d), want 0.50 (1 of 2)", p.Exit.PartialExitRatio, p.Exit.PartialExitN, p.Exit.ObservableN)
+	// EXIT — real partial exits: only T1 (1 of 2 fully-visible confirmed)
+	if math.Abs(p.Exit.PartialExitRatio.Strict.Value-0.50) > 0.001 ||
+		p.Exit.PartialExitRatio.Strict.N != 2 ||
+		math.Abs(p.Exit.PartialExitRatio.Strict.Value*float64(p.Exit.PartialExitRatio.Strict.N)-1) > 0.001 {
+		t.Errorf("partial exits = %.2f (n=%d), want 0.50 (1 of 2)", p.Exit.PartialExitRatio.Strict.Value, p.Exit.PartialExitRatio.Strict.N)
 	}
-	if p.Exit.FirstSellP50.Value != 180 || p.Exit.FirstSellP50.N != 2 { // 60, 300
-		t.Errorf("first sell P50 = %.0f (n%d), want 180 (n2)", p.Exit.FirstSellP50.Value, p.Exit.FirstSellP50.N)
+	if p.Exit.FirstSellP50.Strict.Value != 180 || p.Exit.FirstSellP50.Strict.N != 2 { // 60, 300
+		t.Errorf("first sell P50 = %.0f (n%d), want 180 (n2)", p.Exit.FirstSellP50.Strict.Value, p.Exit.FirstSellP50.Strict.N)
 	}
-	if p.Exit.CloseP50.Value != 240 || p.Exit.CloseP50.N != 2 {
-		t.Errorf("close P50 = %.0f (n%d), want 240 (n2)", p.Exit.CloseP50.Value, p.Exit.CloseP50.N)
+	if p.Exit.CloseP50.Strict.Value != 240 || p.Exit.CloseP50.Strict.N != 2 {
+		t.Errorf("close P50 = %.0f (n%d), want 240 (n2)", p.Exit.CloseP50.Strict.Value, p.Exit.CloseP50.Strict.N)
 	}
-	if p.Exit.ClosedPnl != -50 || math.Abs(p.Exit.ClosedWinRate-0.50) > 0.001 {
-		t.Errorf("closed pnl/win = %.0f/%.2f, want -50/0.50", p.Exit.ClosedPnl, p.Exit.ClosedWinRate)
+	if p.Exit.ClosedPnl.Strict.Value != -50 || math.Abs(p.Exit.ClosedWinRate.Strict.Value-0.50) > 0.001 {
+		t.Errorf("closed pnl/win = %.0f/%.2f, want -50/0.50", p.Exit.ClosedPnl.Strict.Value, p.Exit.ClosedWinRate.Strict.Value)
 	}
-	if p.Exit.CensoredPnl != 30 { // the data-gap (censored) episode's pnl
-		t.Errorf("censored pnl = %.0f, want 30", p.Exit.CensoredPnl)
+	// pnl buckets are MUTUALLY EXCLUSIVE: the gap episode's pnl lives in
+	// IncompletePnl, censored-complete stays 0
+	if p.Exit.CensoredPnl != 0 || p.Exit.IncompletePnl != 30 {
+		t.Errorf("pnl buckets = censored %.0f incomplete %.0f, want 0/30", p.Exit.CensoredPnl, p.Exit.IncompletePnl)
 	}
 	if math.Abs(p.Exit.IncompleteRatio-0.25) > 0.001 || p.Exit.IncompletePnl != 30 {
 		t.Errorf("incomplete = %.2f pnl %.0f, want 0.25/30", p.Exit.IncompleteRatio, p.Exit.IncompletePnl)
@@ -126,9 +133,10 @@ func TestBuildProfile(t *testing.T) {
 
 	// missing data → n/a (N=0), not a fabricated zero
 	empty := BuildProfile("W", nil, nil)
-	if empty.Entry.MedianChase.N != 0 || empty.Entry.MedianAge.N != 0 ||
-		empty.Exit.FirstSellP50.N != 0 || empty.Exit.CloseP50.N != 0 {
-		t.Errorf("empty profile must carry N=0, got %+v", empty)
+	if empty.Entry.MedianChase.Strict.N != 0 || empty.Entry.MedianAge.Strict.N != 0 ||
+		empty.Exit.FirstSellP50.Strict.N != 0 || empty.Exit.CloseP50.Strict.N != 0 ||
+		empty.Entry.MedianChase.Research.N != 0 {
+		t.Errorf("empty profile must carry N=0 on both channels, got %+v", empty)
 	}
 }
 
@@ -156,7 +164,78 @@ func TestBuildProfileWindowCohort(t *testing.T) {
 	if p.Entry.InitialCount != 0 || p.Entry.AddCount != 1 {
 		t.Errorf("initial/add = %d/%d, want 0/1 (window shows only the add)", p.Entry.InitialCount, p.Entry.AddCount)
 	}
-	if p.Entry.MedianInitialBuy.Value != 100 || p.Entry.MedianInitialBuy.N != 1 {
-		t.Errorf("initial buy = %.0f (n%d), want 100 (n1 — full-history reconstruction)", p.Entry.MedianInitialBuy.Value, p.Entry.MedianInitialBuy.N)
+	if p.Entry.MedianInitialBuy.Strict.Value != 100 || p.Entry.MedianInitialBuy.Strict.N != 1 {
+		t.Errorf("initial buy = %.0f (n%d), want 100 (n1 — full-history reconstruction)", p.Entry.MedianInitialBuy.Strict.Value, p.Entry.MedianInitialBuy.Strict.N)
+	}
+}
+
+// TestProductionPathNeverConfirms is the end-to-end evidence trap: the REAL
+// storage reconstruction has no way to produce OriginConfirmedZero (no
+// source proves a zero balance), so a profile built from production-shaped
+// data must show confirmed=0 everywhere while the research channel carries
+// the post-visible-close episodes.
+func TestProductionPathNeverConfirms(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	base := now.Add(-2 * time.Hour).Truncate(30 * time.Second)
+	mk := func(id, token, side string, ts time.Time, qty float64) {
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W_E2E", token, side),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W_E2E", WalletType: domain.WalletSmartMoney,
+			TokenAddress: token, Side: domain.Side(side), AmountUSD: qty,
+			TokenAmount: qty, PriceUSD: 1.0, BuyCostUSD: 0,
+			TradeTime: ts, ReceivedAt: ts,
+		}
+		if _, err := s.InsertEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("e1", "T1", "buy", base, 100)
+	mk("e2", "T1", "sell", base.Add(30*time.Second), 100) // visible zero
+	mk("e3", "T1", "buy", base.Add(60*time.Second), 50)   // VisibleZero episode
+	mk("e4", "T1", "sell", base.Add(90*time.Second), 50)  // closes
+
+	episodes, err := s.ReconstructEpisodesFor("W_E2E", now.Add(-3*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	classified, err := s.ClassifiedEntries("W_E2E")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := make([]EntryFact, 0, len(classified))
+	for _, ce := range classified {
+		entries = append(entries, EntryFact{
+			Initial: ce.Initial, TradeTime: ce.TradeTime, ReceivedAt: ce.ReceivedAt,
+			SinceInitialSecs: ce.SinceInitialSecs, OriginQuality: ce.OriginQuality,
+		})
+	}
+	p := BuildProfile("W_E2E", episodes, entries)
+
+	// e1 is the first observed episode (Censored), e3 sits after a visible
+	// close (VisibleZero) — nothing can be Confirmed on the production path
+	if p.Entry.InitialConfirmed != 0 || p.Entry.InitialVisible != 1 || p.Entry.InitialCensored != 1 {
+		t.Errorf("initial split = conf %d vis %d cens %d, want 0/1/1",
+			p.Entry.InitialConfirmed, p.Entry.InitialVisible, p.Entry.InitialCensored)
+	}
+	if p.Position.Trusted != 0 || p.Position.Censored != 2 {
+		t.Errorf("episodes = trusted %d censored %d, want 0/2", p.Position.Trusted, p.Position.Censored)
+	}
+	// strict channel must be completely empty; research channel has data
+	if p.Entry.MedianChase.Strict.N != 0 || p.Entry.MedianInitialBuy.Strict.N != 0 {
+		t.Errorf("strict channel must be empty, got %+v", p.Entry)
+	}
+	if p.Position.MedianHoldSecs.Research.N == 0 {
+		t.Errorf("research channel must carry the visible-zero episodes, got %+v", p.Position.MedianHoldSecs)
+	}
+	if p.Entry.ReentryRate.Strict.N != 0 || p.Entry.ReentryRate.Research.N != 1 {
+		t.Errorf("reentry = strict n%d research n%d, want 0/1 (one visible-zero episode)",
+			p.Entry.ReentryRate.Strict.N, p.Entry.ReentryRate.Research.N)
 	}
 }

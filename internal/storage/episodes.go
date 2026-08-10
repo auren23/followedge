@@ -295,6 +295,9 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 				cur.DataGap = true
 				cur.ClosedAt = int64(ts)
 				cur.HoldDurationS = cur.ClosedAt - cur.OpenedAt
+				// an oversold leg proves our trajectory has a gap — the
+				// next episode's origin confidence drops back to Censored
+				origin = OriginCensored
 				flush()
 			}
 		}

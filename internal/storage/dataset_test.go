@@ -970,3 +970,57 @@ func TestHiddenPreDatasetPosition(t *testing.T) {
 		}
 	}
 }
+
+// TestOversoldDowngradesOrigin pins the P1 state-machine fix: after an
+// oversold leg (trajectory gap), the next episode's origin confidence must
+// drop BACK to Censored — a previous visible zero does not survive a gap.
+func TestOversoldDowngradesOrigin(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	base := now.Add(-1 * time.Hour).Truncate(30 * time.Second)
+	mk := func(id, side string, ts time.Time, qty float64) {
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W_OV", "TOKEN_OV", side),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W_OV", WalletType: domain.WalletSmartMoney,
+			TokenAddress: "TOKEN_OV", Side: domain.Side(side), AmountUSD: qty,
+			TokenAmount: qty, PriceUSD: 1.0, BuyCostUSD: 0,
+			TradeTime: ts, ReceivedAt: ts,
+		}
+		if _, err := s.InsertEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("o1", "buy", base, 100)
+	mk("o2", "sell", base.Add(30*time.Second), 100) // visible zero → VisibleZero
+	mk("o3", "buy", base.Add(60*time.Second), 50)   // new episode (VisibleZero)
+	mk("o4", "sell", base.Add(90*time.Second), 999) // oversold: gap in trajectory
+	mk("o5", "buy", base.Add(120*time.Second), 10)  // MUST be Censored again
+
+	eps, err := s.ReconstructEpisodesFor("W_OV", now.Add(-2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eps) != 3 {
+		t.Fatalf("episodes = %+v, want 3", eps)
+	}
+	if last := eps[len(eps)-1]; last.OriginQuality != OriginCensored {
+		t.Errorf("post-oversold episode must be OriginCensored, got %v", last.OriginQuality)
+	}
+
+	classified, err := s.ClassifiedEntries("W_OV")
+	if err != nil {
+		t.Fatal(err)
+	}
+	o5 := domain.EventID("sol", "o5", "W_OV", "TOKEN_OV", "buy")
+	for _, ce := range classified {
+		if ce.EventID == o5 && ce.OriginQuality != OriginCensored {
+			t.Errorf("o5 (post-oversold buy) must be OriginCensored, got %v", ce.OriginQuality)
+		}
+	}
+}

@@ -3,15 +3,19 @@
 //
 // Point-in-time discipline carries over from v0.1: entry-context features
 // (prior flow, chase) only ever use data knowable at the entry's trade_time.
-// Semantic notes (v0.2.0.2):
-//   - "partial exit" = sell legs that LEFT visible quantity (PartialExitLegs),
-//     never the data-gap status EpisodePartial;
-//   - chase comes from entry observations only (never future-conditioned)
-//     and is horizon-independent;
-//   - INITIAL entry context and ADD context are separate questions — why he
-//     opens vs why he adds must not be conflated;
-//   - data-gap episodes never enter initial-buy / capital medians;
-//   - every feature that can be missing carries its sample size (N).
+//
+// EVIDENCE POLICY (v0.2.1): every statistic is reported under TWO policies
+// side by side, because the strict channel alone is empty by design:
+//
+//	Strict   — OriginConfirmedZero episodes only. No current data source
+//	           can prove a real zero balance (GMGN's is_open_or_close
+//	           conflates close/reduce), so this stays n/a until on-chain
+//	           balance evidence arrives.
+//	Research — VisibleZero + ConfirmedZero episodes (Censored and
+//	           data-gap excluded). Inferred, never dressed up as fact.
+//
+// Censored episodes are counted and their pnl shown separately as
+// diagnostics — dataset-coverage information, not mechanism evidence.
 package mechanism
 
 import (
@@ -27,6 +31,15 @@ type MedianStat struct {
 	N     int
 }
 
+// TwoStat carries one statistic under the two evidence policies. N=0 on
+// both sides means no evidence at all. For ratios (reentry, add-episode,
+// cluster>=3, partial-exit, win rate) Value is the ratio and N its
+// denominator.
+type TwoStat struct {
+	Strict   MedianStat // OriginConfirmedZero only
+	Research MedianStat // VisibleZero + ConfirmedZero (Censored/DataGap excluded)
+}
+
 // EntryFact is one buy event's entry-time context (pre-classified by the
 // caller from the full event stream).
 type EntryFact struct {
@@ -40,10 +53,8 @@ type EntryFact struct {
 	PriorValid       bool  // prior-flow window lies inside the dataset (not truncated)
 	SinceInitialSecs int64 // adds only: time since the episode's opening buy
 	// OriginQuality rates the evidence behind this buy's episode (initial
-	// or add). Initial-entry and add features below are only consumed from
-	// OriginConfirmedZero episodes — the only level that proves the wallet
-	// actually had no position before. VisibleZero is inferred, research
-	// only; Censored means a hidden pre-dataset position may exist.
+	// or add). Initial-entry and add features are consumed per evidence
+	// policy; Censored means a hidden pre-dataset position may exist.
 	OriginQuality storage.OriginQuality
 }
 
@@ -52,8 +63,8 @@ type EntryStats struct {
 	InitialCount int // opening buys
 	AddCount     int // add buys
 	// Opening buys split by origin quality. Only ConfirmedZero feeds the
-	// initial-entry features below; VisibleZero is an inference (ledger
-	// zero ≠ real zero) and Censored means a hidden position may exist.
+	// Strict side; VisibleZero is an inference (ledger zero ≠ real zero)
+	// and Censored means a hidden position may exist.
 	InitialConfirmed int
 	InitialVisible   int
 	InitialCensored  int
@@ -61,55 +72,51 @@ type EntryStats struct {
 	// ReentryRate: (episodes - distinct tokens) / episodes — how often the
 	// actor comes back to a token it already traded (scale-ins are counted
 	// separately as adds, not as re-entry).
-	ReentryRate float64
+	ReentryRate TwoStat
 
-	MedianInitialBuy MedianStat // opening buy notional per COMPLETE, confirmed episode
-	MedianAddBuy     MedianStat // add notional per episode THAT ADDED (Adds > 0)
-	AddEpisodeRate   float64    // episodes with adds / episodes
-	MedianCapitalIn  MedianStat // total capital in per COMPLETE, confirmed episode
+	MedianInitialBuy TwoStat // opening buy notional per complete episode
+	MedianAddBuy     TwoStat // add notional per episode THAT ADDED (Adds > 0)
+	AddEpisodeRate   TwoStat // episodes with adds / episodes
+	MedianCapitalIn  TwoStat // total capital in per complete episode
 
-	MedianAge              MedianStat // initial entries only: source age (received - trade)
-	MedianChase            MedianStat // initial entries only (entry observations)
-	MedianAddChase         MedianStat // adds only
-	MedianSinceInitialSecs MedianStat // adds to CONFIRMED episodes only: seconds after opening
+	MedianAge              TwoStat // source age (received - trade), initial entries
+	MedianChase            TwoStat // initial entries (entry observations)
+	MedianAddChase         TwoStat // adds
+	MedianSinceInitialSecs TwoStat // adds: seconds after the opening buy
 
-	SmartPriorP50 MedianStat // confirmed initial entries with a valid prior-flow window
-	KOLPriorP50   MedianStat
-	Cluster3Plus  float64 // share of valid-prior confirmed initial entries with >= 3 prior smart buyers
-	PriorFlowN    int     // confirmed initial entries with valid prior flow
+	SmartPriorP50 TwoStat // prior smart buyers at entry, initial entries
+	KOLPriorP50   TwoStat
+	Cluster3Plus  TwoStat // share of initial entries with >= 3 prior smart buyers
 }
 
 // PositionStats are facts about how the actor manages positions.
-// Core statistics consume CONFIRMED episodes only; censored episodes
-// (left-censored or inferred-zero) are counted and shown separately.
+// Core statistics are TwoStat (Strict=Confirmed, Research=Visible+Confirmed);
+// censored episodes are counted and reported separately.
 type PositionStats struct {
-	Episodes       int // all episodes in the cohort
-	Trusted        int // OriginConfirmedZero
-	Censored       int // everything else (Censored + VisibleZero)
-	MedianAdds     MedianStat
-	MedianReduces  MedianStat
-	MedianHoldSecs MedianStat // closed, confirmed episodes only
+	Episodes int // all episodes in the cohort
+	Trusted  int // OriginConfirmedZero
+	Censored int // everything else (Censored + VisibleZero)
+
+	MedianAdds     TwoStat
+	MedianReduces  TwoStat
+	MedianHoldSecs TwoStat // closed episodes only
 }
 
-// ExitStats are facts about how the actor exits.
+// ExitStats are facts about how the actor exits. Core statistics are
+// TwoStat; censored pnl and data-gap pnl are MUTUALLY EXCLUSIVE diagnostic
+// buckets (a data-gap episode always has OriginCensored — its opening buy
+// is unseen — so the three buckets partition realized pnl).
 type ExitStats struct {
-	// PartialExitRatio: episodes with PartialExitLegs > 0 among fully
-	// visible episodes with observable exits — REAL partial exits, not
-	// data-gap statuses.
-	PartialExitRatio float64
-	PartialExitN     int
-	ObservableN      int // fully visible episodes with at least one sell leg
+	PartialExitRatio TwoStat // episodes with PartialExitLegs > 0 / observable exits
+	FirstSellP50     TwoStat // seconds from opening buy to first sell leg
+	CloseP50         TwoStat // seconds from opening buy to full close (closed only)
 
-	FirstSellP50 MedianStat // seconds from opening buy to first sell leg
-	CloseP50     MedianStat // seconds from opening buy to full close (closed only)
-
-	ClosedPnl     float64 // realized pnl of truly closed episodes
-	ClosedWinRate float64 // profitable / closed
+	ClosedPnl     TwoStat // Value = realized pnl, N = closed episodes
+	ClosedWinRate TwoStat // profitable / closed
 
 	IncompleteRatio float64 // data-gap episodes / all episodes
-	IncompletePnl   float64 // realized pnl of data-gap episodes (shown separately)
-
-	CensoredPnl float64 // realized pnl of censored episodes (shown separately)
+	IncompletePnl   float64 // realized pnl of data-gap episodes
+	CensoredPnl     float64 // realized pnl of Censored, complete-data episodes
 }
 
 // ActorBehaviorProfile is the complete fact card of one actor's behavior.
@@ -127,155 +134,254 @@ func BuildProfile(wallet string, episodes []storage.Episode, entries []EntryFact
 	p := ActorBehaviorProfile{Wallet: wallet}
 
 	// ---- ENTRY ----
-	var ages, chases, addChases, sinceInitial []float64
-	var smartPrior, kolPrior []float64
+	var agesStrict, agesResearch, chasesStrict, chasesResearch []float64
+	var addChasesStrict, addChasesResearch, sinceStrict, sinceResearch []float64
+	var smartStrict, smartResearch, kolStrict, kolResearch []float64
 	for _, e := range entries {
 		if e.Initial {
 			p.Entry.InitialCount++
 			switch e.OriginQuality {
 			case storage.OriginConfirmedZero:
 				p.Entry.InitialConfirmed++
-				ages = append(ages, float64(e.ReceivedAt-e.TradeTime))
+				agesStrict = append(agesStrict, float64(e.ReceivedAt-e.TradeTime))
+				agesResearch = append(agesResearch, float64(e.ReceivedAt-e.TradeTime))
 				if e.HasChase {
-					chases = append(chases, e.ChasePct)
+					chasesStrict = append(chasesStrict, e.ChasePct)
+					chasesResearch = append(chasesResearch, e.ChasePct)
 				}
 				if e.PriorValid {
-					smartPrior = append(smartPrior, float64(e.SmartPrior))
-					kolPrior = append(kolPrior, float64(e.KOLPrior))
+					smartStrict = append(smartStrict, float64(e.SmartPrior))
+					smartResearch = append(smartResearch, float64(e.SmartPrior))
+					kolStrict = append(kolStrict, float64(e.KOLPrior))
+					kolResearch = append(kolResearch, float64(e.KOLPrior))
 				}
 			case storage.OriginVisibleZero:
 				p.Entry.InitialVisible++
+				agesResearch = append(agesResearch, float64(e.ReceivedAt-e.TradeTime))
+				if e.HasChase {
+					chasesResearch = append(chasesResearch, e.ChasePct)
+				}
+				if e.PriorValid {
+					smartResearch = append(smartResearch, float64(e.SmartPrior))
+					kolResearch = append(kolResearch, float64(e.KOLPrior))
+				}
 			default:
 				p.Entry.InitialCensored++
 			}
 		} else {
 			p.Entry.AddCount++
-			// adds of a left-censored episode are untrustworthy too — the
-			// "opening" they add to may not be the real opening
-			if e.OriginQuality == storage.OriginConfirmedZero {
+			switch e.OriginQuality {
+			case storage.OriginConfirmedZero:
 				if e.HasChase {
-					addChases = append(addChases, e.ChasePct)
+					addChasesStrict = append(addChasesStrict, e.ChasePct)
+					addChasesResearch = append(addChasesResearch, e.ChasePct)
 				}
-				sinceInitial = append(sinceInitial, float64(e.SinceInitialSecs))
+				sinceStrict = append(sinceStrict, float64(e.SinceInitialSecs))
+				sinceResearch = append(sinceResearch, float64(e.SinceInitialSecs))
+			case storage.OriginVisibleZero:
+				if e.HasChase {
+					addChasesResearch = append(addChasesResearch, e.ChasePct)
+				}
+				sinceResearch = append(sinceResearch, float64(e.SinceInitialSecs))
 			}
 		}
 	}
-	p.Entry.MedianAge = median(ages)
-	p.Entry.MedianChase = median(chases)
-	p.Entry.MedianAddChase = median(addChases)
-	p.Entry.MedianSinceInitialSecs = median(sinceInitial)
-	p.Entry.SmartPriorP50 = median(smartPrior)
-	p.Entry.KOLPriorP50 = median(kolPrior)
-	p.Entry.PriorFlowN = len(smartPrior)
-	if len(smartPrior) > 0 {
-		n3 := 0
-		for _, n := range smartPrior {
-			if n >= 3 {
-				n3++
-			}
-		}
-		p.Entry.Cluster3Plus = float64(n3) / float64(len(smartPrior))
-	}
+	p.Entry.MedianAge = two(median(agesStrict), median(agesResearch))
+	p.Entry.MedianChase = two(median(chasesStrict), median(chasesResearch))
+	p.Entry.MedianAddChase = two(median(addChasesStrict), median(addChasesResearch))
+	p.Entry.MedianSinceInitialSecs = two(median(sinceStrict), median(sinceResearch))
+	p.Entry.SmartPriorP50 = two(median(smartStrict), median(smartResearch))
+	p.Entry.KOLPriorP50 = two(median(kolStrict), median(kolResearch))
+	p.Entry.Cluster3Plus = two(
+		ratioStat(smartStrict, 3),
+		ratioStat(smartResearch, 3),
+	)
 
+	// ---- episodes (sizes, position, exit) ----
+	var initStrict, initResearch, capStrict, capResearch []float64
+	var addBuyStrict, addBuyResearch []float64
+	var addedStrict, addedResearch, episodeN int
 	tokens := map[string]bool{}
-	var initBuys, addBuys, capIn []float64
-	var addedEpisodes, episodeN int
+	tokensStrict := map[string]bool{}
+	tokensResearch := map[string]bool{}
+	strictN, researchN := 0, 0
 	for _, e := range episodes {
-		tokens[e.Token] = true
 		episodeN++
-		// data-gap episodes have no visible opening buy, and anything below
-		// OriginConfirmedZero may really be an add to a hidden position:
-		// neither may enter the initial-size medians as a true initial entry.
-		if !e.DataGap && e.OriginQuality == storage.OriginConfirmedZero {
-			initBuys = append(initBuys, e.InitialBuyUSD)
-			capIn = append(capIn, e.CapitalIn)
+		tokens[e.Token] = true
+		strict := e.OriginQuality == storage.OriginConfirmedZero
+		research := (e.OriginQuality == storage.OriginConfirmedZero ||
+			e.OriginQuality == storage.OriginVisibleZero) && !e.DataGap
+		if strict {
+			strictN++
+			p.Position.Trusted++
+			tokensStrict[e.Token] = true
+			if e.Adds > 0 {
+				addedStrict++
+				addBuyStrict = append(addBuyStrict, e.AddBuyUSD)
+			}
 		}
-		if e.Adds > 0 {
-			addedEpisodes++
-			addBuys = append(addBuys, e.AddBuyUSD)
+		if research {
+			researchN++
+			tokensResearch[e.Token] = true
+			if e.Adds > 0 {
+				addedResearch++
+				addBuyResearch = append(addBuyResearch, e.AddBuyUSD)
+			}
+		}
+		if strict {
+			initStrict = append(initStrict, e.InitialBuyUSD)
+			capStrict = append(capStrict, e.CapitalIn)
+		}
+		if research {
+			initResearch = append(initResearch, e.InitialBuyUSD)
+			capResearch = append(capResearch, e.CapitalIn)
 		}
 	}
 	if episodeN > 0 {
-		p.Entry.AddEpisodeRate = float64(addedEpisodes) / float64(episodeN)
-		p.Entry.ReentryRate = 1 - float64(len(tokens))/float64(episodeN)
+		p.Entry.ReentryRate = two(
+			reentryStat(tokensStrict, strictN),
+			reentryStat(tokensResearch, researchN),
+		)
+		p.Entry.AddEpisodeRate = two(
+			ratioStatN(addedStrict, strictN),
+			ratioStatN(addedResearch, researchN),
+		)
 	}
-	p.Entry.MedianInitialBuy = median(initBuys)
-	p.Entry.MedianAddBuy = median(addBuys)
-	p.Entry.MedianCapitalIn = median(capIn)
+	p.Entry.MedianInitialBuy = two(median(initStrict), median(initResearch))
+	p.Entry.MedianAddBuy = two(median(addBuyStrict), median(addBuyResearch))
+	p.Entry.MedianCapitalIn = two(median(capStrict), median(capResearch))
 
-	// ---- POSITION ----
 	p.Position.Episodes = episodeN
-	var adds, reduces, holds []float64
+	p.Position.Censored = episodeN - strictN
+	var addsS, addsR, redS, redR, holdS, holdR []float64
 	for _, e := range episodes {
-		trusted := e.OriginQuality == storage.OriginConfirmedZero
-		if trusted {
-			p.Position.Trusted++
-			adds = append(adds, float64(e.Adds))
-			reduces = append(reduces, float64(e.Reduces))
+		strict := e.OriginQuality == storage.OriginConfirmedZero
+		research := (e.OriginQuality == storage.OriginConfirmedZero ||
+			e.OriginQuality == storage.OriginVisibleZero) && !e.DataGap
+		if strict {
+			addsS = append(addsS, float64(e.Adds))
+			redS = append(redS, float64(e.Reduces))
 			if e.Status == storage.EpisodeClosed {
-				holds = append(holds, float64(e.HoldDurationS))
+				holdS = append(holdS, float64(e.HoldDurationS))
 			}
-		} else {
-			p.Position.Censored++
+		}
+		if research {
+			addsR = append(addsR, float64(e.Adds))
+			redR = append(redR, float64(e.Reduces))
+			if e.Status == storage.EpisodeClosed {
+				holdR = append(holdR, float64(e.HoldDurationS))
+			}
 		}
 	}
-	p.Position.MedianAdds = median(adds)
-	p.Position.MedianReduces = median(reduces)
-	p.Position.MedianHoldSecs = median(holds)
+	p.Position.MedianAdds = two(median(addsS), median(addsR))
+	p.Position.MedianReduces = two(median(redS), median(redR))
+	p.Position.MedianHoldSecs = two(median(holdS), median(holdR))
 
 	// ---- EXIT ----
-	var observable, partialN int
-	var firstSells, closes []float64
-	var closedN, closedWins int
+	var obsS, obsR, partialS, partialR int
+	var firstS, firstR, closeS, closeR []float64
+	var closedS, closedR, winsS, winsR int
+	var pnlS, pnlR, censoredPnl, gapPnl float64
 	var incompleteN int
 	for _, e := range episodes {
-		trusted := e.OriginQuality == storage.OriginConfirmedZero
 		if e.DataGap {
 			incompleteN++
-			p.Exit.IncompletePnl += e.RealizedPnL
+			gapPnl += e.RealizedPnL // data-gap bucket (always OriginCensored)
 		}
-		if !trusted {
-			// closed AND data-gap-partial episodes carry realized pnl
-			if e.Status == storage.EpisodeClosed || e.Status == storage.EpisodePartial {
-				p.Exit.CensoredPnl += e.RealizedPnL
+		strict := e.OriginQuality == storage.OriginConfirmedZero
+		research := (e.OriginQuality == storage.OriginConfirmedZero ||
+			e.OriginQuality == storage.OriginVisibleZero) && !e.DataGap
+		if !strict && !research {
+			if e.Status == storage.EpisodeClosed && !e.DataGap {
+				censoredPnl += e.RealizedPnL // censored, complete data
 			}
-			continue // core exit statistics consume confirmed episodes only
+			continue
 		}
-		// partial-exit behavior only makes sense for fully visible episodes:
-		// a data-gap episode's opening buy is unseen, so its exit behavior
-		// is not attributable.
 		if e.SellLegs > 0 && !e.DataGap {
-			observable++
-			if e.PartialExitLegs > 0 {
-				partialN++
+			if strict {
+				obsS++
+				if e.PartialExitLegs > 0 {
+					partialS++
+				}
+				if e.FirstSellAt > 0 {
+					firstS = append(firstS, float64(e.FirstSellAt-e.OpenedAt))
+				}
 			}
-			if e.FirstSellAt > 0 {
-				firstSells = append(firstSells, float64(e.FirstSellAt-e.OpenedAt))
+			if research {
+				obsR++
+				if e.PartialExitLegs > 0 {
+					partialR++
+				}
+				if e.FirstSellAt > 0 {
+					firstR = append(firstR, float64(e.FirstSellAt-e.OpenedAt))
+				}
 			}
 		}
 		if e.Status == storage.EpisodeClosed {
-			closes = append(closes, float64(e.HoldDurationS))
-			p.Exit.ClosedPnl += e.RealizedPnL
-			closedN++
-			if e.RealizedPnL > 0 {
-				closedWins++
+			if strict {
+				closedS++
+				pnlS += e.RealizedPnL
+				closeS = append(closeS, float64(e.HoldDurationS))
+				if e.RealizedPnL > 0 {
+					winsS++
+				}
+			}
+			if research {
+				closedR++
+				pnlR += e.RealizedPnL
+				closeR = append(closeR, float64(e.HoldDurationS))
+				if e.RealizedPnL > 0 {
+					winsR++
+				}
 			}
 		}
 	}
-	p.Exit.FirstSellP50 = median(firstSells)
-	p.Exit.CloseP50 = median(closes)
-	p.Exit.ObservableN = observable
-	if observable > 0 {
-		p.Exit.PartialExitRatio = float64(partialN) / float64(observable)
-		p.Exit.PartialExitN = partialN
-	}
-	if closedN > 0 {
-		p.Exit.ClosedWinRate = float64(closedWins) / float64(closedN)
-	}
+	p.Exit.PartialExitRatio = two(
+		ratioStatN(partialS, obsS),
+		ratioStatN(partialR, obsR),
+	)
+	p.Exit.FirstSellP50 = two(median(firstS), median(firstR))
+	p.Exit.CloseP50 = two(median(closeS), median(closeR))
+	p.Exit.ClosedPnl = two(
+		MedianStat{Value: pnlS, N: closedS},
+		MedianStat{Value: pnlR, N: closedR},
+	)
+	p.Exit.ClosedWinRate = two(
+		ratioStatN(winsS, closedS),
+		ratioStatN(winsR, closedR),
+	)
 	if episodeN > 0 {
 		p.Exit.IncompleteRatio = float64(incompleteN) / float64(episodeN)
 	}
+	p.Exit.IncompletePnl = gapPnl
+	p.Exit.CensoredPnl = censoredPnl
 	return p
+}
+
+func two(s, r MedianStat) TwoStat { return TwoStat{Strict: s, Research: r} }
+
+func reentryStat(tokens map[string]bool, n int) MedianStat {
+	if n == 0 {
+		return MedianStat{}
+	}
+	return MedianStat{Value: 1 - float64(len(tokens))/float64(n), N: n}
+}
+
+func ratioStat(values []float64, threshold float64) MedianStat {
+	n := 0
+	for _, v := range values {
+		if v >= threshold {
+			n++
+		}
+	}
+	return ratioStatN(n, len(values))
+}
+
+func ratioStatN(num, den int) MedianStat {
+	if den == 0 {
+		return MedianStat{}
+	}
+	return MedianStat{Value: float64(num) / float64(den), N: den}
 }
 
 func median(a []float64) MedianStat {
