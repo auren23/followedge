@@ -26,7 +26,7 @@ import (
 	"github.com/auren23/followedge/internal/storage"
 )
 
-const version = "0.1.2-entry-pit"
+const version = "0.1.3-dataset"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -348,14 +348,47 @@ func cmdAnalyze(ctx context.Context, args []string) error {
 	case "latency":
 		return analyze.Latency(os.Stdout, store, sinceT)
 	case "latency-ev":
-		return analyze.LatencyEV(os.Stdout, store, h, *side, *byChase)
+		noExitLoss := fs.Float64("noexit-loss", 100, "assumed loss %% for unpriced rows in conservative EV")
+		return analyze.LatencyEV(os.Stdout, store, h, *side, *byChase, *noExitLoss)
 	case "chase":
 		return analyze.Chase(os.Stdout, store, h, *side)
+	case "coverage":
+		horizons, err := markout.ParseHorizons(cfg.Markout.Horizons)
+		if err != nil {
+			return err
+		}
+		return analyze.Coverage(os.Stdout, store, storage.MarkoutFollower, horizons, cfg.Markout.Grace)
+	case "episodes":
+		n, err := store.RebuildEpisodes(sinceT)
+		if err != nil {
+			return err
+		}
+		st, err := store.EpisodeStats()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("POSITION EPISODES (since %s)\n", sinceT.Format("2006-01-02"))
+		fmt.Printf("  total %d  (closed %d / open %d / partial %d)\n", st.Total, st.Closed, st.Open, st.Partial)
+		if st.Closed > 0 {
+			d := time.Duration(st.AvgHoldSecs) * time.Second
+			fmt.Printf("  avg hold    %s\n", d.Round(time.Second).String())
+			fmt.Printf("  total pnl   $%.2f  (%.0f%% profitable episodes)\n", st.TotalPnl, pctF(st.Profitable, st.Closed))
+			fmt.Printf("  avg pnl     $%.2f per closed episode\n", st.AvgPnl)
+		}
+		fmt.Printf("  rebuilt %d episodes into position_episodes\n", n)
 	case "clusters":
 		return analyze.Clusters(os.Stdout, store, w, sinceT, *limit)
 	default:
 		return fmt.Errorf("unknown analyze subcommand %q", sub)
 	}
+	return nil
+}
+
+func pctF(n, d int) float64 {
+	if d == 0 {
+		return 0
+	}
+	return float64(n) / float64(d) * 100
 }
 
 func parseDurations(specs []string) ([]time.Duration, error) {

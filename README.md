@@ -2,7 +2,7 @@
 
 **Profit Actor Discovery & Strategy Replication Engine.**
 
-版本：`v0.1.2-entry-pit`。
+版本：`v0.1.3-dataset`。
 
 核心问题不是"哪些信号可以买"，而是：
 
@@ -71,7 +71,9 @@ bin/followedge analyze clusters --window 60s      # 钱包汇聚分布
 | `actors rank` | Actor 排行榜：Quality 与 Replicability 双轴 |
 | `actors inspect <wallet>` | 单个 actor 研究卡：PnL 事实 + 证据等级 + 各 horizon EV 衰减 |
 | `analyze latency` | 源延迟分布（trade_time → received_at） |
-| `analyze latency-ev` | **source-age × follower EV**（`--by-chase` 出二维矩阵）|
+| `analyze latency-ev` | **source-age × follower EV**（DUE/FILLED/COVER + 保守 EV；`--by-chase` 二维矩阵）|
+| `analyze coverage` | markout 状态普查（filled/no_candle/token_inactive/...）—— selection bias 防线 |
+| `analyze episodes` | 重建 position episodes（adds/reduces/pnl/hold）+ 统计 |
 | `analyze chase` | 追价桶 vs 前向收益 —— EV cliff 表 |
 | `analyze clusters` | 窗口内 distinct wallet 汇聚分布 |
 | `version` | 版本 |
@@ -129,7 +131,8 @@ edge 都必须扛住它。样本量远不够下结论，继续积累 5,000+ even
 |---|---|
 | `v0.1.0-observe` | Actor 采集/排名（Quality+Replicability）、markout、chase、cluster、延迟分析 |
 | `v0.1.1-measurement` | 测量口径修复：leader/follower markout 分离、chase 重定义、follower EV、buy_cost_usd 自洽性 |
-| `v0.1.2-entry-pit`（本版） | entry point-in-time（无 look-ahead）、source-age×EV 分析、ActorEvidence E0-E4、survival 指标 |
+| `v0.1.2-entry-pit` | entry point-in-time（无 look-ahead）、source-age×EV 分析、ActorEvidence E0-E4、survival 指标 |
+| `v0.1.3-dataset`（本版） | markout status 分类 + coverage 表、coverage-aware EV、conservative EV、position episodes、mechanism 数据契约 |
 | `v0.2.0-mechanism` | Mechanism Analyzer（他靠什么赚钱）、Hypothesis 注册、archetype 聚类 |
 | `v0.3.0-experiment` | Replay/Experiment Engine（train/val/test）、Strategy 血缘注册 |
 | `v0.4.0-shadow` | 实时 Shadow Copy + Strategy Clone |

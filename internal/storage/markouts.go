@@ -60,8 +60,9 @@ type DueMarkout struct {
 //     horizon price
 func (s *Store) DueMarkouts(grace time.Duration, now time.Time, limit int) ([]DueMarkout, error) {
 	cutoff := now.Add(-grace).Unix()
-	// follower rows first (the measurement that matters), then newest first —
-	// stale leader rows from dead tokens must not starve fresh data.
+	// follower rows first (the measurement that matters), retryable misses
+	// next (they can still recover), then newest first — stale leader rows
+	// from dead tokens must not starve fresh data.
 	rows, err := s.db.Query(`
 		SELECT m.event_id, m.kind, m.horizon_ms, m.base_price, m.base_ms,
 		       e.token_address
@@ -69,7 +70,8 @@ func (s *Store) DueMarkouts(grace time.Duration, now time.Time, limit int) ([]Du
 		JOIN trade_events e ON e.event_id = m.event_id
 		WHERE m.observed_price IS NULL
 		  AND m.base_ms + m.horizon_ms/1000 <= ?
-		ORDER BY (m.kind = 'follower') DESC, m.base_ms + m.horizon_ms/1000 DESC
+		ORDER BY (m.kind = 'follower') DESC, (m.status = 'lookback_miss') DESC,
+		         m.base_ms + m.horizon_ms/1000 DESC
 		LIMIT ?`, cutoff, limit)
 	if err != nil {
 		return nil, err
@@ -103,13 +105,41 @@ func (s *Store) SetEntryPrice(eventID, kind string, horizon time.Duration, entry
 	return err
 }
 
+// Markout status — why a row is (not) filled. Every non-filled status is a
+// coverage loss that EV tables must surface; unpriced tokens are usually the
+// worst performers, so silently excluding them biases EV upward.
+const (
+	MarkoutStatusPending       = "pending"           // not yet due
+	MarkoutStatusFilled        = "filled"            // horizon price sampled
+	MarkoutStatusNoCandle      = "no_candle"         // candle stream ended before horizon (token stopped trading)
+	MarkoutStatusTokenInactive = "token_inactive"    // token has no kline at all
+	MarkoutStatusAPIError      = "api_error"         // kline request failed (non-429)
+	MarkoutStatusRateLimited   = "rate_limited"      // 429; gate closed
+	MarkoutStatusLookbackMiss  = "lookback_miss"     // entry candle out of fetched range
+	MarkoutStatusParseError    = "price_parse_error" // kline close unparseable
+)
+
 // FillMarkout writes the sampled horizon price and return for one row.
 func (s *Store) FillMarkout(eventID, kind string, horizon time.Duration, observed float64) error {
 	_, err := s.db.Exec(`
 		UPDATE markouts SET observed_price = ?,
-			return_pct = CASE WHEN base_price > 0 THEN ( ? / base_price - 1 ) * 100 ELSE NULL END
+			return_pct = CASE WHEN base_price > 0 THEN ( ? / base_price - 1 ) * 100 ELSE NULL END,
+			status = ?
 		WHERE event_id = ? AND kind = ? AND horizon_ms = ? AND observed_price IS NULL`,
-		observed, observed, eventID, kind, horizon.Milliseconds())
+		observed, observed, MarkoutStatusFilled, eventID, kind, horizon.Milliseconds())
+	return err
+}
+
+// SetMarkoutStatus records why a row could not be filled. Terminal statuses
+// (no_candle, token_inactive, ...) are sticky; lookback_miss is RETRYABLE —
+// the kline window may simply have been too short, and a later pass can
+// succeed (the horizon price then fills and overwrites the status).
+func (s *Store) SetMarkoutStatus(eventID, kind string, horizon time.Duration, status string) error {
+	_, err := s.db.Exec(`
+		UPDATE markouts SET status = ?
+		WHERE event_id = ? AND kind = ? AND horizon_ms = ?
+		  AND status IN ('pending','lookback_miss')`,
+		status, eventID, kind, horizon.Milliseconds())
 	return err
 }
 
@@ -166,6 +196,87 @@ func (s *Store) MarkoutsAt(kind string, horizon time.Duration) ([]MarkoutStat, e
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// CensusRow is one markout row regardless of fill status — the input for
+// coverage-aware EV (selection bias guard).
+type CensusRow struct {
+	EventID       string
+	WalletType    string
+	TradeTime     int64
+	ReceivedAt    int64
+	BaseMs        int64
+	HorizonMs     int64
+	ObservedPrice *float64
+	Status        string
+	BasePrice     float64
+	LeaderPrice   float64
+}
+
+// MarkoutCensus returns every row of one kind at one horizon, filled or not.
+func (s *Store) MarkoutCensus(kind string, horizon time.Duration) ([]CensusRow, error) {
+	rows, err := s.db.Query(`
+		SELECT m.event_id, e.wallet_type, e.trade_time, e.received_at,
+		       m.base_ms, m.horizon_ms, m.observed_price, m.status,
+		       m.base_price, e.price_usd
+		FROM markouts m
+		JOIN trade_events e ON e.event_id = m.event_id
+		WHERE m.kind = ? AND m.horizon_ms = ?`,
+		kind, horizon.Milliseconds())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CensusRow
+	for rows.Next() {
+		var r CensusRow
+		var obs sql.NullFloat64
+		var base sql.NullFloat64
+		if err := rows.Scan(&r.EventID, &r.WalletType, &r.TradeTime, &r.ReceivedAt,
+			&r.BaseMs, &r.HorizonMs, &obs, &r.Status, &base, &r.LeaderPrice); err != nil {
+			return nil, err
+		}
+		if obs.Valid {
+			r.ObservedPrice = &obs.Float64
+		}
+		r.BasePrice = base.Float64
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// MarkoutStatusCounts groups rows whose horizon has passed by status, plus
+// the number still pending (not yet due).
+func (s *Store) MarkoutStatusCounts(kind string, horizon, grace time.Duration, now time.Time) (map[string]int, int, error) {
+	cutoff := now.Add(-grace).Unix()
+	rows, err := s.db.Query(`
+		SELECT status, COUNT(*) FROM markouts
+		WHERE kind = ? AND horizon_ms = ? AND base_ms + horizon_ms/1000 <= ?
+		GROUP BY status`,
+		kind, horizon.Milliseconds(), cutoff)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	counts := map[string]int{}
+	for rows.Next() {
+		var st string
+		var n int
+		if err := rows.Scan(&st, &n); err != nil {
+			return nil, 0, err
+		}
+		counts[st] = n
+	}
+	var pending int
+	err = s.db.QueryRow(`
+		SELECT COUNT(*) FROM markouts
+		WHERE kind = ? AND horizon_ms = ? AND base_ms + horizon_ms/1000 > ?
+		  AND status = ?`,
+		kind, horizon.Milliseconds(), cutoff, MarkoutStatusPending).Scan(&pending)
+	if err != nil {
+		return nil, 0, err
+	}
+	return counts, pending, rows.Err()
 }
 
 // DueCoverage counts filled vs DUE rows for one kind at one horizon — the
