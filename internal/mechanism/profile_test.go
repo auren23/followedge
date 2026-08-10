@@ -7,9 +7,10 @@ import (
 	"github.com/auren23/followedge/internal/storage"
 )
 
-// TestBuildProfile pins the v0.2.0.1 semantics: reentry rate (not buy
-// count), real partial exits (PartialExitLegs, not data-gap status),
-// closed-only pnl stats, per-feature sample sizes, and n/a on missing data.
+// TestBuildProfile pins the v0.2.0.2 semantics: initial vs add context
+// separation, data-gap exclusion from size medians, real partial exits
+// (PartialExitLegs), closed-only pnl, prior-flow validity, and n/a on
+// missing data.
 func TestBuildProfile(t *testing.T) {
 	episodes := []storage.Episode{
 		// closed, profitable: one add, one REAL partial exit (s1), close at 180s
@@ -24,49 +25,69 @@ func TestBuildProfile(t *testing.T) {
 			Status:      storage.EpisodeClosed,
 			FirstSellAt: 800, InitialBuyUSD: 200, AddBuyUSD: 0,
 			SellLegs: 1, PartialExitLegs: 0, DataGap: false},
-		// data-gap (partial status): sells exceeded visible position — NOT
-		// a partial exit; excluded from closed pnl
+		// data-gap: InitialBuyUSD=0 must NOT enter size medians
 		{Wallet: "W", Token: "T3", OpenedAt: 900, ClosedAt: 960, Adds: 0, Reduces: 1,
 			CapitalIn: 50, CapitalOut: 80, RealizedPnL: 30, HoldDurationS: 60,
 			Status:      storage.EpisodePartial,
 			FirstSellAt: 960, InitialBuyUSD: 0, AddBuyUSD: 0,
 			SellLegs: 1, PartialExitLegs: 0, DataGap: true},
-		// open (never exited) — SAME token T1 as the first episode: re-entry
+		// open, re-entry on T1
 		{Wallet: "W", Token: "T1", OpenedAt: 1000, ClosedAt: 0, Adds: 0, Reduces: 0,
 			CapitalIn: 30, CapitalOut: 0, RealizedPnL: 0, HoldDurationS: 0,
 			Status:      storage.EpisodeOpen,
 			FirstSellAt: 0, InitialBuyUSD: 30, AddBuyUSD: 0,
 			SellLegs: 0, PartialExitLegs: 0, DataGap: false},
 	}
-	// 4 buys: T1×3 (one add + one re-entry), T2 — reentry rate over EPISODES:
-	// 4 episodes, 3 distinct tokens → 1 - 3/4 = 0.25
-	entries := []storage.EntryRow{
-		{Token: "T1", AmountUSD: 100, TradeTime: 100, ReceivedAt: 130},  // age 30s
-		{Token: "T1", AmountUSD: 50, TradeTime: 150, ReceivedAt: 190},   // age 40s
-		{Token: "T2", AmountUSD: 200, TradeTime: 500, ReceivedAt: 560},  // age 60s
-		{Token: "T1", AmountUSD: 30, TradeTime: 1000, ReceivedAt: 1010}, // age 10s
+	// entries: T1 initial (+chase, valid prior), T1 add (+chase, since 60s),
+	// T2 initial (+chase, prior INVALID — window before dataset start),
+	// T1 re-entry initial
+	entries := []EntryFact{
+		{Initial: true, TradeTime: 100, ReceivedAt: 130,
+			ChasePct: 1, HasChase: true, SmartPrior: 2, KOLPrior: 0, PriorValid: true},
+		{Initial: false, TradeTime: 150, ReceivedAt: 190,
+			ChasePct: 3, HasChase: true, SinceInitialSecs: 50},
+		{Initial: true, TradeTime: 500, ReceivedAt: 560,
+			ChasePct: 2, HasChase: true, SmartPrior: 9, KOLPrior: 1, PriorValid: false},
+		{Initial: true, TradeTime: 1000, ReceivedAt: 1010,
+			ChasePct: 4, HasChase: true, SmartPrior: 4, KOLPrior: 1, PriorValid: true},
 	}
-	chases := []float64{1.0, 2.0, 3.0, 4.0, 5.0}
-	smartPrior := []float64{1, 2, 3, 4, 5}
-	kolPrior := []float64{0, 0, 1, 1, 2}
 
-	p := BuildProfile("W", episodes, entries, chases, smartPrior, kolPrior)
+	p := BuildProfile("W", episodes, entries)
 
-	// ENTRY
-	if p.Entry.Count != 4 || math.Abs(p.Entry.ReentryRate-0.25) > 0.001 {
-		t.Errorf("entry count/reentry = %d/%.2f, want 4/0.25", p.Entry.Count, p.Entry.ReentryRate)
+	// ENTRY — initial vs add
+	if p.Entry.InitialCount != 3 || p.Entry.AddCount != 1 {
+		t.Errorf("initial/add = %d/%d, want 3/1", p.Entry.InitialCount, p.Entry.AddCount)
 	}
-	if p.Entry.MedianInitialBuy.Value != 65 || p.Entry.MedianInitialBuy.N != 4 { // [100,200,0,30] → sorted → (30+100)/2
-		t.Errorf("initial buy = %.0f (n%d), want 65 (n4)", p.Entry.MedianInitialBuy.Value, p.Entry.MedianInitialBuy.N)
+	if math.Abs(p.Entry.ReentryRate-0.25) > 0.001 { // 4 episodes, 3 tokens
+		t.Errorf("reentry = %.2f, want 0.25", p.Entry.ReentryRate)
 	}
-	if p.Entry.MedianChase.Value != 3 || p.Entry.MedianChase.N != 5 {
-		t.Errorf("median chase = %.0f (n%d), want 3 (n5)", p.Entry.MedianChase.Value, p.Entry.MedianChase.N)
+	// median chase: INITIAL entries only → [1,2,4] (add's 3 excluded)
+	if p.Entry.MedianChase.Value != 2 || p.Entry.MedianChase.N != 3 {
+		t.Errorf("median chase = %.0f (n%d), want 2 (n3, initial only)", p.Entry.MedianChase.Value, p.Entry.MedianChase.N)
 	}
-	if p.Entry.SmartPriorP50.Value != 3 || p.Entry.PriorFlowN != 5 {
-		t.Errorf("prior smart = %.0f (n%d), want 3 (n5)", p.Entry.SmartPriorP50.Value, p.Entry.PriorFlowN)
+	if p.Entry.MedianAddChase.Value != 3 || p.Entry.MedianAddChase.N != 1 {
+		t.Errorf("median add chase = %.0f (n%d), want 3 (n1)", p.Entry.MedianAddChase.Value, p.Entry.MedianAddChase.N)
 	}
-	if math.Abs(p.Entry.Cluster3Plus-0.60) > 0.001 { // 3,4,5 of 5 >= 3
-		t.Errorf("cluster3plus = %.2f, want 0.60", p.Entry.Cluster3Plus)
+	if p.Entry.MedianSinceInitialSecs.Value != 50 || p.Entry.MedianSinceInitialSecs.N != 1 {
+		t.Errorf("since initial = %.0f (n%d), want 50 (n1)", p.Entry.MedianSinceInitialSecs.Value, p.Entry.MedianSinceInitialSecs.N)
+	}
+	// prior flow: only VALID windows → [2,4] (the T2 window predates the dataset)
+	if p.Entry.SmartPriorP50.Value != 3 || p.Entry.SmartPriorP50.N != 2 || p.Entry.PriorFlowN != 2 {
+		t.Errorf("prior smart = %.0f (n%d, flowN %d), want 3 (n2)", p.Entry.SmartPriorP50.Value, p.Entry.SmartPriorP50.N, p.Entry.PriorFlowN)
+	}
+	if math.Abs(p.Entry.Cluster3Plus-0.50) > 0.001 { // 4 of [2,4] >= 3
+		t.Errorf("cluster3plus = %.2f, want 0.50", p.Entry.Cluster3Plus)
+	}
+	// sizes: gap episode's $0 must NOT enter — initial buys [100,200,30] → 100
+	if p.Entry.MedianInitialBuy.Value != 100 || p.Entry.MedianInitialBuy.N != 3 {
+		t.Errorf("initial buy = %.0f (n%d), want 100 (n3, gap excluded)", p.Entry.MedianInitialBuy.Value, p.Entry.MedianInitialBuy.N)
+	}
+	// add capital: only episodes that added → [50]
+	if p.Entry.MedianAddBuy.Value != 50 || p.Entry.MedianAddBuy.N != 1 {
+		t.Errorf("add buy = %.0f (n%d), want 50 (n1)", p.Entry.MedianAddBuy.Value, p.Entry.MedianAddBuy.N)
+	}
+	if math.Abs(p.Entry.AddEpisodeRate-0.25) > 0.001 {
+		t.Errorf("add episode rate = %.2f, want 0.25", p.Entry.AddEpisodeRate)
 	}
 
 	// POSITION — hold median only over closed (180, 300)
@@ -77,17 +98,16 @@ func TestBuildProfile(t *testing.T) {
 		t.Errorf("median hold = %.0f (n%d), want 240 (n2, closed only)", p.Position.MedianHoldSecs.Value, p.Position.MedianHoldSecs.N)
 	}
 
-	// EXIT — real partial exits: only T1 (1 of 2 observable episodes)
+	// EXIT — real partial exits: only T1 (1 of 2 fully-visible observable)
 	if math.Abs(p.Exit.PartialExitRatio-0.50) > 0.001 || p.Exit.PartialExitN != 1 || p.Exit.ObservableN != 2 {
 		t.Errorf("partial exits = %.2f (%d of %d), want 0.50 (1 of 2)", p.Exit.PartialExitRatio, p.Exit.PartialExitN, p.Exit.ObservableN)
 	}
-	if p.Exit.FirstSellP50.Value != 180 || p.Exit.FirstSellP50.N != 2 { // 160-100=60, 800-500=300 → 180
+	if p.Exit.FirstSellP50.Value != 180 || p.Exit.FirstSellP50.N != 2 { // 60, 300
 		t.Errorf("first sell P50 = %.0f (n%d), want 180 (n2)", p.Exit.FirstSellP50.Value, p.Exit.FirstSellP50.N)
 	}
 	if p.Exit.CloseP50.Value != 240 || p.Exit.CloseP50.N != 2 {
 		t.Errorf("close P50 = %.0f (n%d), want 240 (n2)", p.Exit.CloseP50.Value, p.Exit.CloseP50.N)
 	}
-	// closed-only pnl: 50 + (-100) = -50; the data-gap +30 shown separately
 	if p.Exit.ClosedPnl != -50 || math.Abs(p.Exit.ClosedWinRate-0.50) > 0.001 {
 		t.Errorf("closed pnl/win = %.0f/%.2f, want -50/0.50", p.Exit.ClosedPnl, p.Exit.ClosedWinRate)
 	}
@@ -96,9 +116,35 @@ func TestBuildProfile(t *testing.T) {
 	}
 
 	// missing data → n/a (N=0), not a fabricated zero
-	empty := BuildProfile("W", nil, nil, nil, nil, nil)
+	empty := BuildProfile("W", nil, nil)
 	if empty.Entry.MedianChase.N != 0 || empty.Entry.MedianAge.N != 0 ||
 		empty.Exit.FirstSellP50.N != 0 || empty.Exit.CloseP50.N != 0 {
 		t.Errorf("empty profile must carry N=0, got %+v", empty)
+	}
+}
+
+// TestBuildProfileLeftTruncation pins the P0.5 fix at the profile level: an
+// episode opened before the analysis window keeps its real InitialBuyUSD —
+// the first visible buy inside the window is an ADD, not the opening buy.
+func TestBuildProfileLeftTruncation(t *testing.T) {
+	episodes := []storage.Episode{
+		// opened 2h ago (before a 24h-window? no — before a 1h window), added
+		// 30m ago, closed 10m ago. Reconstructed from FULL history, so the
+		// initial buy ($100) is known even though it predates the window.
+		{Wallet: "W", Token: "T1", OpenedAt: 0, ClosedAt: 0, Adds: 1, Reduces: 1,
+			CapitalIn: 150, CapitalOut: 140, RealizedPnL: -10, HoldDurationS: 0,
+			Status:      storage.EpisodeOpen,
+			FirstSellAt: 0, InitialBuyUSD: 100, AddBuyUSD: 50,
+			SellLegs: 0, PartialExitLegs: 0, DataGap: false},
+	}
+	entries := []EntryFact{
+		{Initial: false, TradeTime: 100, ReceivedAt: 130, SinceInitialSecs: 100}, // the add
+	}
+	p := BuildProfile("W", episodes, entries)
+	if p.Entry.InitialCount != 0 || p.Entry.AddCount != 1 {
+		t.Errorf("initial/add = %d/%d, want 0/1 (window shows only the add)", p.Entry.InitialCount, p.Entry.AddCount)
+	}
+	if p.Entry.MedianInitialBuy.Value != 100 || p.Entry.MedianInitialBuy.N != 1 {
+		t.Errorf("initial buy = %.0f (n%d), want 100 (n1 — full-history reconstruction)", p.Entry.MedianInitialBuy.Value, p.Entry.MedianInitialBuy.N)
 	}
 }

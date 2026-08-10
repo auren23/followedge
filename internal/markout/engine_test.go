@@ -2,6 +2,7 @@ package markout
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -810,5 +811,95 @@ func TestSampleDueCloseTimeHorizon(t *testing.T) {
 	wantObs := b.Add(30*time.Second).Unix() + 30
 	if rows[0].OutcomeObservedAt != wantObs {
 		t.Errorf("outcome_observed_at = %d, want %d (close time, lag must be in [0, res])", rows[0].OutcomeObservedAt, wantObs)
+	}
+}
+
+// TestSampleDueFollowerEntryPropagates pins the P0 multi-horizon fix: the
+// follower entry is an EVENT-level observation. Pass #1 captures it for the
+// 30s row; pass #2 (5m now due, kline window no longer reaching the entry
+// candle) must reuse the propagated entry and fill — NOT lookback_miss.
+func TestSampleDueFollowerEntryPropagates(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	received := now.Add(-8 * time.Minute)
+	ev := domain.TradeEvent{
+		ID:     domain.EventID("sol", "txprop", "W1", "TOKEN_PROP", "buy"),
+		Source: "gmgn_smartmoney", Chain: "sol", TxHash: "txprop",
+		Wallet: "W1", WalletType: domain.WalletSmartMoney,
+		TokenAddress: "TOKEN_PROP", Side: domain.Buy, AmountUSD: 100, PriceUSD: 1.00,
+		TradeTime: received, ReceivedAt: received,
+	}
+	created, err := s.InsertEvent(ev)
+	if err != nil || !created {
+		t.Fatalf("insert: %v %v", created, err)
+	}
+	if err := s.CreateMarkouts(ev, storage.MarkoutFollower, nil,
+		[]time.Duration{30 * time.Second, 5 * time.Minute}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// candles covering the whole timeline (pass1 window .. pass2 horizon)
+	trunc := received.Truncate(30 * time.Second)
+	start := trunc.Add(-30 * time.Second)
+	candles := []gmgn.Candle{}
+	for i := 0; i < 80; i++ {
+		candles = append(candles, gmgn.Candle{
+			Time:  start.Add(time.Duration(i*30) * time.Second).UnixMilli(),
+			Close: "1.00",
+		})
+	}
+	eng := NewEngine(s, nil, noopLimiter{}, "sol", "30s", 4*time.Minute,
+		[]time.Duration{30 * time.Second, 5 * time.Minute})
+	eng.client = &fakeClient{candles: candles}
+
+	// pass 1 @ now: only the 30s row is due (5m due = received+5m = now-3m >
+	// cutoff now-4m). Entry is captured and must propagate to ALL horizons.
+	eng.nowFunc = func() time.Time { return now }
+	if err := eng.SampleDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	rows30, err := s.MarkoutsAt(storage.MarkoutFollower, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows30) != 1 || !rows30[0].ReturnPct.Valid {
+		t.Fatalf("pass1: 30s row not filled: %+v", rows30)
+	}
+	var bp sql.NullFloat64
+	if err := s.DB().QueryRow(`SELECT base_price FROM markouts WHERE event_id = ? AND horizon_ms = 300000`,
+		ev.ID).Scan(&bp); err != nil {
+		t.Fatal(err)
+	}
+	if !bp.Valid {
+		t.Fatalf("pass1: 5m row has no entry price — entry must propagate to every horizon")
+	}
+
+	// pass 2 @ now+3m: 5m row due. The kline window now starts at
+	// (now-3m)-60s = now-4m, which does NOT reach the entry candle at
+	// received-30s = now-8m30s — without propagation this would be
+	// lookback_miss.
+	eng.nowFunc = func() time.Time { return now.Add(3 * time.Minute) }
+	if err := eng.SampleDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	rows5m, err := s.MarkoutsAt(storage.MarkoutFollower, 5*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows5m) != 1 || !rows5m[0].ReturnPct.Valid {
+		t.Fatalf("pass2: 5m row not filled (got %+v) — propagated entry must be reused, not lookback_miss", rows5m)
+	}
+	var st string
+	if err := s.DB().QueryRow(`SELECT status FROM markouts WHERE event_id = ? AND horizon_ms = 300000`,
+		ev.ID).Scan(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st == storage.MarkoutStatusLookbackMiss {
+		t.Fatalf("5m row ended lookback_miss despite propagated entry")
 	}
 }

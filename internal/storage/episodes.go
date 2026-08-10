@@ -3,6 +3,7 @@ package storage
 import (
 	"database/sql"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -99,36 +100,62 @@ func (s *Store) RebuildEpisodes(since time.Time) (int, error) {
 // ReconstructEpisodesFor rebuilds ONE wallet's episodes on demand, straight
 // from trade_events — the behavior card must never depend on a stale or
 // never-materialized position_episodes table.
+//
+// Left-truncation guard: reconstruction runs over the wallet's FULL history
+// and only the final episodes (opened_at >= since) are returned — an episode
+// opened before the analysis window keeps its real InitialBuyUSD / OpenedAt
+// instead of mistaking the first visible add for the opening buy.
 func (s *Store) ReconstructEpisodesFor(wallet string, since time.Time) ([]Episode, error) {
 	rows, err := s.db.Query(`
 		SELECT wallet, token_address, side, token_amount, amount_usd,
 		       buy_cost_usd, trade_time, received_at, event_id
 		FROM trade_events
-		WHERE wallet = ? AND trade_time >= ?
-		ORDER BY token_address, trade_time, received_at, event_id`, wallet, since.Unix())
+		WHERE wallet = ?
+		ORDER BY token_address, trade_time, received_at, event_id`, wallet)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	return reconstructEpisodes(rows)
+	eps, err := reconstructEpisodes(rows)
+	if err != nil {
+		return nil, err
+	}
+	out := eps[:0]
+	for _, e := range eps {
+		if e.OpenedAt >= since.Unix() {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 
 // reconstructEpisodes builds episodes from an ordered event stream
 // (wallet, token, side, token_amount, amount_usd, buy_cost_usd, trade_time,
 // received_at, event_id — ascending by time). Shared by the global rebuild
 // and the per-wallet on-demand reconstruction.
+//
+// Quantity arithmetic uses a RELATIVE epsilon (1e-9 of the peak visible
+// quantity): large meme-token counts with float64 residue must not turn a
+// perfect full close into a data-gap partial.
 func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 	var eps []Episode
 	var cur *Episode
 	var curWallet, curToken string
-	var qty float64 // visible token quantity
+	var qty, peakQty float64 // visible token quantity + its peak (epsilon scale)
+
+	epsOf := func() float64 {
+		if peakQty <= 0 {
+			return 1e-9
+		}
+		return math.Max(1e-9, peakQty*1e-9)
+	}
 
 	flush := func() {
 		if cur != nil {
 			eps = append(eps, *cur)
 			cur = nil
 		}
-		qty = 0
+		qty, peakQty = 0, 0
 	}
 
 	for rows.Next() {
@@ -146,7 +173,7 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 			cur.DataGap = side == "sell" // window opened on a sell: opening buy unseen
 		}
 		if side == "buy" {
-			if qty <= 0 {
+			if qty <= epsOf() {
 				// opening buy (or re-opening after a full close)
 				cur.OpenedAt = int64(ts)
 				cur.InitialBuyUSD = amountUSD
@@ -159,7 +186,7 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 			qty += tokenAmount
 			cur.CapitalIn += amountUSD
 		} else { // sell
-			if qty <= 0 {
+			if qty <= epsOf() {
 				cur.DataGap = true // selling with no visible position
 			}
 			if cur.FirstSellAt == 0 {
@@ -172,21 +199,26 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 			if buyCost.Valid && buyCost.Float64 > 0 {
 				cur.RealizedPnL += amountUSD - buyCost.Float64
 			}
-			if qty > 0 {
+			if qty > epsOf() {
 				cur.PartialExitLegs++ // position remains: a REAL partial exit
 			}
-			if qty <= 0 {
-				if qty < 0 {
-					cur.Status = EpisodePartial // sold more than visible position
-					cur.DataGap = true
-				} else {
-					cur.Status = EpisodeClosed
-				}
+			if math.Abs(qty) <= epsOf() {
+				qty = 0
+				cur.Status = EpisodeClosed
+				cur.ClosedAt = int64(ts)
+				cur.HoldDurationS = cur.ClosedAt - cur.OpenedAt
+				flush()
+			} else if qty < -epsOf() {
+				cur.Status = EpisodePartial // sold more than visible position
+				cur.DataGap = true
 				qty = 0
 				cur.ClosedAt = int64(ts)
 				cur.HoldDurationS = cur.ClosedAt - cur.OpenedAt
 				flush()
 			}
+		}
+		if math.Abs(qty) > peakQty {
+			peakQty = math.Abs(qty)
 		}
 	}
 	if err := rows.Err(); err != nil {

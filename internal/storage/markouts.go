@@ -114,15 +114,17 @@ func (s *Store) DueMarkouts(grace time.Duration, now time.Time, limit int, skipT
 	return out, rows.Err()
 }
 
-// SetEntryPrice fills a follower row's base_price with the price a follower
-// could have traded at reception: the close of the last candle ALREADY
-// CLOSED at ReceivedAt (never look-ahead — see migration 004). observedAt is
-// the instant that price actually represents (candle open + resolution).
-func (s *Store) SetEntryPrice(eventID, kind string, horizon time.Duration, entryPrice float64, observedAt time.Time) error {
+// SetFollowerEntry fills the follower entry price for EVERY horizon row of
+// an event in one shot (event-level observation — all horizons share the
+// same entry, and the first horizon to become due must not be the only one
+// to capture it, or later horizons would lookback_miss on a window that no
+// longer reaches the entry candle). observedAt is the instant that price
+// actually represents (candle open + resolution).
+func (s *Store) SetFollowerEntry(eventID string, entryPrice float64, observedAt time.Time) error {
 	_, err := s.db.Exec(`
 		UPDATE markouts SET base_price = ?, entry_observed_at = ?
-		WHERE event_id = ? AND kind = ? AND horizon_ms = ? AND base_price IS NULL`,
-		entryPrice, observedAt.Unix(), eventID, kind, horizon.Milliseconds())
+		WHERE event_id = ? AND kind = 'follower' AND base_price IS NULL`,
+		entryPrice, observedAt.Unix(), eventID)
 	return err
 }
 

@@ -567,7 +567,18 @@ func TestBehaviorQueries(t *testing.T) {
 		Wallet: "OTHER_SMART", WalletType: domain.WalletSmartMoney,
 		TokenAddress: "TOKEN_X", Side: domain.Buy, AmountUSD: 10,
 		TokenAmount: 10, PriceUSD: 1.0, BuyCostUSD: 0,
-		TradeTime: base.Add(-30 * time.Second), ReceivedAt: base.Add(-30*time.Second + 20*time.Second),
+		TradeTime: base.Add(-55 * time.Second), ReceivedAt: base.Add(-55*time.Second + 20*time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// filler: pushes dataset start before the 60s prior-flow window (base-70s)
+	if _, err := s.InsertEvent(domain.TradeEvent{
+		ID:     domain.EventID("sol", "filler", "FILLER", "TOKEN_X", "buy"),
+		Source: "gmgn_smartmoney", Chain: "sol", TxHash: "filler",
+		Wallet: "FILLER", WalletType: domain.WalletSmartMoney,
+		TokenAddress: "TOKEN_X", Side: domain.Buy, AmountUSD: 10,
+		TokenAmount: 10, PriceUSD: 1.0, BuyCostUSD: 0,
+		TradeTime: base.Add(-70 * time.Second), ReceivedAt: base.Add(-70*time.Second + 20*time.Second),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -582,12 +593,24 @@ func TestBehaviorQueries(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	smart, kol, err := s.PriorFlowAt("TOKEN_X", base.Unix(), time.Minute)
+	ds, err := s.DatasetStart()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if smart != 1 || kol != 0 {
-		t.Errorf("prior flow = smart %d kol %d, want 1/0 (same-second buy must be excluded)", smart, kol)
+	pf, err := s.PriorFlowAt("TOKEN_X", base.Unix(), time.Minute, ds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pf.Valid || pf.Smart != 1 || pf.KOL != 0 {
+		t.Errorf("prior flow = %+v, want valid smart=1 kol=0 (same-second buy must be excluded)", pf)
+	}
+	// window before the dataset → invalid, NOT fabricated zero
+	pf, err = s.PriorFlowAt("TOKEN_X", ds+30, time.Hour, ds)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pf.Valid {
+		t.Errorf("prior flow at dataset edge must be invalid, got %+v", pf)
 	}
 
 	// entry chase observations: base_price set, NO horizon fill required
@@ -607,7 +630,7 @@ func TestBehaviorQueries(t *testing.T) {
 		t.Fatal(err)
 	}
 	// NO FillMarkout: the 5m outcome is missing; chase must still be observable
-	obs, err := s.EntryObservations("W_B", now.Add(-2*time.Hour), 30*time.Second)
+	obs, err := s.EntryObservations("W_B", now.Add(-2*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}

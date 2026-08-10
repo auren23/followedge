@@ -16,7 +16,8 @@ import (
 //
 // Point-in-time: entry-context features (prior flow, chase) only use data
 // knowable at each entry's trade_time. Episodes are reconstructed on demand
-// from trade_events — never from the possibly-stale materialized table.
+// over the wallet's FULL history (left-truncation guard), then filtered to
+// the analysis window.
 func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 	horizon time.Duration, noExitLoss float64, grace time.Duration, clusterWindow time.Duration) error {
 	// ---- QUALITY (same window) ----
@@ -73,47 +74,71 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 		fmt.Fprintf(w, "  cons EV        %s\n", consStr)
 	}
 
-	// ---- BEHAVIOR (on-demand reconstruction, same window) ----
+	// ---- BEHAVIOR (full-history reconstruction, filtered to window) ----
 	episodes, err := s.ReconstructEpisodesFor(wallet, since)
 	if err != nil {
 		return err
 	}
-	entries, err := s.EntryRows(wallet, since)
+	classified, err := s.ClassifiedEntries(wallet)
 	if err != nil {
 		return err
 	}
-	obs, err := s.EntryObservations(wallet, since, horizon)
+	obs, err := s.EntryObservations(wallet, since)
 	if err != nil {
 		return err
 	}
-	var chases []float64
+	chaseByEvent := map[string]float64{}
 	for _, o := range obs {
-		chases = append(chases, o.ChasePct)
+		chaseByEvent[o.EventID] = o.ChasePct
 	}
-	var smartPrior, kolPrior []float64
-	for _, e := range entries {
-		smart, kol, err := s.PriorFlowAt(e.Token, e.TradeTime, clusterWindow)
-		if err != nil {
-			return err
+	datasetStart, err := s.DatasetStart()
+	if err != nil {
+		return err
+	}
+	// PIT prior flow per entry (initial entries only; adds get their own
+	// since-initial context)
+	var facts []mechanism.EntryFact
+	for _, ce := range classified {
+		if ce.TradeTime < since.Unix() {
+			continue
 		}
-		smartPrior = append(smartPrior, float64(smart))
-		kolPrior = append(kolPrior, float64(kol))
+		f := mechanism.EntryFact{
+			Initial:          ce.Initial,
+			TradeTime:        ce.TradeTime,
+			ReceivedAt:       ce.ReceivedAt,
+			SinceInitialSecs: ce.SinceInitialSecs,
+		}
+		if ch, ok := chaseByEvent[ce.EventID]; ok {
+			f.ChasePct, f.HasChase = ch, true
+		}
+		if ce.Initial {
+			pf, err := s.PriorFlowAt(ce.Token, ce.TradeTime, clusterWindow, datasetStart)
+			if err != nil {
+				return err
+			}
+			f.SmartPrior, f.KOLPrior, f.PriorValid = pf.Smart, pf.KOL, pf.Valid
+		}
+		facts = append(facts, f)
 	}
 
-	prof := mechanism.BuildProfile(wallet, episodes, entries, chases, smartPrior, kolPrior)
+	prof := mechanism.BuildProfile(wallet, episodes, facts)
 
 	fmt.Fprintf(w, "\nBEHAVIOR (since %s)\n", since.Format("2006-01-02"))
 	fmt.Fprintf(w, "\nENTRY\n")
-	fmt.Fprintf(w, "  entries         %d\n", prof.Entry.Count)
+	fmt.Fprintf(w, "  initial buys    %d\n", prof.Entry.InitialCount)
+	fmt.Fprintf(w, "  add buys        %d\n", prof.Entry.AddCount)
 	fmt.Fprintf(w, "  reentry rate    %.0f%%\n", prof.Entry.ReentryRate*100)
 	fmt.Fprintf(w, "  initial buy     %s\n", usd(prof.Entry.MedianInitialBuy))
-	fmt.Fprintf(w, "  add buy         %s\n", usd(prof.Entry.MedianAddBuy))
+	fmt.Fprintf(w, "  add buy         %s (%.0f%% of episodes add)\n",
+		usd(prof.Entry.MedianAddBuy), prof.Entry.AddEpisodeRate*100)
 	fmt.Fprintf(w, "  total capital   %s\n", usd(prof.Entry.MedianCapitalIn))
 	fmt.Fprintf(w, "  median age      %s\n", secs(prof.Entry.MedianAge))
-	fmt.Fprintf(w, "  median chase    %s\n", pctMed(prof.Entry.MedianChase))
+	fmt.Fprintf(w, "  median chase    %s (initial only)\n", pctMed(prof.Entry.MedianChase))
+	fmt.Fprintf(w, "  median add chase %s\n", pctMed(prof.Entry.MedianAddChase))
+	fmt.Fprintf(w, "  add since open  %s\n", secs(prof.Entry.MedianSinceInitialSecs))
 	fmt.Fprintf(w, "  prior smart P50 %s\n", num(prof.Entry.SmartPriorP50))
 	fmt.Fprintf(w, "  prior KOL P50   %s\n", num(prof.Entry.KOLPriorP50))
-	fmt.Fprintf(w, "  cluster >=3     %.0f%% (%d observed)\n",
+	fmt.Fprintf(w, "  cluster >=3     %.0f%% (%d valid prior windows)\n",
 		prof.Entry.Cluster3Plus*100, prof.Entry.PriorFlowN)
 	fmt.Fprintf(w, "\nPOSITION\n")
 	fmt.Fprintf(w, "  episodes        %d\n", prof.Position.Episodes)

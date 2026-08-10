@@ -70,6 +70,8 @@ type Engine struct {
 	emptyStreak map[string]int
 
 	resSecs int64 // kline resolution in seconds (for point-in-time entry bounds)
+
+	nowFunc func() time.Time // clock injection for deterministic multi-pass tests
 }
 
 func NewEngine(store *storage.Store, client *gmgn.Client, limiter weightLimiter,
@@ -81,7 +83,8 @@ func NewEngine(store *storage.Store, client *gmgn.Client, limiter weightLimiter,
 	}
 	return &Engine{store: store, client: client, limiter: limiter, chain: chain,
 		res: resolution, grace: grace, horizons: horizons, log: slog.With("pkg", "markout"),
-		skipUntil: map[string]time.Time{}, emptyStreak: map[string]int{}, resSecs: resSecs}
+		skipUntil: map[string]time.Time{}, emptyStreak: map[string]int{}, resSecs: resSecs,
+		nowFunc: time.Now}
 }
 
 func (e *Engine) Horizons() []time.Duration { return e.horizons }
@@ -114,7 +117,7 @@ func (e *Engine) Run(ctx context.Context, tick time.Duration) {
 // SampleDue fills every due markout with the first available candle close at
 // or after its due time.
 func (e *Engine) SampleDue(ctx context.Context) error {
-	now := time.Now().UTC()
+	now := e.nowFunc().UTC()
 	// tokens still in backoff are excluded at the SQL level — if they filled
 	// the LIMIT slots, the engine would skip them all and fresh pending rows
 	// could starve behind a no_kline_data backlog.
@@ -230,7 +233,7 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 					ep = entryPrice{price: c.close, observedAt: time.Unix(c.open+e.resSecs, 0).UTC()}
 					entryCache[t.event] = ep
 				}
-				if err := e.store.SetEntryPrice(t.event, t.kind, t.horizon, ep.price, ep.observedAt); err != nil {
+				if err := e.store.SetFollowerEntry(t.event, ep.price, ep.observedAt); err != nil {
 					e.log.Warn("set entry price failed", "event", t.event, "err", err)
 				}
 				t.basePrice = ep.price

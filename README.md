@@ -2,7 +2,7 @@
 
 **Profit Actor Discovery & Strategy Replication Engine.**
 
-版本：`v0.2.0.1-behavior-integrity`。
+版本：`v0.2.0.2-entry-observation-integrity`。
 
 核心问题不是"哪些信号可以买"，而是：
 
@@ -145,7 +145,8 @@ edge 都必须扛住它。样本量远不够下结论，继续积累 5,000+ even
 | `v0.1.4.1-actor-census-integrity` | census 与 Quality 同窗口（--since）且只统计 BUY（entry replication）、no-kline retry fresh-first（SQL 层排除 backoff token）、frontier/sort 加 min sample gate、inspect chase 标注 observed-only |
 | `v0.1.4.2-v01-freeze`（本版） | inspect alpha decay/chase 遵守 --since、engine tokenOrder 保持 SQL fresh-first 顺序、sample gate 对齐 cons-EV 有效样本（filled+market loss） |
 | `v0.2.0-behavior-reconstruction` | Actor Behavior Reconstruction：position episodes → entry context（PIT）→ exit behavior → ActorBehaviorProfile（`followedge actors behavior`） |
-| `v0.2.0.1-behavior-integrity`（本版） | 行为口径校准：按需 episode 重建（不依赖 stale 物化表）、prior flow 从 raw events 按 [T-window,T) 重算、chase 用 entry observation（无 survivor bias）、partial exit 拆成 PartialExitLegs vs data-gap、closed-only pnl、全部 feature 带 N |
+| `v0.2.0.1-behavior-integrity` | 行为口径校准：按需 episode 重建（不依赖 stale 物化表）、prior flow 从 raw events 按 [T-window,T) 重算、chase 用 entry observation（无 survivor bias）、partial exit 拆成 PartialExitLegs vs data-gap、closed-only pnl、全部 feature 带 N |
+| `v0.2.0.2-entry-observation-integrity`（本版） | follower entry 事件级传播（SetFollowerEntry，多 horizon 不再 lookback_miss）、chase 去 horizon、episode 全历史重建防左截断、qty 相对 epsilon、prior-flow dataset 边界 validity、initial/add entry context 分离 |
 | `v0.2.1-mechanism` | Mechanism Analyzer（他靠什么赚钱）、Hypothesis 注册、archetype 聚类 |
 | `v0.3.0-experiment` | Replay/Experiment Engine（train/val/test）、Strategy 血缘注册 |
 | `v0.4.0-shadow` | 实时 Shadow Copy + Strategy Clone |
