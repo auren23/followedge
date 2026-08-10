@@ -34,9 +34,8 @@ func (s *Store) ClassifiedEntries(wallet string) ([]ClassifiedEntry, error) {
 	defer rows.Close()
 	var out []ClassifiedEntry
 	var curToken string
-	qty := 0.0
+	book := &positionBook{}
 	openTime := int64(0)
-	eps := 1e-9
 	for rows.Next() {
 		var id, token, side string
 		var amt, ts, received float64
@@ -44,22 +43,23 @@ func (s *Store) ClassifiedEntries(wallet string) ([]ClassifiedEntry, error) {
 			return nil, err
 		}
 		if token != curToken {
-			curToken, qty, openTime = token, 0, int64(ts)
+			curToken, openTime = token, int64(ts)
+			book.reset()
 		}
 		if side == "buy" {
-			initial := qty <= eps
+			initial := book.isEmpty()
 			if initial {
 				openTime = int64(ts)
 			}
-			qty += amt
+			book.add(amt)
 			out = append(out, ClassifiedEntry{
 				EventID: id, Token: token, TradeTime: int64(ts), ReceivedAt: int64(received),
 				AmountUSD: amt, Initial: initial, SinceInitialSecs: int64(ts) - openTime,
 			})
 		} else {
-			qty -= amt
-			if qty < 0 {
-				qty = 0 // visible position can't go below zero for classification
+			book.sell(amt)
+			if book.belowZero() {
+				book.reset() // classification has no negative positions: next buy reopens
 			}
 		}
 	}

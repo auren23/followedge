@@ -96,10 +96,13 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 		return err
 	}
 	// PIT prior flow per entry (initial entries only; adds get their own
-	// since-initial context)
+	// since-initial context). Cohort rule: an entry belongs to the profile iff
+	// its EPISODE opened in the window — adds are judged by their opening
+	// time, not their own trade time, so the card's counts always describe
+	// the same set of positions.
 	var facts []mechanism.EntryFact
 	for _, ce := range classified {
-		if ce.TradeTime < since.Unix() {
+		if !inCohort(ce, since.Unix()) {
 			continue
 		}
 		f := mechanism.EntryFact{
@@ -123,7 +126,7 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 
 	prof := mechanism.BuildProfile(wallet, episodes, facts)
 
-	fmt.Fprintf(w, "\nBEHAVIOR (since %s)\n", since.Format("2006-01-02"))
+	fmt.Fprintf(w, "\nBEHAVIOR COHORT — positions opened since %s\n", since.Format("2006-01-02"))
 	fmt.Fprintf(w, "\nENTRY\n")
 	fmt.Fprintf(w, "  initial buys    %d\n", prof.Entry.InitialCount)
 	fmt.Fprintf(w, "  add buys        %d\n", prof.Entry.AddCount)
@@ -159,6 +162,19 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 	fmt.Fprintf(w, "  incomplete      %.0f%%  (data gap: opening buys unseen) pnl $%.0f\n",
 		prof.Exit.IncompleteRatio*100, prof.Exit.IncompletePnl)
 	return nil
+}
+
+// inCohort reports whether an entry belongs to the profile cohort: its
+// EPISODE must have opened inside the analysis window. Adds are judged by
+// their opening time (TradeTime - SinceInitialSecs) — an add to a position
+// opened before the window is not part of this cohort, keeping the card's
+// episodes/adds/exits all describing the same set of positions.
+func inCohort(ce storage.ClassifiedEntry, sinceUnix int64) bool {
+	opening := ce.TradeTime
+	if !ce.Initial {
+		opening = ce.TradeTime - ce.SinceInitialSecs
+	}
+	return opening >= sinceUnix
 }
 
 func usd(m mechanism.MedianStat) string {

@@ -129,6 +129,47 @@ func (s *Store) ReconstructEpisodesFor(wallet string, since time.Time) ([]Episod
 	return out, nil
 }
 
+// positionBook tracks a (wallet, token) visible quantity with a RELATIVE
+// epsilon (1e-9 of peak): float64 residue on large meme-token counts must
+// not flip a full close into a data gap. Single source of truth for both
+// episode reconstruction and entry classification — the two must never
+// disagree on whether a position is open.
+type positionBook struct {
+	qty, peak float64
+}
+
+func (b *positionBook) eps() float64 {
+	if b.peak <= 0 {
+		return 1e-9
+	}
+	return math.Max(1e-9, b.peak*1e-9)
+}
+
+func (b *positionBook) add(amount float64) {
+	b.qty += amount
+	if b.qty > b.peak {
+		b.peak = b.qty
+	}
+}
+
+// sell subtracts and snaps to zero when |remaining| <= eps (full close).
+// Residuals beyond -eps stay negative so episode reconstruction can detect
+// the data gap; classification callers snap those away explicitly.
+func (b *positionBook) sell(amount float64) {
+	b.qty -= amount
+	if math.Abs(b.qty) <= b.eps() {
+		b.qty = 0
+	}
+	if b.qty > b.peak {
+		b.peak = b.qty
+	}
+}
+
+func (b *positionBook) isEmpty() bool   { return b.qty <= b.eps() }
+func (b *positionBook) atZero() bool    { return math.Abs(b.qty) <= b.eps() }
+func (b *positionBook) belowZero() bool { return b.qty < -b.eps() }
+func (b *positionBook) reset()          { b.qty, b.peak = 0, 0 }
+
 // reconstructEpisodes builds episodes from an ordered event stream
 // (wallet, token, side, token_amount, amount_usd, buy_cost_usd, trade_time,
 // received_at, event_id — ascending by time). Shared by the global rebuild
@@ -141,21 +182,14 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 	var eps []Episode
 	var cur *Episode
 	var curWallet, curToken string
-	var qty, peakQty float64 // visible token quantity + its peak (epsilon scale)
-
-	epsOf := func() float64 {
-		if peakQty <= 0 {
-			return 1e-9
-		}
-		return math.Max(1e-9, peakQty*1e-9)
-	}
+	book := &positionBook{}
 
 	flush := func() {
 		if cur != nil {
 			eps = append(eps, *cur)
 			cur = nil
 		}
-		qty, peakQty = 0, 0
+		book.reset()
 	}
 
 	for rows.Next() {
@@ -173,7 +207,7 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 			cur.DataGap = side == "sell" // window opened on a sell: opening buy unseen
 		}
 		if side == "buy" {
-			if qty <= epsOf() {
+			if book.isEmpty() {
 				// opening buy (or re-opening after a full close)
 				cur.OpenedAt = int64(ts)
 				cur.InitialBuyUSD = amountUSD
@@ -183,10 +217,10 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 				cur.Adds++
 				cur.AddBuyUSD += amountUSD
 			}
-			qty += tokenAmount
+			book.add(tokenAmount)
 			cur.CapitalIn += amountUSD
 		} else { // sell
-			if qty <= epsOf() {
+			if book.isEmpty() {
 				cur.DataGap = true // selling with no visible position
 			}
 			if cur.FirstSellAt == 0 {
@@ -194,31 +228,27 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 			}
 			cur.SellLegs++
 			cur.Reduces++
-			qty -= tokenAmount
+			book.sell(tokenAmount)
 			cur.CapitalOut += amountUSD
 			if buyCost.Valid && buyCost.Float64 > 0 {
 				cur.RealizedPnL += amountUSD - buyCost.Float64
 			}
-			if qty > epsOf() {
+			if !book.atZero() && !book.belowZero() {
 				cur.PartialExitLegs++ // position remains: a REAL partial exit
 			}
-			if math.Abs(qty) <= epsOf() {
-				qty = 0
+			if book.atZero() {
 				cur.Status = EpisodeClosed
 				cur.ClosedAt = int64(ts)
 				cur.HoldDurationS = cur.ClosedAt - cur.OpenedAt
 				flush()
-			} else if qty < -epsOf() {
+			} else if book.belowZero() {
 				cur.Status = EpisodePartial // sold more than visible position
 				cur.DataGap = true
-				qty = 0
+				book.reset()
 				cur.ClosedAt = int64(ts)
 				cur.HoldDurationS = cur.ClosedAt - cur.OpenedAt
 				flush()
 			}
-		}
-		if math.Abs(qty) > peakQty {
-			peakQty = math.Abs(qty)
 		}
 	}
 	if err := rows.Err(); err != nil {

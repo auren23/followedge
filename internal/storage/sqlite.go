@@ -178,6 +178,9 @@ func inferLegacyVersion(db *sql.DB) int {
 	if hasColumn(db, "markouts", "status") { // v6
 		ver = 6
 	}
+	if hasColumn(db, "markouts", "outcome_observed_at") { // v8 (v7 added no schema)
+		ver = 8
+	}
 	return ver
 }
 

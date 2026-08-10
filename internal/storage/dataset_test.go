@@ -233,8 +233,8 @@ func TestMigration007BackfillsFilled(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT version FROM schema_version`).Scan(&ver); err != nil {
 		t.Fatal(err)
 	}
-	if ver != 8 {
-		t.Errorf("legacy v6 db pinned to version %d, want 8 (007+008 must have run)", ver)
+	if ver != 9 {
+		t.Errorf("legacy v6 db pinned to version %d, want 9 (007..009 must have run)", ver)
 	}
 	var st string
 	if err := s.db.QueryRow(`SELECT status FROM markouts WHERE event_id = 'sol_upg_legacy'`).Scan(&st); err != nil {
@@ -272,8 +272,8 @@ func TestLegacyV5Inference(t *testing.T) {
 	if err := s.db.QueryRow(`SELECT version FROM schema_version`).Scan(&ver); err != nil {
 		t.Fatal(err)
 	}
-	if ver != 8 {
-		t.Errorf("legacy v5 db pinned to version %d, want 8", ver)
+	if ver != 9 {
+		t.Errorf("legacy v5 db pinned to version %d, want 9", ver)
 	}
 	// 006 must have created the status column + episodes table
 	if !hasColumn(s.db, "markouts", "status") {
@@ -645,5 +645,140 @@ func TestBehaviorQueries(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("entry observation missing for unfilled horizon — chase must not depend on outcome: %+v", obs)
+	}
+}
+
+// TestMigration009BackfillsEventEntry pins the P0 fix: pre-SetFollowerEntry
+// databases have events where only the short horizon captured the follower
+// entry and longer horizons sit entryless in lookback_miss. Migration 009
+// must propagate the known entry to every row of the event; the rows keep
+// their retryable status so the engine fills the outcome on the next pass.
+func TestMigration009BackfillsEventEntry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v8.db")
+	db := buildLegacyDB(t, path, 8) // 001-008 applied, empty schema_version
+	now := time.Now().UTC().Unix()
+	if _, err := db.Exec(`INSERT INTO trade_events
+		(event_id, source, chain, tx_hash, wallet, wallet_type, token_address, token_symbol,
+		 side, position_action, amount_usd, token_amount, price_usd, buy_cost_usd,
+		 trade_time, received_at, processed_at, raw_json)
+		VALUES ('sol_legacy_entry', 'gmgn_smartmoney', 'sol', 'leg', 'W', 'smart_money', 'TOKEN_LE', 'LE',
+		        'buy', NULL, 10, 1e18, 1.0, 10, ?, ?, ?, '{}')`, now-3600, now-3600, now); err != nil {
+		t.Fatal(err)
+	}
+	// 30s row: entry captured + filled. 5m row: entryless lookback_miss —
+	// exactly the pre-fix state.
+	if _, err := db.Exec(`INSERT INTO markouts
+		(event_id, kind, horizon_ms, base_ms, base_price, observed_price, return_pct,
+		 created_at, status, entry_observed_at)
+		VALUES ('sol_legacy_entry', 'follower', 30000, ?, 1.0, 1.1, 10, ?, 'filled', ?),
+		       ('sol_legacy_entry', 'follower', 300000, ?, NULL, NULL, NULL, ?, 'lookback_miss', NULL)`,
+		now-3600, now, now-3600, now-3600, now); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	var bp float64
+	var eoa, wantEoa int64
+	var status string
+	if err := s.db.QueryRow(`SELECT base_price, entry_observed_at, status FROM markouts
+		WHERE event_id = 'sol_legacy_entry' AND horizon_ms = 300000`).Scan(&bp, &eoa, &status); err != nil {
+		t.Fatal(err)
+	}
+	wantEoa = now - 3600
+	if bp != 1.0 || eoa != wantEoa {
+		t.Errorf("5m row after 009 = base %.2f observed %d, want 1.00/%d (entry propagated from 30s row)", bp, eoa, wantEoa)
+	}
+	if status != MarkoutStatusLookbackMiss {
+		t.Errorf("5m row status = %s, want lookback_miss (must stay retryable so the outcome fills)", status)
+	}
+	// the row is now due-eligible and the engine can fill it without entry lookup
+	due, err := s.DueMarkouts(0, time.Now().UTC(), 100, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, d := range due {
+		if d.EventID == "sol_legacy_entry" && d.Horizon == 5*time.Minute {
+			found = true
+			if d.BasePrice != 1.0 {
+				t.Errorf("due row base_price = %.2f, want 1.0 (backfilled entry must be visible to the engine)", d.BasePrice)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("5m row must be due-eligible after backfill: %+v", due)
+	}
+}
+
+// TestPositionBookEpsilon pins the shared-accounting fix: episode
+// reconstruction and entry classification must agree on position state even
+// with float64 residue on large quantities — a sum of three 333.3333 buys
+// minus a 1000 sell is a FULL CLOSE, not a data gap, and the next buy opens
+// a new episode (initial), not an add.
+func TestPositionBookEpsilon(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	base := now.Add(-1 * time.Hour).Truncate(30 * time.Second)
+	mk := func(id, side string, ts time.Time, qty float64) {
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W_E", "TOKEN_E", side),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W_E", WalletType: domain.WalletSmartMoney,
+			TokenAddress: "TOKEN_E", Side: domain.Side(side), AmountUSD: qty,
+			TokenAmount: qty, PriceUSD: 1.0, BuyCostUSD: 0,
+			TradeTime: ts, ReceivedAt: ts,
+		}
+		if _, err := s.InsertEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 3 buys of 333.3333333333333 accumulate to 999.9999999999999;
+	// the 1000 sell leaves ~-1.1e-13 residue — far inside the relative epsilon.
+	mk("b1", "buy", base, 333.3333333333333)
+	mk("b2", "buy", base.Add(30*time.Second), 333.3333333333333)
+	mk("b3", "buy", base.Add(60*time.Second), 333.3333333333333)
+	mk("s1", "sell", base.Add(90*time.Second), 1000.0)
+	mk("b4", "buy", base.Add(120*time.Second), 50.0) // must be a NEW episode's opening buy
+
+	eps, err := s.ReconstructEpisodesFor("W_E", now.Add(-2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eps) != 2 {
+		t.Fatalf("episodes = %+v, want 2 (full close + reopen)", eps)
+	}
+	if eps[0].Status != EpisodeClosed || eps[0].Adds != 2 || eps[0].DataGap {
+		t.Errorf("episode1 = status %s adds %d gap %v, want closed/2/false (residue must not be a data gap)", eps[0].Status, eps[0].Adds, eps[0].DataGap)
+	}
+	if eps[1].InitialBuyUSD != 50 || eps[1].Adds != 0 {
+		t.Errorf("episode2 = init %.0f adds %d, want 50/0 (reopened, not an add)", eps[1].InitialBuyUSD, eps[1].Adds)
+	}
+
+	// classification agrees: b4 is INITIAL, not an add
+	classified, err := s.ClassifiedEntries("W_E")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var initials, adds int
+	for _, ce := range classified {
+		if ce.Initial {
+			initials++
+		} else {
+			adds++
+		}
+	}
+	if initials != 2 || adds != 2 { // b1, b4 initial; b2, b3 adds
+		t.Errorf("classification = initial %d adds %d, want 2/2 (shared epsilon)", initials, adds)
 	}
 }

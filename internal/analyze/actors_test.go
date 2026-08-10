@@ -295,3 +295,26 @@ func TestRankEffectiveSampleGate(t *testing.T) {
 		t.Errorf("effective-N=5 actor must not enter the frontier:\n%s", out)
 	}
 }
+
+// TestInCohort pins the cohort rule: an entry belongs to the profile iff its
+// EPISODE opened in the window. Adds are judged by their opening time — an
+// add to a position opened before `since` must not leak into the cohort.
+func TestInCohort(t *testing.T) {
+	const since = 200
+	cases := []struct {
+		name string
+		ce   storage.ClassifiedEntry
+		want bool
+	}{
+		{"initial inside", storage.ClassifiedEntry{Initial: true, TradeTime: 300}, true},
+		{"initial outside", storage.ClassifiedEntry{Initial: true, TradeTime: 100}, false},
+		{"add to inside position", storage.ClassifiedEntry{Initial: false, TradeTime: 350, SinceInitialSecs: 100}, true},   // opened 250
+		{"add to outside position", storage.ClassifiedEntry{Initial: false, TradeTime: 250, SinceInitialSecs: 100}, false}, // opened 150
+		{"add same-sec boundary", storage.ClassifiedEntry{Initial: false, TradeTime: 300, SinceInitialSecs: 100}, true},    // opened 200
+	}
+	for _, c := range cases {
+		if got := inCohort(c.ce, since); got != c.want {
+			t.Errorf("%s: inCohort(%+v) = %v, want %v", c.name, c.ce, got, c.want)
+		}
+	}
+}
