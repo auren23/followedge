@@ -4,8 +4,9 @@
 //
 // Price source: GMGN 30s klines (the finest resolution the public API
 // offers). The observed price for horizon H is the close of the first candle
-// that opens at/after TradeTime+H. Sub-30s horizons therefore need a
-// different price source and are not supported in v0.1.
+// that CLOSES at/after TradeTime+H (lag bounded by one resolution). Sub-30s
+// horizons therefore need a different price source and are not supported in
+// v0.1.
 package markout
 
 import (
@@ -135,8 +136,12 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 	const maxTokensPerTick = 25
 
 	byToken := map[string][]target{}
+	tokenOrder := []string{} // keeps the SQL fresh-first order through the map
 	earliest := map[string]time.Time{}
 	for _, d := range due {
+		if _, ok := byToken[d.Token]; !ok {
+			tokenOrder = append(tokenOrder, d.Token)
+		}
 		byToken[d.Token] = append(byToken[d.Token], target{
 			d.DueAt, d.EventID, d.Kind, d.Horizon, d.BasePrice, d.BaseMs,
 		})
@@ -147,7 +152,8 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 
 	tokensDone := 0
 	entryCache := map[string]entryPrice{} // event → entry (shared across its 6 horizon rows)
-	for token, targets := range byToken {
+	for _, token := range tokenOrder {
+		targets := byToken[token]
 		if tokensDone >= maxTokensPerTick {
 			break // rest retried next tick
 		}

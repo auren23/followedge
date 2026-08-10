@@ -201,7 +201,8 @@ func TestRankSortAndFrontier(t *testing.T) {
 
 // TestRankSampleGate pins the P1 fix: a N=1 +300% actor must not top
 // --sort replicability nor claim a --frontier slot — replication axes
-// require a minimum sample (--min-repl-due/--min-repl-filled).
+// require a minimum sample (--min-repl-market/--min-repl-filled), aligned with
+// the cons-EV denominator (filled + market loss).
 func TestRankSampleGate(t *testing.T) {
 	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {

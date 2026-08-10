@@ -2,7 +2,7 @@
 
 **Profit Actor Discovery & Strategy Replication Engine.**
 
-版本：`v0.1.4.1-actor-census-integrity`。
+版本：`v0.1.4.2-v01-freeze`。
 
 核心问题不是"哪些信号可以买"，而是：
 
@@ -137,7 +137,8 @@ edge 都必须扛住它。样本量远不够下结论，继续积累 5,000+ even
 | `v0.1.3.2-dataset-integrity` | legacy schema inference（真实版本推断而非 pin maxVer）、pending-due 归入 unresolved 不进 cons-EV、price_parse_error 真正分类、stale_outcome + outcome_observed_at 固定 horizon 口径 |
 | `v0.1.3.3-measurement-freeze` | terminal status 不再每 tick 重采、fixed horizon 按 candle close time（lag∈[0,res]）、coverage 拆 unresolved_due/not_due、migration 事务原子化 |
 | `v0.1.4-actor-replication` | Actor 级 coverage-aware replication census（survivor-bias guard）、`actors rank --sort/--frontier`、空 kline 不再直接判死（no_kline_data + backoff）、price_parse_error retry 闭环 |
-| `v0.1.4.1-actor-census-integrity`（本版） | census 与 Quality 同窗口（--since）且只统计 BUY（entry replication）、no-kline retry fresh-first（SQL 层排除 backoff token）、frontier/sort 加 min sample gate、inspect chase 标注 observed-only |
+| `v0.1.4.1-actor-census-integrity` | census 与 Quality 同窗口（--since）且只统计 BUY（entry replication）、no-kline retry fresh-first（SQL 层排除 backoff token）、frontier/sort 加 min sample gate、inspect chase 标注 observed-only |
+| `v0.1.4.2-v01-freeze`（本版） | inspect alpha decay/chase 遵守 --since、engine tokenOrder 保持 SQL fresh-first 顺序、sample gate 对齐 cons-EV 有效样本（filled+market loss） |
 | `v0.2.0-mechanism` | Mechanism Analyzer（他靠什么赚钱）、Hypothesis 注册、archetype 聚类 |
 | `v0.3.0-experiment` | Replay/Experiment Engine（train/val/test）、Strategy 血缘注册 |
 | `v0.4.0-shadow` | 实时 Shadow Copy + Strategy Clone |

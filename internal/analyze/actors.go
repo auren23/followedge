@@ -160,11 +160,14 @@ const (
 
 // rankActors sorts by the requested axis, then applies the optional Pareto
 // frontier filter on (Quality, conservative EV). Replication axes honor a
-// minimum sample gate (--min-repl-due/--min-repl-filled): an actor with
-// N=1 +300%% must not top the replicability sort nor enter the frontier.
-func rankActors(list []*Actor, sortKey ActorSortKey, frontier bool, minReplDue, minReplFilled int) []*Actor {
+// minimum sample gate (--min-repl-market/--min-repl-filled) aligned with the
+// conservative-EV denominator: the effective market sample is Filled +
+// MarketLoss (measurement losses and unresolved rows never enter ConsEV), so
+// an actor with Due=100 but 95 api_error rows must not present ConsEV on an
+// N=5 sample.
+func rankActors(list []*Actor, sortKey ActorSortKey, frontier bool, minReplMarket, minReplFilled int) []*Actor {
 	replEligible := func(a *Actor) bool {
-		return a.Due >= minReplDue && a.Filled >= minReplFilled
+		return a.Filled+a.MarketLoss >= minReplMarket && a.Filled >= minReplFilled
 	}
 	switch sortKey {
 	case SortReplicability:
@@ -239,7 +242,7 @@ func rankActors(list []*Actor, sortKey ActorSortKey, frontier bool, minReplDue, 
 // hide survivor bias. Sorting and the Pareto frontier are user-selectable.
 func Rank(w io.Writer, s *storage.Store, since time.Time, horizon time.Duration,
 	limit, minTrades int, noExitLoss float64, grace time.Duration, sortKey ActorSortKey,
-	frontier bool, minReplDue, minReplFilled int) error {
+	frontier bool, minReplMarket, minReplFilled int) error {
 	groups, err := s.ActorGroups(since)
 	if err != nil {
 		return err
@@ -265,7 +268,7 @@ func Rank(w io.Writer, s *storage.Store, since time.Time, horizon time.Duration,
 			list = append(list, a)
 		}
 	}
-	list = rankActors(list, sortKey, frontier, minReplDue, minReplFilled)
+	list = rankActors(list, sortKey, frontier, minReplMarket, minReplFilled)
 	if limit > 0 && len(list) > limit {
 		list = list[:limit]
 	}
@@ -371,10 +374,10 @@ func Inspect(w io.Writer, s *storage.Store, wallet string, since time.Time,
 		fmt.Fprintf(w, "  (evidence query failed: %v)\n", err)
 	}
 
-	fmt.Fprintf(w, "\nALPHA DECAY (follower: entry at ReceivedAt, mean return of buys)\n")
+	fmt.Fprintf(w, "\nALPHA DECAY (follower: entry at ReceivedAt, mean return of buys, window %s+)\n", since.Format("2006-01-02"))
 	fmt.Fprintf(w, "%-10s %8s %8s %8s\n", "horizon", "fills", "avg", "WR")
 	for _, h := range horizons {
-		rets := buysAt(s, wallet, h)
+		rets := buysAt(s, wallet, h, since)
 		if len(rets) == 0 {
 			continue
 		}
@@ -417,10 +420,11 @@ func Inspect(w io.Writer, s *storage.Store, wallet string, since time.Time,
 			obsStr = fmt.Sprintf("%+9.2f%%", r.ObservedEV)
 		}
 		fmt.Fprintf(w, "\nREPLICATION @%v (follower — coverage-aware census)\n", h)
-		fmt.Fprintf(w, "  due:              %d\n", r.Due)
-		fmt.Fprintf(w, "  filled:           %d    coverage %.1f%%\n", r.Filled, pct(r.Filled, r.Due))
-		fmt.Fprintf(w, "  observed EV:      %s\n", obsStr)
-		fmt.Fprintf(w, "  conservative EV:  %s  (unpriced market-outcome rows assumed -%.0f%%)\n", consStr, noExitLoss)
+		fmt.Fprintf(w, "  due:                 %d\n", r.Due)
+		fmt.Fprintf(w, "  filled:              %d    coverage %.1f%%\n", r.Filled, pct(r.Filled, r.Due))
+		fmt.Fprintf(w, "  effective market n:  %d  (filled + market loss — the cons-EV denominator)\n", r.Filled+r.MarketLoss)
+		fmt.Fprintf(w, "  observed EV:         %s\n", obsStr)
+		fmt.Fprintf(w, "  conservative EV:     %s  (unpriced market-outcome rows assumed -%.0f%%)\n", consStr, noExitLoss)
 		fmt.Fprintf(w, "  market loss:      %d  (no_candle/token_inactive/stale_outcome)\n", r.MarketLoss)
 		fmt.Fprintf(w, "  measurement loss: %d  (api/rate/lookback/parse/no_kline)\n", r.MeasLoss)
 		fmt.Fprintf(w, "  unresolved:       %d  (worker lag)\n", r.Unresolved)
@@ -429,8 +433,8 @@ func Inspect(w io.Writer, s *storage.Store, wallet string, since time.Time,
 	// the EV cliff in one line: does chasing kill this actor's edge?
 	// OBSERVED-ONLY: filled rows; coverage/market loss are in the census above.
 	const refHorizon = 5 * time.Minute
-	low := chaseConditionedEV(s, wallet, refHorizon, func(c float64) bool { return c <= 5 })
-	high := chaseConditionedEV(s, wallet, refHorizon, func(c float64) bool { return c > 10 })
+	low := chaseConditionedEV(s, wallet, refHorizon, since, func(c float64) bool { return c <= 5 })
+	high := chaseConditionedEV(s, wallet, refHorizon, since, func(c float64) bool { return c > 10 })
 	if low.n > 0 || high.n > 0 {
 		fmt.Fprintf(w, "\nCHASE-CONDITIONED EV @ %v (follower, OBSERVED-ONLY — filled rows; coverage in REPLICATION census above)\n", refHorizon)
 		fmt.Fprintf(w, "%-14s %8s %10s\n", "condition", "N", "avg")
@@ -444,17 +448,23 @@ func Inspect(w io.Writer, s *storage.Store, wallet string, since time.Time,
 	return nil
 }
 
-// buysAt collects one wallet's filled FOLLOWER buy markouts at a horizon.
-func buysAt(s *storage.Store, wallet string, horizon time.Duration) []float64 {
+// buysAt collects one wallet's filled FOLLOWER buy markouts at a horizon,
+// restricted to the SAME window as the actor card (--since) so the card's
+// sections never mix periods.
+func buysAt(s *storage.Store, wallet string, horizon time.Duration, since time.Time) []float64 {
 	rows, err := s.MarkoutsAt(storage.MarkoutFollower, horizon)
 	if err != nil {
 		return nil
 	}
 	var out []float64
 	for _, m := range rows {
-		if m.Wallet == wallet && m.Side == "buy" && m.ReturnPct.Valid {
-			out = append(out, m.ReturnPct.Float64)
+		if m.Wallet != wallet || m.Side != "buy" || !m.ReturnPct.Valid {
+			continue
 		}
+		if m.TradeTime < since.Unix() {
+			continue
+		}
+		out = append(out, m.ReturnPct.Float64)
 	}
 	return out
 }
@@ -466,7 +476,7 @@ type condEV struct {
 	mean float64
 }
 
-func chaseConditionedEV(s *storage.Store, wallet string, horizon time.Duration, cond func(float64) bool) condEV {
+func chaseConditionedEV(s *storage.Store, wallet string, horizon time.Duration, since time.Time, cond func(float64) bool) condEV {
 	rows, err := s.MarkoutsAt(storage.MarkoutFollower, horizon)
 	if err != nil {
 		return condEV{}
@@ -474,6 +484,9 @@ func chaseConditionedEV(s *storage.Store, wallet string, horizon time.Duration, 
 	var rets []float64
 	for _, m := range rows {
 		if m.Wallet != wallet || m.Side != "buy" || !m.ReturnPct.Valid {
+			continue
+		}
+		if m.TradeTime < since.Unix() {
 			continue
 		}
 		if cond(m.ChasePct) {

@@ -2,6 +2,7 @@ package markout
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"path/filepath"
 	"sort"
@@ -399,10 +400,12 @@ func (t *tokenCannedClient) Kline(ctx context.Context, chain, address, resolutio
 	return t.byToken[address], nil
 }
 
-// countingClient wraps a klineFetcher and records per-token request counts.
+// countingClient wraps a klineFetcher and records per-token request counts
+// and the request ORDER (for fresh-first assertions).
 type countingClient struct {
 	c        klineFetcher
 	requests map[string]int
+	order    []string
 }
 
 func (c *countingClient) Kline(ctx context.Context, chain, address, resolution string, from, to time.Time) ([]gmgn.Candle, error) {
@@ -410,7 +413,74 @@ func (c *countingClient) Kline(ctx context.Context, chain, address, resolution s
 		c.requests = map[string]int{}
 	}
 	c.requests[address]++
+	c.order = append(c.order, address)
 	return c.c.Kline(ctx, chain, address, resolution, from, to)
+}
+
+// TestSampleDueFreshFirstOrdering pins the P1-high fix: the SQL fresh-first
+// order must survive the byToken map. With 30 fresh follower-pending tokens
+// ahead of 30 old retry tokens and maxTokensPerTick=25, all 25 requests of
+// one tick must come from fresh tokens.
+func TestSampleDueFreshFirstOrdering(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	freshBase := now.Add(-30 * time.Minute).Truncate(30 * time.Second)
+	retryBase := now.Add(-60 * time.Minute).Truncate(30 * time.Second)
+	mk := func(id, token string, base time.Time, status string) {
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W1", token, "buy"),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W1", WalletType: domain.WalletSmartMoney,
+			TokenAddress: token, Side: domain.Buy, AmountUSD: 100, PriceUSD: 1.00,
+			TradeTime: base, ReceivedAt: base,
+		}
+		if _, err := s.InsertEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CreateMarkouts(ev, storage.MarkoutFollower, nil, []time.Duration{30 * time.Second}, now); err != nil {
+			t.Fatal(err)
+		}
+		if status != "" {
+			if err := s.SetMarkoutStatus(ev.ID, storage.MarkoutFollower, 30*time.Second, status); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for i := 0; i < 30; i++ {
+		mk(fmt.Sprintf("f%d", i), fmt.Sprintf("FRESH_%d", i), freshBase, "")
+	}
+	for i := 0; i < 30; i++ {
+		mk(fmt.Sprintf("r%d", i), fmt.Sprintf("RETRY_%d", i), retryBase, storage.MarkoutStatusLookbackMiss)
+	}
+
+	// candles covering the fresh window (freshBase-30s … now)
+	candles := []gmgn.Candle{}
+	for i := 0; i < 65; i++ {
+		candles = append(candles, gmgn.Candle{
+			Time:  freshBase.Add(-30 * time.Second).Add(time.Duration(i*30) * time.Second).UnixMilli(),
+			Close: "1.00",
+		})
+	}
+	counted := &countingClient{c: &tokenCannedClient{byToken: map[string][]gmgn.Candle{"__default__": candles}}}
+	eng := NewEngine(s, nil, noopLimiter{}, "sol", "30s", 0, []time.Duration{30 * time.Second})
+	eng.client = counted
+	if err := eng.SampleDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(counted.order) != 25 {
+		t.Fatalf("expected 25 kline requests (maxTokensPerTick), got %d", len(counted.order))
+	}
+	for i, tok := range counted.order {
+		if !strings.HasPrefix(tok, "FRESH_") {
+			t.Fatalf("request #%d was %s — fresh-first order lost through the map", i, tok)
+		}
+	}
 }
 
 // TestSampleDueFollower verifies the measurement split AND the P0.5 fix:
