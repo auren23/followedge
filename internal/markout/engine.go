@@ -174,15 +174,12 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 			e.markStatus(targets, storage.MarkoutStatusTokenInactive)
 			continue
 		}
-		// candle open times in unix seconds, ascending
-		times := make([]int64, len(candles))
-		closes := make([]float64, len(candles))
+		// candles with validity kept separate: an unparseable close is a
+		// measurement failure (price_parse_error), NOT a dead token.
+		scs := make([]sampledCandle, len(candles))
 		for i, c := range candles {
-			times[i] = c.Time / 1000
-			closes[i], err = strconv.ParseFloat(c.Close, 64)
-			if err != nil {
-				closes[i] = 0
-			}
+			p, err := strconv.ParseFloat(c.Close, 64)
+			scs[i] = sampledCandle{open: c.Time / 1000, close: p, valid: err == nil && p > 0}
 		}
 		for _, t := range targets {
 			// follower rows need their entry price: the close of the last
@@ -192,14 +189,18 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 			if t.kind == storage.MarkoutFollower && t.basePrice == 0 {
 				ep, ok := entryCache[t.event]
 				if !ok {
-					p, open, found := lastCloseAtOrBefore(times, closes, t.baseMs-e.resSecs)
-					if !found || p <= 0 {
-						// entry candle out of the fetched window (or unparseable) —
-						// retryable: a later pass fetches a longer window.
+					c, found := lastCloseAtOrBefore(scs, t.baseMs-e.resSecs)
+					if !found {
+						// entry candle out of the fetched window — retryable: a
+						// later pass fetches a longer window.
 						e.markStatus([]target{t}, storage.MarkoutStatusLookbackMiss)
 						continue
 					}
-					ep = entryPrice{price: p, observedAt: time.Unix(open+e.resSecs, 0).UTC()}
+					if !c.valid {
+						e.markStatus([]target{t}, storage.MarkoutStatusParseError)
+						continue
+					}
+					ep = entryPrice{price: c.close, observedAt: time.Unix(c.open+e.resSecs, 0).UTC()}
 					entryCache[t.event] = ep
 				}
 				if err := e.store.SetEntryPrice(t.event, t.kind, t.horizon, ep.price, ep.observedAt); err != nil {
@@ -211,15 +212,28 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 				e.markStatus([]target{t}, storage.MarkoutStatusLookbackMiss)
 				continue // entry unknown; horizon return would be meaningless
 			}
-			obs, ok := firstCloseAtOrAfter(times, closes, t.due.Unix())
-			if !ok || obs <= 0 {
+			c, found := firstCloseAtOrAfter(scs, t.due.Unix())
+			if !found {
 				// the kline window covers the due time (it starts 2 res before
 				// the earliest due) but no candle opens there — the candle
 				// stream ended before the horizon: the token stopped trading.
 				e.markStatus([]target{t}, storage.MarkoutStatusNoCandle)
 				continue
 			}
-			if err := e.store.FillMarkout(t.event, t.kind, t.horizon, obs); err != nil {
+			if !c.valid {
+				// candle exists but its close is garbage — malformed API
+				// response, NOT a dead token.
+				e.markStatus([]target{t}, storage.MarkoutStatusParseError)
+				continue
+			}
+			if c.open > t.due.Unix()+e.resSecs {
+				// the stream continued, but the first trade after due opened
+				// later than due+res: no executable price AT the fixed
+				// horizon. Market outcome (like no_candle), not measurement.
+				e.markStatus([]target{t}, storage.MarkoutStatusStaleOutcome)
+				continue
+			}
+			if err := e.store.FillMarkout(t.event, t.kind, t.horizon, c.close, c.open+e.resSecs); err != nil {
 				e.log.Warn("fill markout failed", "event", t.event, "horizon", t.horizon, "err", err)
 			}
 		}
@@ -245,23 +259,34 @@ type entryPrice struct {
 	observedAt time.Time
 }
 
-// firstCloseAtOrAfter returns the close of the first candle opening at or
-// after ts. times must be ascending.
-func firstCloseAtOrAfter(times []int64, closes []float64, ts int64) (float64, bool) {
-	i := sort.Search(len(times), func(i int) bool { return times[i] >= ts })
-	if i == len(times) {
-		return 0, false
-	}
-	return closes[i], closes[i] > 0
+// sampledCandle is one kline candle with its close parsed; valid=false
+// means the close was unparseable or non-positive — a measurement failure
+// that must NOT be mistaken for a dead token.
+type sampledCandle struct {
+	open  int64 // candle open, unix seconds
+	close float64
+	valid bool
 }
 
-// lastCloseAtOrBefore returns the close and open time of the last candle
-// opening at or before ts — used for follower entries: the newest candle
-// whose close (open+res) is already known at ts, i.e. NO future info.
-func lastCloseAtOrBefore(times []int64, closes []float64, ts int64) (price float64, open int64, ok bool) {
-	i := sort.Search(len(times), func(i int) bool { return times[i] > ts })
-	if i == 0 {
-		return 0, 0, false
+// firstCloseAtOrAfter returns the first candle opening at or after ts.
+// found=false means the candle stream ended before ts; the returned candle
+// may still be invalid (unparseable close). cs must be ascending by open.
+func firstCloseAtOrAfter(cs []sampledCandle, ts int64) (sampledCandle, bool) {
+	i := sort.Search(len(cs), func(i int) bool { return cs[i].open >= ts })
+	if i == len(cs) {
+		return sampledCandle{}, false
 	}
-	return closes[i-1], times[i-1], closes[i-1] > 0
+	return cs[i], true
+}
+
+// lastCloseAtOrBefore returns the last candle opening at or before ts — used
+// for follower entries: the newest candle whose close (open+res) is already
+// known at ts, i.e. NO future info. found=false when the stream starts after
+// ts; the returned candle may still be invalid.
+func lastCloseAtOrBefore(cs []sampledCandle, ts int64) (sampledCandle, bool) {
+	i := sort.Search(len(cs), func(i int) bool { return cs[i].open > ts })
+	if i == 0 {
+		return sampledCandle{}, false
+	}
+	return cs[i-1], true
 }

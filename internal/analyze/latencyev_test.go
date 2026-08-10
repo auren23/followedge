@@ -39,7 +39,7 @@ func TestLatencyEVCoverageAndConservative(t *testing.T) {
 			t.Fatal(err)
 		}
 		if ret != nil {
-			if err := s.FillMarkout(ev.ID, storage.MarkoutFollower, 30*time.Second, 1.0+*ret/100); err != nil {
+			if err := s.FillMarkout(ev.ID, storage.MarkoutFollower, 30*time.Second, 1.0+*ret/100, 0); err != nil {
 				t.Fatal(err)
 			}
 		} else {
@@ -104,7 +104,7 @@ func TestLatencyEVSideFilter(t *testing.T) {
 		if err := s.CreateMarkouts(ev, storage.MarkoutFollower, &entry, []time.Duration{30 * time.Second}, now); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.FillMarkout(ev.ID, storage.MarkoutFollower, 30*time.Second, 1.0+ret/100); err != nil {
+		if err := s.FillMarkout(ev.ID, storage.MarkoutFollower, 30*time.Second, 1.0+ret/100, 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -153,7 +153,7 @@ func TestLatencyEVMeasurementFailureExcluded(t *testing.T) {
 			t.Fatal(err)
 		}
 		if ret != nil {
-			if err := s.FillMarkout(ev.ID, storage.MarkoutFollower, 30*time.Second, 1.0+*ret/100); err != nil {
+			if err := s.FillMarkout(ev.ID, storage.MarkoutFollower, 30*time.Second, 1.0+*ret/100, 0); err != nil {
 				t.Fatal(err)
 			}
 		} else {
@@ -215,7 +215,7 @@ func TestLatencyEVByChaseUnobserved(t *testing.T) {
 			t.Fatal(err)
 		}
 		if ret != nil {
-			if err := s.FillMarkout(ev.ID, storage.MarkoutFollower, 30*time.Second, 1.0+*ret/100); err != nil {
+			if err := s.FillMarkout(ev.ID, storage.MarkoutFollower, 30*time.Second, 1.0+*ret/100, 0); err != nil {
 				t.Fatal(err)
 			}
 		} else {
@@ -243,5 +243,66 @@ func TestLatencyEVByChaseUnobserved(t *testing.T) {
 	}
 	if !strings.Contains(out, "50.0%") {
 		t.Errorf("unobserved row vanished from due total (want coverage 50.0%%): %s", out)
+	}
+}
+
+// TestLatencyEVPendingDueUnresolved pins the P0.5 fix: a row that is DUE but
+// still 'pending' (the worker has not classified it — tick lag, backlog) is
+// sampling throughput, not a market outcome. It must not enter the cons-EV
+// denominator as a -100% trade; it shows up in the unresolved column.
+func TestLatencyEVPendingDueUnresolved(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	mk := func(id string, ret *float64) {
+		ts := now.Add(-20 * time.Minute)
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W", "T_"+id, "buy"),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W", WalletType: domain.WalletSmartMoney,
+			TokenAddress: "T_" + id, Side: domain.Buy, AmountUSD: 10, PriceUSD: 1.0,
+			TradeTime: ts.Add(-10 * time.Second), ReceivedAt: ts,
+		}
+		insert(t, s, ev)
+		entry := 1.0
+		if err := s.CreateMarkouts(ev, storage.MarkoutFollower, &entry, []time.Duration{30 * time.Second}, now); err != nil {
+			t.Fatal(err)
+		}
+		if ret != nil {
+			if err := s.FillMarkout(ev.ID, storage.MarkoutFollower, 30*time.Second, 1.0+*ret/100, 0); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// no status set for e2 → stays 'pending' although already due
+	}
+	p10 := 10.0
+	mk("e1", &p10)
+	mk("e2", nil) // due but pending (worker lag)
+
+	var buf sink
+	if err := LatencyEV(&buf, s, 30*time.Second, "", false, 100, 0); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	t.Log(out)
+
+	// due=2 filled=1 cover=50%, but cons EV = obs EV = +10: the pending row
+	// is unresolved, not a -100% market loss. If it wrongly entered the
+	// denominator, cons would be (10-100)/2 = -45.00.
+	if !strings.Contains(out, "50.0%") {
+		t.Errorf("coverage must count the pending row as due: %s", out)
+	}
+	if !strings.Contains(out, "+10.00%") {
+		t.Errorf("cons EV wrong (want +10.00 — pending row excluded): %s", out)
+	}
+	if strings.Contains(out, "-45.00%") {
+		t.Errorf("pending-due row must NOT count as -100%% trade: %s", out)
+	}
+	if !strings.Contains(out, "unresolved") {
+		t.Errorf("unresolved column missing: %s", out)
 	}
 }

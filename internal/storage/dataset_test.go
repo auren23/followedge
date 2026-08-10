@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -58,7 +59,7 @@ func TestMarkoutStatusLifecycle(t *testing.T) {
 	}
 
 	// fill wins over any status
-	if err := s.FillMarkout(ev.ID, MarkoutLeader, 30*time.Second, 1.2); err != nil {
+	if err := s.FillMarkout(ev.ID, MarkoutLeader, 30*time.Second, 1.2, 0); err != nil {
 		t.Fatal(err)
 	}
 	counts, _, err = s.MarkoutStatusCounts(MarkoutLeader, 30*time.Second, 0, now)
@@ -159,62 +160,90 @@ func TestRebuildEpisodes(t *testing.T) {
 	}
 }
 
+// buildLegacyDB creates a raw SQLite db with migrations 001..upto applied
+// and an EMPTY schema_version table — the exact state of every db built in
+// the buggy era before version tracking worked.
+func buildLegacyDB(t *testing.T, path string, upto int) *sql.DB {
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dirs, err := migrationsFS.ReadDir("migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range dirs[:upto] {
+		data, err := migrationsFS.ReadFile("migrations/" + d.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(string(data)); err != nil {
+			t.Fatalf("apply %s: %v", d.Name(), err)
+		}
+	}
+	if _, err := db.Exec(`CREATE TABLE schema_version (version INTEGER NOT NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+// seedLegacyPricedRow inserts one leader markout row that was PRICED before
+// statuses existed (observed_price set, status 'pending' where the column
+// exists — the exact trap 007 must fix).
+func seedLegacyPricedRow(t *testing.T, db *sql.DB, withStatus bool) {
+	now := time.Now().UTC().Unix()
+	if _, err := db.Exec(`INSERT INTO trade_events
+		(event_id, source, chain, tx_hash, wallet, wallet_type, token_address, token_symbol,
+		 side, position_action, amount_usd, token_amount, price_usd, buy_cost_usd,
+		 trade_time, received_at, processed_at, raw_json)
+		VALUES ('sol_upg_legacy', 'gmgn_smartmoney', 'sol', 'upg', 'W', 'smart_money', 'TOKEN_UP', 'UP',
+		        'buy', NULL, 10, 1e18, 1.0, 10, ?, ?, ?, '{}')`, now-300, now-300, now); err != nil {
+		t.Fatal(err)
+	}
+	cols := "event_id, kind, horizon_ms, base_ms, base_price, observed_price, return_pct, created_at"
+	vals := "'sol_upg_legacy', 'leader', 30000, ?, 1.0, 1.1, 10, ?"
+	args := []any{now - 300, now}
+	if withStatus {
+		cols += ", status"
+		vals += ", 'pending'"
+	}
+	if _, err := db.Exec(`INSERT INTO markouts (`+cols+`) VALUES (`+vals+`)`, args...); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestMigration007BackfillsFilled simulates the v0.1.3 → v0.1.3.1 upgrade:
-// rows already priced before v6's status column existed were left 'pending'
-// and must be backfilled to 'filled', or coverage numerators undercount.
+// a legacy v6 db (no version row) whose priced rows are stuck on 'pending'
+// must have 007 run — schema inferred to 6, not pinned to the latest — and
+// the backfill must flip them to 'filled'.
 func TestMigration007BackfillsFilled(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "upgrade.db")
+	db := buildLegacyDB(t, path, 6) // v6 schema: status column exists
+	seedLegacyPricedRow(t, db, true)
+	db.Close()
 
-	// 1. build a current schema db with a priced row
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	now := time.Now().UTC()
-	ev := domain.TradeEvent{
-		ID:     domain.EventID("sol", "upg", "W", "TOKEN_UP", "buy"),
-		Source: "gmgn_smartmoney", Chain: "sol", TxHash: "upg",
-		Wallet: "W", WalletType: domain.WalletSmartMoney,
-		TokenAddress: "TOKEN_UP", Side: domain.Buy, AmountUSD: 10, PriceUSD: 1.0,
-		TradeTime: now.Add(-5 * time.Minute), ReceivedAt: now.Add(-5 * time.Minute),
-	}
-	created, err := s.InsertEvent(ev)
-	if err != nil || !created {
-		t.Fatalf("insert: %v %v", created, err)
-	}
-	price := 1.0
-	if err := s.CreateMarkouts(ev, MarkoutLeader, &price, []time.Duration{30 * time.Second}, now); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.FillMarkout(ev.ID, MarkoutLeader, 30*time.Second, 1.1); err != nil {
-		t.Fatal(err)
-	}
+	defer s.Close()
 
-	// 2. simulate the v6-era state: status stuck on 'pending' for already
-	//    priced rows, schema_version rolled back so 007 re-runs on reopen
-	if _, err := s.db.Exec(`UPDATE markouts SET status = 'pending'`); err != nil {
+	var ver int
+	if err := s.db.QueryRow(`SELECT version FROM schema_version`).Scan(&ver); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.db.Exec(`UPDATE schema_version SET version = 6`); err != nil {
-		t.Fatal(err)
+	if ver != 8 {
+		t.Errorf("legacy v6 db pinned to version %d, want 8 (007+008 must have run)", ver)
 	}
-	s.Close()
-
-	// 3. reopen: migration 007 must backfill the priced row to 'filled'
-	s2, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s2.Close()
 	var st string
-	if err := s2.db.QueryRow(`SELECT status FROM markouts WHERE event_id = ?`, ev.ID).Scan(&st); err != nil {
+	if err := s.db.QueryRow(`SELECT status FROM markouts WHERE event_id = 'sol_upg_legacy'`).Scan(&st); err != nil {
 		t.Fatal(err)
 	}
 	if st != MarkoutStatusFilled {
-		t.Errorf("pre-v6 priced row status = %q after upgrade, want %q", st, MarkoutStatusFilled)
+		t.Errorf("pre-v6 priced row status = %q after upgrade, want %q (007 backfill)", st, MarkoutStatusFilled)
 	}
-	// and coverage must count it as filled
-	filled, due, err := s2.DueCoverage(MarkoutLeader, 30*time.Second, 0, now)
+	// coverage must count it as filled
+	filled, due, err := s.DueCoverage(MarkoutLeader, 30*time.Second, 0, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,31 +252,45 @@ func TestMigration007BackfillsFilled(t *testing.T) {
 	}
 }
 
-// TestOpenBugEraDB pins the migration-bug fix: a db created before version
-// tracking worked has tables but NO schema_version row. Opening it must pin
-// the version to the latest migration (all were applied in that era), not
-// re-run everything and crash on "table already exists".
-func TestOpenBugEraDB(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "bugera.db")
+// TestLegacyV5Inference upgrades a v5 db (no status column, no episodes
+// table): inference must land on 5, then 006 creates the status column and
+// episodes table, and 007 backfills the priced row.
+func TestLegacyV5Inference(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v5.db")
+	db := buildLegacyDB(t, path, 5)
+	seedLegacyPricedRow(t, db, false) // v5 markouts has no status column
+	db.Close()
+
 	s, err := Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.db.Exec(`DELETE FROM schema_version`); err != nil {
-		t.Fatal(err)
-	}
-	s.Close()
+	defer s.Close()
 
-	s2, err := Open(path)
-	if err != nil {
-		t.Fatalf("reopen bug-era db: %v", err)
-	}
-	defer s2.Close()
 	var ver int
-	if err := s2.db.QueryRow(`SELECT version FROM schema_version`).Scan(&ver); err != nil {
+	if err := s.db.QueryRow(`SELECT version FROM schema_version`).Scan(&ver); err != nil {
 		t.Fatal(err)
 	}
-	if ver != 7 {
-		t.Errorf("bug-era db pinned to version %d, want 7", ver)
+	if ver != 8 {
+		t.Errorf("legacy v5 db pinned to version %d, want 8", ver)
+	}
+	// 006 must have created the status column + episodes table
+	if !hasColumn(s.db, "markouts", "status") {
+		t.Error("markouts.status missing after v5→v8 upgrade")
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='position_episodes'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Error("position_episodes table missing after v5→v8 upgrade")
+	}
+	// 007 backfill: the priced row must be 'filled' (was pending by DEFAULT)
+	var st string
+	if err := s.db.QueryRow(`SELECT status FROM markouts WHERE event_id = 'sol_upg_legacy'`).Scan(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st != MarkoutStatusFilled {
+		t.Errorf("v5-era priced row status = %q, want %q (007 backfill)", st, MarkoutStatusFilled)
 	}
 }

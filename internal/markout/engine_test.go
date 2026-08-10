@@ -75,8 +75,12 @@ func (r *rateLimitedClient) Kline(ctx context.Context, chain, address, resolutio
 }
 
 func TestFirstCloseAtOrAfter(t *testing.T) {
-	times := []int64{100, 130, 160, 190}
-	closes := []float64{1.0, 1.1, 1.2, 1.3}
+	cs := []sampledCandle{
+		{open: 100, close: 1.0, valid: true},
+		{open: 130, close: 1.1, valid: true},
+		{open: 160, close: 1.2, valid: true},
+		{open: 190, close: 1.3, valid: true},
+	}
 
 	cases := []struct {
 		ts   int64
@@ -90,10 +94,21 @@ func TestFirstCloseAtOrAfter(t *testing.T) {
 		{99, 1.0, true},  // before first candle
 	}
 	for _, c := range cases {
-		got, ok := firstCloseAtOrAfter(times, closes, c.ts)
-		if got != c.want || ok != c.ok {
+		got, ok := firstCloseAtOrAfter(cs, c.ts)
+		if got.close != c.want || ok != c.ok {
 			t.Errorf("firstCloseAtOrAfter(%d) = (%v, %v), want (%v, %v)", c.ts, got, ok, c.want, c.ok)
 		}
+	}
+
+	// invalid candle is found but flagged: parse failure must NOT look like
+	// a dead token (found=true) nor like a valid price (valid=false).
+	bad := []sampledCandle{{open: 100, close: 0, valid: false}}
+	got, found := firstCloseAtOrAfter(bad, 100)
+	if !found || got.valid {
+		t.Errorf("unparseable candle: found=%v valid=%v, want found=true valid=false", found, got.valid)
+	}
+	if _, found := lastCloseAtOrBefore(bad, 100); !found {
+		t.Errorf("lastCloseAtOrBefore must find the unparseable candle (entry parse error path)")
 	}
 }
 
@@ -432,5 +447,143 @@ func TestSampleDueFollower(t *testing.T) {
 	}
 	if m.LeaderPrice != 1.00 {
 		t.Errorf("leader price = %v, want 1.00", m.LeaderPrice)
+	}
+}
+
+// TestSampleDueParseError pins the price_parse_error path: a candle whose
+// close cannot be parsed is a MEASUREMENT failure — it must not fall into
+// lookback_miss (entry) or no_candle (horizon), i.e. must not look like a
+// dead token.
+func TestSampleDueParseError(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	mkLeader := func(id, token string) {
+		base := now.Add(-5 * time.Minute).Truncate(30 * time.Second).Add(15 * time.Second)
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W1", token, "buy"),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W1", WalletType: domain.WalletSmartMoney,
+			TokenAddress: token, Side: domain.Buy, AmountUSD: 100, PriceUSD: 1.00,
+			TradeTime: base, ReceivedAt: base,
+		}
+		if _, err := s.InsertEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+		price := ev.PriceUSD
+		if err := s.CreateMarkouts(ev, storage.MarkoutLeader, &price, []time.Duration{30 * time.Second}, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mkFollower := func(id, token string) {
+		base := now.Add(-5 * time.Minute).Truncate(30 * time.Second).Add(15 * time.Second)
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W1", token, "buy"),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W1", WalletType: domain.WalletSmartMoney,
+			TokenAddress: token, Side: domain.Buy, AmountUSD: 100, PriceUSD: 1.00,
+			TradeTime: base, ReceivedAt: base,
+		}
+		if _, err := s.InsertEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.CreateMarkouts(ev, storage.MarkoutFollower, nil, []time.Duration{30 * time.Second}, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// P1: horizon candle exists but close is garbage (open b+60 >= due b+45)
+	mkLeader("p1", "TOKEN_P1")
+	// P2: entry candle exists but close is garbage (open b-30 <= base-30)
+	mkFollower("p2", "TOKEN_P2")
+	b := now.Add(-5 * time.Minute).Truncate(30 * time.Second)
+
+	eng := NewEngine(s, nil, noopLimiter{}, "sol", "30s", 0, []time.Duration{30 * time.Second})
+	eng.client = &tokenCannedClient{byToken: map[string][]gmgn.Candle{
+		"TOKEN_P1": {{Time: b.UnixMilli(), Close: "1.00"}, {Time: b.Add(60 * time.Second).UnixMilli(), Close: "garbage"}},
+		"TOKEN_P2": {{Time: b.Add(-30 * time.Second).UnixMilli(), Close: "garbage"}, {Time: b.Add(60 * time.Second).UnixMilli(), Close: "1.10"}},
+	}}
+	if err := eng.SampleDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, token := range []string{"TOKEN_P1", "TOKEN_P2"} {
+		var st string
+		if err := s.DB().QueryRow(`SELECT m.status FROM markouts m JOIN trade_events e ON e.event_id = m.event_id WHERE e.token_address = ?`, token).Scan(&st); err != nil {
+			t.Fatal(err)
+		}
+		if st != storage.MarkoutStatusParseError {
+			t.Errorf("%s status = %s, want %s (malformed close is measurement failure, not dead token)", token, st, storage.MarkoutStatusParseError)
+		}
+	}
+}
+
+// TestSampleDueStaleOutcome pins the fixed-horizon rule: the first candle at
+// or after due must open within [due, due+res] to count as a strict fill;
+// otherwise the row is stale_outcome. Valid fills record outcome_observed_at.
+func TestSampleDueStaleOutcome(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	mkLeader := func(id, token string) {
+		base := now.Add(-5 * time.Minute).Truncate(30 * time.Second).Add(15 * time.Second)
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W1", token, "buy"),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W1", WalletType: domain.WalletSmartMoney,
+			TokenAddress: token, Side: domain.Buy, AmountUSD: 100, PriceUSD: 1.00,
+			TradeTime: base, ReceivedAt: base,
+		}
+		if _, err := s.InsertEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+		price := ev.PriceUSD
+		if err := s.CreateMarkouts(ev, storage.MarkoutLeader, &price, []time.Duration{30 * time.Second}, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// S1: due = b+45s, next candle opens b+90s (> due+30s) → stale_outcome
+	mkLeader("s1", "TOKEN_S1")
+	// S2: due = b+45s, next candle opens b+60s (<= due+30s) → strict fill
+	mkLeader("s2", "TOKEN_S2")
+	b := now.Add(-5 * time.Minute).Truncate(30 * time.Second)
+
+	eng := NewEngine(s, nil, noopLimiter{}, "sol", "30s", 0, []time.Duration{30 * time.Second})
+	eng.client = &tokenCannedClient{byToken: map[string][]gmgn.Candle{
+		"TOKEN_S1": {{Time: b.UnixMilli(), Close: "1.00"}, {Time: b.Add(90 * time.Second).UnixMilli(), Close: "1.10"}},
+		"TOKEN_S2": {{Time: b.UnixMilli(), Close: "1.00"}, {Time: b.Add(60 * time.Second).UnixMilli(), Close: "1.10"}},
+	}}
+	if err := eng.SampleDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var st string
+	if err := s.DB().QueryRow(`SELECT m.status FROM markouts m JOIN trade_events e ON e.event_id = m.event_id WHERE e.token_address = 'TOKEN_S1'`).Scan(&st); err != nil {
+		t.Fatal(err)
+	}
+	if st != storage.MarkoutStatusStaleOutcome {
+		t.Errorf("TOKEN_S1 status = %s, want %s (first candle opened past due+res)", st, storage.MarkoutStatusStaleOutcome)
+	}
+
+	rows, err := s.MarkoutsAt(storage.MarkoutLeader, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || !rows[0].ReturnPct.Valid {
+		t.Fatalf("expected exactly the strict fill TOKEN_S2, got %+v", rows)
+	}
+	// observed at = candle close instant = open + res
+	wantObs := b.Add(60*time.Second).Unix() + 30
+	if rows[0].OutcomeObservedAt != wantObs {
+		t.Errorf("outcome_observed_at = %d, want %d (candle close instant)", rows[0].OutcomeObservedAt, wantObs)
 	}
 }

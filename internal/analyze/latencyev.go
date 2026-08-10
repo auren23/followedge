@@ -74,11 +74,12 @@ func LatencyEV(w io.Writer, s *storage.Store, horizon time.Duration, side string
 	}
 
 	type cell struct {
-		due    int // all due rows (denominator of coverage)
-		filled int // priced with a computable return
-		market int // market-outcome rows (filled + dead tokens + unclassified)
-		meas   int // measurement failures (excluded from cons EV)
-		rets   []float64
+		due        int // all due rows (denominator of coverage)
+		filled     int // priced with a computable return
+		market     int // market-outcome rows (filled + no_candle + token_inactive + stale_outcome)
+		meas       int // measurement failures (excluded from cons EV)
+		unresolved int // due but not yet classified by the worker (pending)
+		rets       []float64
 	}
 
 	// ---- bucket every due row (census) by wallet type × age × [chase] ----
@@ -113,8 +114,13 @@ func LatencyEV(w io.Writer, s *storage.Store, horizon time.Duration, side string
 				cl.filled++
 				cl.rets = append(cl.rets, (*r.ObservedPrice/r.BasePrice-1)*100)
 			}
-		case storage.MarkoutStatusNoCandle, storage.MarkoutStatusTokenInactive, storage.MarkoutStatusPending:
-			cl.market++ // dead / unclassified due rows: conservative loss
+		case storage.MarkoutStatusNoCandle, storage.MarkoutStatusTokenInactive, storage.MarkoutStatusStaleOutcome:
+			cl.market++ // dead / stale tokens: conservative loss
+		case storage.MarkoutStatusPending:
+			// due but the worker has not classified it yet (tick lag,
+			// maxTokensPerTick backlog). That is sampling throughput, not a
+			// market outcome — keep it out of the cons-EV denominator.
+			cl.unresolved++
 		default: // api_error, rate_limited, lookback_miss, price_parse_error
 			cl.meas++ // measurement loss — NOT a trade outcome
 		}
@@ -159,35 +165,29 @@ func LatencyEV(w io.Writer, s *storage.Store, horizon time.Duration, side string
 			continue
 		}
 
-		fmt.Fprintf(w, "%-10s %8s %8s %9s %8s %10s %10s %10s %8s\n",
-			"age", "due", "fill", "cover", "WR", "obs EV", "median", "cons EV", "meas")
+		fmt.Fprintf(w, "%-10s %8s %8s %9s %10s %10s %12s %8s %10s\n",
+			"age", "due", "fill", "cover", "obsEV", "consEV", "market_loss", "meas", "unresolved")
 		for _, b := range ageOrder {
 			c := cells[key{t, b, ""}]
 			if c == nil || c.due == 0 {
 				continue
 			}
-			wins := 0
-			for _, r := range c.rets {
-				if r > 0 {
-					wins++
-				}
-			}
 			// conservative EV: every unpriced MARKET-outcome due row assumed
-			// to lose noExitLoss%; measurement failures are excluded — a 429
-			// is not a trade that lost 100%.
+			// to lose noExitLoss%; measurement failures AND pending rows are
+			// excluded — a 429 or an unprocessed row is not a -100% trade.
 			consStr := "n/a"
 			if c.market > 0 {
 				loss := float64(c.market-c.filled) * -noExitLoss
 				cons := (sum(c.rets) + loss) / float64(c.market)
 				consStr = fmt.Sprintf("%+9.2f%%", cons)
 			}
-			fmt.Fprintf(w, "%-10s %8d %8d %8.1f%% %7.1f%% %+9.2f%% %+9.2f%% %10s %8d\n",
+			fmt.Fprintf(w, "%-10s %8d %8d %8.1f%% %+9.2f%% %10s %12d %8d %10d\n",
 				b, c.due, c.filled, pctOf(c.filled, c.due),
-				pctOf(wins, c.filled), mean(c.rets), median(c.rets), consStr, c.meas)
+				mean(c.rets), consStr, c.market-c.filled, c.meas, c.unresolved)
 		}
 	}
-	fmt.Fprintf(w, "\ncons EV: unpriced MARKET-outcome rows (no_candle/token_inactive/pending) assumed to lose %.0f%%;\n", noExitLoss)
-	fmt.Fprintf(w, "measurement failures (api_error/rate_limited/lookback_miss/parse_error) excluded — coverage loss, not trade loss.\n")
+	fmt.Fprintf(w, "\ncons EV: unpriced MARKET-outcome rows (no_candle/token_inactive/stale_outcome) assumed to lose %.0f%%;\n", noExitLoss)
+	fmt.Fprintf(w, "measurement failures (api/rate/lookback/parse) and unresolved (pending, worker lag) excluded — coverage loss, not trade loss.\n")
 	return nil
 }
 

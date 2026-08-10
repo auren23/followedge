@@ -83,12 +83,8 @@ func (s *Store) migrate() error {
 		return err
 	}
 	names := make([]string, 0, len(dirs))
-	maxVer := 0
 	for _, d := range dirs {
 		names = append(names, d.Name())
-		if ver, err := strconv.Atoi(d.Name()[:3]); err == nil && ver > maxVer {
-			maxVer = ver
-		}
 	}
 	sort.Strings(names)
 
@@ -98,18 +94,10 @@ func (s *Store) migrate() error {
 		// no version row: seed it. Without a row every UPDATE below affects
 		// 0 rows and the whole set re-runs on every Open, crashing on
 		// "table already exists" the second time a db is opened.
-		// A pre-existing db (trade_events present) was built in that buggy
-		// era and already has every migration applied — pin it to maxVer.
-		var n int
-		if err := s.db.QueryRow(
-			"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='trade_events'").Scan(&n); err != nil {
-			return err
-		}
-		if n > 0 {
-			cur = maxVer
-		} else {
-			cur = 0
-		}
+		// The schema that exists tells us how far the buggy era got — never
+		// jump straight to maxVer, or the pending migrations above the real
+		// schema (e.g. the 007 status backfill on a v6 db) would be skipped.
+		cur = inferLegacyVersion(s.db)
 		if _, err := s.db.Exec("INSERT INTO schema_version (version) VALUES (?)", cur); err != nil {
 			return err
 		}
@@ -137,6 +125,53 @@ func (s *Store) migrate() error {
 		}
 	}
 	return nil
+}
+
+// inferLegacyVersion guesses the schema version of a db created before
+// version tracking worked (schema_version exists but has no row). Each
+// migration leaves a distinctive fingerprint; the highest fingerprint found
+// is the version to resume from. The cap is intentional: fingerprints only
+// exist up to v6 (the last schema change of the buggy era), so a legacy db
+// is never pinned past it and 007/008 still run. Extend when adding v9+.
+func inferLegacyVersion(db *sql.DB) int {
+	tables := map[string]bool{}
+	rows, err := db.Query(`SELECT name FROM sqlite_master WHERE type='table'`)
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var n string
+		if rows.Scan(&n) == nil {
+			tables[n] = true
+		}
+	}
+	if !tables["trade_events"] {
+		return 0 // fresh db, run everything
+	}
+	ver := 1
+	if tables["actors"] { // v2
+		ver = 2
+	}
+	if hasColumn(db, "markouts", "kind") { // v3
+		ver = 3
+	}
+	if hasColumn(db, "markouts", "entry_observed_at") { // v4
+		ver = 4
+	}
+	if tables["actor_evidence"] { // v5
+		ver = 5
+	}
+	if hasColumn(db, "markouts", "status") { // v6
+		ver = 6
+	}
+	return ver
+}
+
+func hasColumn(db *sql.DB, table, col string) bool {
+	var n int
+	err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?`, table, col).Scan(&n)
+	return err == nil && n > 0
 }
 
 // InsertEvent stores an event. Returns created=false when the event_id was

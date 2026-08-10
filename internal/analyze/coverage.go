@@ -32,6 +32,7 @@ func Coverage(w io.Writer, s *storage.Store, kind string, horizons []time.Durati
 			storage.MarkoutStatusFilled,
 			storage.MarkoutStatusNoCandle,
 			storage.MarkoutStatusTokenInactive,
+			storage.MarkoutStatusStaleOutcome,
 			storage.MarkoutStatusAPIError,
 			storage.MarkoutStatusRateLimited,
 			storage.MarkoutStatusLookbackMiss,
@@ -58,10 +59,10 @@ func Coverage(w io.Writer, s *storage.Store, kind string, horizons []time.Durati
 		// two dimensions: market outcome (trade reality) vs measurement
 		// failure (data quality). Only market-outcome rows belong in a
 		// conservative EV denominator — a 429 is not a -100% trade.
-		market := counts[storage.MarkoutStatusNoCandle] + counts[storage.MarkoutStatusTokenInactive]
+		market := counts[storage.MarkoutStatusNoCandle] + counts[storage.MarkoutStatusTokenInactive] + counts[storage.MarkoutStatusStaleOutcome]
 		meas := counts[storage.MarkoutStatusAPIError] + counts[storage.MarkoutStatusRateLimited] +
 			counts[storage.MarkoutStatusLookbackMiss] + counts[storage.MarkoutStatusParseError]
-		fmt.Fprintf(w, "  %-16s %8d   %5.1f%%  (no_candle + token_inactive → cons-EV denominator)\n",
+		fmt.Fprintf(w, "  %-16s %8d   %5.1f%%  (no_candle + token_inactive + stale_outcome → cons-EV denominator)\n",
 			"market_loss", market, pctOf(market, due))
 		fmt.Fprintf(w, "  %-16s %8d   %5.1f%%  (api/rate/parse/lookback → coverage loss only)\n",
 			"meas_loss", meas, pctOf(meas, due))

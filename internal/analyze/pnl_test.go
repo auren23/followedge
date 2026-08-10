@@ -126,7 +126,7 @@ func TestChaseBucketsByChaseNotReturn(t *testing.T) {
 		if err := s.CreateMarkouts(ev, storage.MarkoutFollower, &entry, []time.Duration{30 * time.Second}, now); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.FillMarkout(ev.ID, storage.MarkoutFollower, 30*time.Second, observed); err != nil {
+		if err := s.FillMarkout(ev.ID, storage.MarkoutFollower, 30*time.Second, observed, 0); err != nil {
 			t.Fatal(err)
 		}
 	}

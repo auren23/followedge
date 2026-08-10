@@ -111,24 +111,27 @@ func (s *Store) SetEntryPrice(eventID, kind string, horizon time.Duration, entry
 // coverage loss that EV tables must surface; unpriced tokens are usually the
 // worst performers, so silently excluding them biases EV upward.
 const (
-	MarkoutStatusPending       = "pending"           // not yet due
+	MarkoutStatusPending       = "pending"           // not yet due / not yet classified
 	MarkoutStatusFilled        = "filled"            // horizon price sampled
 	MarkoutStatusNoCandle      = "no_candle"         // candle stream ended before horizon (token stopped trading)
 	MarkoutStatusTokenInactive = "token_inactive"    // token has no kline at all
+	MarkoutStatusStaleOutcome  = "stale_outcome"     // stream continued but first candle at/after due opened later than due+res
 	MarkoutStatusAPIError      = "api_error"         // kline request failed (non-429)
 	MarkoutStatusRateLimited   = "rate_limited"      // 429; gate closed
 	MarkoutStatusLookbackMiss  = "lookback_miss"     // entry candle out of fetched range
 	MarkoutStatusParseError    = "price_parse_error" // kline close unparseable
 )
 
-// FillMarkout writes the sampled horizon price and return for one row.
-func (s *Store) FillMarkout(eventID, kind string, horizon time.Duration, observed float64) error {
+// FillMarkout writes the sampled horizon price, return and the observation
+// instant (candle close time) for one row.
+func (s *Store) FillMarkout(eventID, kind string, horizon time.Duration, observed float64, observedAt int64) error {
 	_, err := s.db.Exec(`
 		UPDATE markouts SET observed_price = ?,
 			return_pct = CASE WHEN base_price > 0 THEN ( ? / base_price - 1 ) * 100 ELSE NULL END,
+			outcome_observed_at = ?,
 			status = ?
 		WHERE event_id = ? AND kind = ? AND horizon_ms = ? AND observed_price IS NULL`,
-		observed, observed, MarkoutStatusFilled, eventID, kind, horizon.Milliseconds())
+		observed, observed, observedAt, MarkoutStatusFilled, eventID, kind, horizon.Milliseconds())
 	return err
 }
 
@@ -152,19 +155,20 @@ func (s *Store) SetMarkoutStatus(eventID, kind string, horizon time.Duration, st
 
 // MarkoutStat is one analyzed markout, with the chase number attached.
 type MarkoutStat struct {
-	EventID         string
-	Wallet          string
-	WalletType      string
-	Side            string
-	AmountUSD       float64
-	TradeTime       int64
-	ReceivedAt      int64
-	Horizon         time.Duration
-	ReturnPct       sql.NullFloat64 // follower/leader forward return at horizon
-	BasePrice       float64         // entry price (leader: price_usd; follower: ReceivedAt price)
-	LeaderPrice     float64         // leader's price_usd, for chase
-	EntryObservedAt int64           // instant the entry price represents (follower), 0 if unknown
-	ChasePct        float64         // (BasePrice/LeaderPrice - 1) * 100 — how much the
+	EventID           string
+	Wallet            string
+	WalletType        string
+	Side              string
+	AmountUSD         float64
+	TradeTime         int64
+	ReceivedAt        int64
+	Horizon           time.Duration
+	ReturnPct         sql.NullFloat64 // follower/leader forward return at horizon
+	BasePrice         float64         // entry price (leader: price_usd; follower: ReceivedAt price)
+	LeaderPrice       float64         // leader's price_usd, for chase
+	EntryObservedAt   int64           // instant the entry price represents (follower), 0 if unknown
+	OutcomeObservedAt int64           // instant the horizon price represents (candle close), 0 if unknown
+	ChasePct          float64         // (BasePrice/LeaderPrice - 1) * 100 — how much the
 	// price moved before we could enter (follower rows; ~0 for leader)
 }
 
@@ -174,7 +178,7 @@ func (s *Store) MarkoutsAt(kind string, horizon time.Duration) ([]MarkoutStat, e
 	rows, err := s.db.Query(`
 		SELECT m.event_id, e.wallet, e.wallet_type, e.side, e.amount_usd,
 		       e.trade_time, e.received_at, m.horizon_ms, m.return_pct,
-		       m.base_price, e.price_usd, m.entry_observed_at
+		       m.base_price, e.price_usd, m.entry_observed_at, m.outcome_observed_at
 		FROM markouts m
 		JOIN trade_events e ON e.event_id = m.event_id
 		WHERE m.kind = ? AND m.horizon_ms = ? AND m.observed_price IS NOT NULL`,
@@ -189,12 +193,14 @@ func (s *Store) MarkoutsAt(kind string, horizon time.Duration) ([]MarkoutStat, e
 		var hms int64
 		var base sql.NullFloat64
 		var eoa sql.NullInt64
+		var ooa sql.NullInt64
 		if err := rows.Scan(&m.EventID, &m.Wallet, &m.WalletType, &m.Side, &m.AmountUSD,
 			&m.TradeTime, &m.ReceivedAt, &hms, &m.ReturnPct, &base, &m.LeaderPrice,
-			&eoa); err != nil {
+			&eoa, &ooa); err != nil {
 			return nil, err
 		}
 		m.EntryObservedAt = eoa.Int64
+		m.OutcomeObservedAt = ooa.Int64
 		m.Horizon = time.Duration(hms) * time.Millisecond
 		m.BasePrice = base.Float64
 		if m.BasePrice > 0 && m.LeaderPrice > 0 {

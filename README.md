@@ -2,7 +2,7 @@
 
 **Profit Actor Discovery & Strategy Replication Engine.**
 
-版本：`v0.1.3.1-measurement-integrity`。
+版本：`v0.1.3.2-dataset-integrity`。
 
 核心问题不是"哪些信号可以买"，而是：
 
@@ -133,7 +133,8 @@ edge 都必须扛住它。样本量远不够下结论，继续积累 5,000+ even
 | `v0.1.1-measurement` | 测量口径修复：leader/follower markout 分离、chase 重定义、follower EV、buy_cost_usd 自洽性 |
 | `v0.1.2-entry-pit` | entry point-in-time（无 look-ahead）、source-age×EV 分析、ActorEvidence E0-E4、survival 指标 |
 | `v0.1.3-dataset` | markout status 分类 + coverage 表、coverage-aware EV、conservative EV、position episodes、mechanism 数据契约 |
-| `v0.1.3.1-measurement-integrity`（本版） | 测量完整性：census 只含 DUE 行、`--side` 真过滤、engine 全分支 status 分类、market outcome vs measurement failure 两维度、migration 007 backfill、kline lookback 2 resolutions、migration 版本追踪修复 |
+| `v0.1.3.1-measurement-integrity` | 测量完整性：census 只含 DUE 行、`--side` 真过滤、engine 全分支 status 分类、market outcome vs measurement failure 两维度、migration 007 backfill、kline lookback 2 resolutions、migration 版本追踪修复 |
+| `v0.1.3.2-dataset-integrity`（本版） | legacy schema inference（真实版本推断而非 pin maxVer）、pending-due 归入 unresolved 不进 cons-EV、price_parse_error 真正分类、stale_outcome + outcome_observed_at 固定 horizon 口径 |
 | `v0.2.0-mechanism` | Mechanism Analyzer（他靠什么赚钱）、Hypothesis 注册、archetype 聚类 |
 | `v0.3.0-experiment` | Replay/Experiment Engine（train/val/test）、Strategy 血缘注册 |
 | `v0.4.0-shadow` | 实时 Shadow Copy + Strategy Clone |
