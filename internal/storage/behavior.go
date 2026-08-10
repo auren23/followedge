@@ -10,9 +10,9 @@ import (
 // opened (adds only). This separates "why does he open" from "why does he
 // add" — the two questions mechanism mining must not conflate.
 //
-// OriginKnown is false for the first observed opening buy of a (wallet,
-// token) until a confirmed full close — that buy may really be an add to a
-// position the collector never saw.
+// OriginQuality is carried by EVERY buy: it rates the evidence behind the
+// episode this buy belongs to (initial or add). Adds of a left-censored
+// episode are just as untrustworthy as its opening buy.
 type ClassifiedEntry struct {
 	EventID          string
 	Token            string
@@ -22,7 +22,7 @@ type ClassifiedEntry struct {
 	ReceivedAt       int64
 	Initial          bool  // opening buy of an episode vs an add
 	SinceInitialSecs int64 // adds only: trade_time - episode opening time
-	OriginKnown      bool  // opening buy is provably an initial entry
+	OriginQuality    OriginQuality
 }
 
 // ClassifiedEntries walks the wallet's full event stream (all sides, for
@@ -42,7 +42,7 @@ func (s *Store) ClassifiedEntries(wallet string) ([]ClassifiedEntry, error) {
 	var curToken string
 	book := &positionBook{}
 	openTime := int64(0)
-	seenFullClose := false // per token: first observed episode is left-censored
+	origin := OriginCensored // per token: quality of the next episode's opening
 	for rows.Next() {
 		var id, token, side string
 		var tokenAmt, usd, ts, received float64
@@ -52,7 +52,7 @@ func (s *Store) ClassifiedEntries(wallet string) ([]ClassifiedEntry, error) {
 		if token != curToken {
 			curToken, openTime = token, int64(ts)
 			book.reset()
-			seenFullClose = false
+			origin = OriginCensored
 		}
 		if side == "buy" {
 			initial := book.isEmpty()
@@ -64,13 +64,16 @@ func (s *Store) ClassifiedEntries(wallet string) ([]ClassifiedEntry, error) {
 				EventID: id, Token: token, TradeTime: int64(ts), ReceivedAt: int64(received),
 				TokenAmount: tokenAmt, AmountUSD: usd,
 				Initial: initial, SinceInitialSecs: int64(ts) - openTime,
-				// same left-censoring rule as episode reconstruction
-				OriginKnown: initial && seenFullClose,
+				// every buy inherits the episode's origin quality — adds of a
+				// left-censored episode are untrustworthy too
+				OriginQuality: origin,
 			})
 		} else {
 			switch book.sell(tokenAmt) {
 			case Closed:
-				seenFullClose = true
+				// ledger zero ≠ real zero (hidden pre-dataset position may
+				// remain): inferred, NOT confirmed
+				origin = OriginVisibleZero
 				book.reset()
 			case Oversold:
 				book.reset() // classification has no negative positions: next buy reopens

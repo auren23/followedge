@@ -26,7 +26,7 @@ import (
 	"github.com/auren23/followedge/internal/storage"
 )
 
-const version = "0.2.0.4-behavior-freeze"
+const version = "0.2.0.5-censoring-semantics"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))

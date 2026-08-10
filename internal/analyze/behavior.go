@@ -110,7 +110,7 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 			TradeTime:        ce.TradeTime,
 			ReceivedAt:       ce.ReceivedAt,
 			SinceInitialSecs: ce.SinceInitialSecs,
-			OriginKnown:      ce.OriginKnown,
+			OriginQuality:    ce.OriginQuality,
 		}
 		if ch, ok := chaseByEvent[ce.EventID]; ok {
 			f.ChasePct, f.HasChase = ch, true
@@ -129,8 +129,8 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 
 	fmt.Fprintf(w, "\nBEHAVIOR COHORT — positions opened since %s\n", since.Format("2006-01-02"))
 	fmt.Fprintf(w, "\nENTRY\n")
-	fmt.Fprintf(w, "  initial buys    %d  (%d origin-known, %d left-censored)\n",
-		prof.Entry.InitialCount, prof.Entry.InitialKnown, prof.Entry.InitialCensored)
+	fmt.Fprintf(w, "  initial buys    %d  (confirmed %d · inferred-zero %d · censored %d)\n",
+		prof.Entry.InitialCount, prof.Entry.InitialConfirmed, prof.Entry.InitialVisible, prof.Entry.InitialCensored)
 	fmt.Fprintf(w, "  add buys        %d\n", prof.Entry.AddCount)
 	fmt.Fprintf(w, "  reentry rate    %.0f%%\n", prof.Entry.ReentryRate*100)
 	fmt.Fprintf(w, "  initial buy     %s\n", usd(prof.Entry.MedianInitialBuy))
@@ -143,10 +143,11 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 	fmt.Fprintf(w, "  add since open  %s\n", secs(prof.Entry.MedianSinceInitialSecs))
 	fmt.Fprintf(w, "  prior smart P50 %s\n", num(prof.Entry.SmartPriorP50))
 	fmt.Fprintf(w, "  prior KOL P50   %s\n", num(prof.Entry.KOLPriorP50))
-	fmt.Fprintf(w, "  cluster >=3     %.0f%% (%d valid prior windows)\n",
+	fmt.Fprintf(w, "  cluster >=3     %.0f%% (%d confirmed, valid prior windows)\n",
 		prof.Entry.Cluster3Plus*100, prof.Entry.PriorFlowN)
 	fmt.Fprintf(w, "\nPOSITION\n")
-	fmt.Fprintf(w, "  episodes        %d\n", prof.Position.Episodes)
+	fmt.Fprintf(w, "  episodes        %d  (trusted %d · censored %d)\n",
+		prof.Position.Episodes, prof.Position.Trusted, prof.Position.Censored)
 	fmt.Fprintf(w, "  median adds     %s\n", num(prof.Position.MedianAdds))
 	fmt.Fprintf(w, "  median reduces  %s\n", num(prof.Position.MedianReduces))
 	fmt.Fprintf(w, "  median hold     %s\n", secs(prof.Position.MedianHoldSecs))
@@ -159,8 +160,11 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 	}
 	fmt.Fprintf(w, "  first sell P50  %s\n", secs(prof.Exit.FirstSellP50))
 	fmt.Fprintf(w, "  full close P50  %s\n", secs(prof.Exit.CloseP50))
-	fmt.Fprintf(w, "  closed pnl      $%.0f  (%.0f%% win rate, %d closed)\n",
+	fmt.Fprintf(w, "  closed pnl      $%.0f  (%.0f%% win rate, %d closed, confirmed)\n",
 		prof.Exit.ClosedPnl, prof.Exit.ClosedWinRate*100, prof.Exit.CloseP50.N)
+	if prof.Exit.CensoredPnl != 0 {
+		fmt.Fprintf(w, "  censored pnl    $%.0f  (inferred/unknown origin — research only)\n", prof.Exit.CensoredPnl)
+	}
 	fmt.Fprintf(w, "  incomplete      %.0f%%  (data gap: opening buys unseen) pnl $%.0f\n",
 		prof.Exit.IncompleteRatio*100, prof.Exit.IncompletePnl)
 	return nil

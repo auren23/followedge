@@ -43,13 +43,29 @@ type Episode struct {
 	PartialExitLegs int     // sell legs that left visible qty > 0 (real partial exit)
 	DataGap         bool    // opening buy (or part of the position) unseen
 
-	// OriginKnown is false while the FIRST observed episode of a
-	// (wallet, token) is open: the collector may have missed an earlier
-	// position, so the first visible buy could be an add. Clears only after
-	// a confirmed full close. Mechanism analysis must only consume
-	// initial-entry features of origin-known episodes.
-	OriginKnown bool
+	// OriginQuality tracks what we KNOW about this episode's opening:
+	//   Censored     — the collector may have missed an earlier position;
+	//                  the first visible buy could be an add.
+	//   VisibleZero  — our visible ledger reached zero, but that does NOT
+	//                  prove the wallet's real balance is zero (a hidden
+	//                  pre-dataset position may remain). Inferred, research
+	//                  only.
+	//   ConfirmedZero— independent evidence (future: on-chain balance = 0)
+	//                  proves the position reached zero. NO current source
+	//                  provides this, so it is never assigned yet.
+	// Mechanism analysis must only consume initial-entry features of
+	// OriginConfirmedZero episodes.
+	OriginQuality OriginQuality
 }
+
+// OriginQuality rates the evidence behind an episode's opening buy.
+type OriginQuality int
+
+const (
+	OriginCensored OriginQuality = iota
+	OriginVisibleZero
+	OriginConfirmedZero
+)
 
 // RebuildEpisodes reconstructs ALL wallets' position episodes since `since`
 // and materializes them into position_episodes.
@@ -200,12 +216,14 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 	var cur *Episode
 	var curWallet, curToken string
 	book := &positionBook{}
-	seenFullClose := false // per token group: only a confirmed full close clears left censorship
+	origin := OriginCensored // per token group: quality of the NEXT episode's opening
 
 	flush := func() {
 		if cur != nil {
 			if cur.Status == EpisodeClosed {
-				seenFullClose = true
+				// Our ledger reached zero — inferred, NOT confirmed: a hidden
+				// pre-dataset position could still be open.
+				origin = OriginVisibleZero
 			}
 			eps = append(eps, *cur)
 			cur = nil
@@ -224,15 +242,18 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 		if cur == nil || wallet != curWallet || token != curToken {
 			flush()
 			if wallet != curWallet || token != curToken {
-				seenFullClose = false // new (wallet, token) group: censored again
+				origin = OriginCensored // new (wallet, token) group: censored again
 			}
 			curWallet, curToken = wallet, token
 			cur = &Episode{Wallet: wallet, Token: token, OpenedAt: int64(ts), Status: EpisodeOpen}
-			// The first observed episode of a (wallet, token) is left-censored:
-			// the collector may have missed an earlier position, so the first
-			// visible buy could be an add. OriginKnown stays false until a
-			// confirmed full close proves the position reached zero.
-			cur.OriginKnown = seenFullClose && side != "sell"
+			// A visible full close only upgrades to VisibleZero — it cannot
+			// prove the wallet's real balance is zero (hidden pre-dataset
+			// position), so OriginConfirmedZero is never reached with the
+			// current data sources.
+			cur.OriginQuality = origin
+			if side == "sell" {
+				cur.OriginQuality = OriginCensored // opening buy unseen
+			}
 			cur.DataGap = side == "sell" // window opened on a sell: opening buy unseen
 		}
 		if side == "buy" {

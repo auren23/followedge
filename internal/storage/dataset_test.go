@@ -886,14 +886,16 @@ func TestOriginKnownLifecycle(t *testing.T) {
 	if len(a) != 2 {
 		t.Fatalf("TOKEN_A episodes = %+v, want 2", a)
 	}
-	if a[0].OriginKnown {
-		t.Errorf("first observed episode must be left-censored (OriginKnown=false): %+v", a[0])
+	if a[0].OriginQuality != OriginCensored {
+		t.Errorf("first observed episode must be censored: %+v", a[0])
 	}
-	if !a[1].OriginKnown {
-		t.Errorf("post-full-close episode must be origin-known: %+v", a[1])
+	// a visible full close upgrades to VISIBLE-ZERO — it can never prove the
+	// real balance is zero (hidden pre-dataset position may remain)
+	if a[1].OriginQuality != OriginVisibleZero {
+		t.Errorf("post-visible-close episode must be OriginVisibleZero (NOT confirmed): %+v", a[1])
 	}
 	b := byToken["TOKEN_B"]
-	if len(b) != 1 || b[0].OriginKnown {
+	if len(b) != 1 || b[0].OriginQuality != OriginCensored {
 		t.Errorf("never-closed token's episode must stay censored: %+v", b)
 	}
 
@@ -902,16 +904,69 @@ func TestOriginKnownLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	originByID := map[string]bool{}
+	originByID := map[string]OriginQuality{}
 	for _, ce := range classified {
-		originByID[ce.EventID] = ce.OriginKnown
+		originByID[ce.EventID] = ce.OriginQuality
 	}
 	a1 := domain.EventID("sol", "a1", "W_OR", "TOKEN_A", "buy")
 	a3 := domain.EventID("sol", "a3", "W_OR", "TOKEN_A", "buy")
-	if originByID[a1] {
+	if originByID[a1] != OriginCensored {
 		t.Errorf("a1 (first observed buy) must be censored in classification too")
 	}
-	if !originByID[a3] {
-		t.Errorf("a3 (post-close opening) must be origin-known in classification")
+	if originByID[a3] != OriginVisibleZero {
+		t.Errorf("a3 (post-close opening) must be OriginVisibleZero in classification")
+	}
+}
+
+// TestHiddenPreDatasetPosition pins the P0 censoring rule: a position that
+// existed before the dataset can survive a visible full close. BUY 100 /
+// SELL 100 / BUY 50 must NOT make the BUY 50 OriginConfirmedZero — the
+// wallet may still hold a hidden 1000 from before the collector started.
+func TestHiddenPreDatasetPosition(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	base := now.Add(-1 * time.Hour).Truncate(30 * time.Second)
+	mk := func(id, side string, ts time.Time, qty float64) {
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W_HID", "TOKEN_H", side),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W_HID", WalletType: domain.WalletSmartMoney,
+			TokenAddress: "TOKEN_H", Side: domain.Side(side), AmountUSD: qty,
+			TokenAmount: qty, PriceUSD: 1.0, BuyCostUSD: 0,
+			TradeTime: ts, ReceivedAt: ts,
+		}
+		if _, err := s.InsertEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("h1", "buy", base, 100)                      // visible open of a hidden 1000 position
+	mk("h2", "sell", base.Add(30*time.Second), 100) // visible ledger zero
+	mk("h3", "buy", base.Add(60*time.Second), 50)   // possibly just another add
+
+	eps, err := s.ReconstructEpisodesFor("W_HID", now.Add(-2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eps) != 2 {
+		t.Fatalf("episodes = %+v, want 2", eps)
+	}
+	if eps[1].OriginQuality != OriginVisibleZero {
+		t.Errorf("post-visible-close episode must be OriginVisibleZero, got %v", eps[1].OriginQuality)
+	}
+
+	classified, err := s.ClassifiedEntries("W_HID")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h3 := domain.EventID("sol", "h3", "W_HID", "TOKEN_H", "buy")
+	for _, ce := range classified {
+		if ce.EventID == h3 && ce.OriginQuality == OriginConfirmedZero {
+			t.Errorf("h3 must NOT be OriginConfirmedZero (hidden pre-dataset position may remain)")
+		}
 	}
 }
