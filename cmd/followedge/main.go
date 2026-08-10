@@ -26,7 +26,7 @@ import (
 	"github.com/auren23/followedge/internal/storage"
 )
 
-const version = "0.1.4.2-v01-freeze"
+const version = "0.2.0-behavior-reconstruction"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -71,6 +71,7 @@ usage:
   followedge actors rank    [--config ...] [--since 24h] [--horizon 60s] [--limit 20] [--min-trades 3]
                              [--sort quality|replicability|pnl|copy-ev] [--frontier]
   followedge actors inspect [--config ...] <wallet> [--since 24h]
+  followedge actors behavior [--config ...] <wallet> [--since 24h] [--horizon 5m]
   followedge analyze latency   [--config ...] [--since 1h]
   followedge analyze latency-ev [--config ...] [--horizon 5m] [--side buy] [--by-chase]
   followedge analyze chase     [--config ...] [--horizon 30s] [--side buy]
@@ -305,6 +306,20 @@ func cmdActors(ctx context.Context, args []string) error {
 			return err
 		}
 		return analyze.Inspect(os.Stdout, store, fs.Arg(0), sinceT, horizons, *noExitLoss, cfg.Markout.Grace)
+	case "behavior":
+		if fs.NArg() != 1 {
+			return fmt.Errorf("usage: followedge actors behavior <wallet> [--since 24h]")
+		}
+		windows, err := parseDurations(cfg.Cluster.Windows)
+		if err != nil {
+			return err
+		}
+		clusterWindow := time.Minute
+		if len(windows) > 0 {
+			clusterWindow = windows[0]
+		}
+		return analyze.Behavior(os.Stdout, store, fs.Arg(0), sinceT, h,
+			*noExitLoss, cfg.Markout.Grace, clusterWindow)
 	default:
 		return fmt.Errorf("unknown actors subcommand %q", sub)
 	}

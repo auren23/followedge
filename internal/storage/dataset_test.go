@@ -479,3 +479,96 @@ func TestDueMarkoutsFreshFirst(t *testing.T) {
 		}
 	}
 }
+
+// TestBehaviorQueries pins the v0.2.0 behavior-reconstruction queries:
+// entry rows, episodes, first-sell delays, and the PIT cluster snapshot
+// (a snapshot taken AFTER the entry must not describe it).
+func TestBehaviorQueries(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	base := now.Add(-1 * time.Hour).Truncate(30 * time.Second)
+	mk := func(id, side string, ts time.Time, tokens, usd, buyCost float64) {
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W_B", "TOKEN_X", side),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W_B", WalletType: domain.WalletSmartMoney,
+			TokenAddress: "TOKEN_X", Side: domain.Side(side), AmountUSD: usd,
+			TokenAmount: tokens, PriceUSD: 1.0, BuyCostUSD: buyCost,
+			TradeTime: ts, ReceivedAt: ts.Add(20 * time.Second),
+		}
+		if _, err := s.InsertEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("b1", "buy", base, 100, 100, 0)                       // open
+	mk("s1", "sell", base.Add(60*time.Second), 60, 70, 60)   // partial: 100-60=40 left, first sell +60s
+	mk("b2", "buy", base.Add(120*time.Second), 50, 50, 0)    // add: qty 90
+	mk("s2", "sell", base.Add(180*time.Second), 90, 130, 90) // close at +180s
+
+	// episodes
+	if _, err := s.RebuildEpisodes(now.Add(-2 * time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	eps, err := s.EpisodesFor("W_B")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(eps) != 1 || eps[0].Status != EpisodeClosed || eps[0].HoldDurationS != 180 {
+		t.Fatalf("episode = %+v, want 1 closed episode hold 180s", eps)
+	}
+	if eps[0].Adds != 1 || eps[0].Reduces != 2 || eps[0].RealizedPnL != 50 {
+		t.Errorf("episode = adds %d reduces %d pnl %.0f, want 1/2/50", eps[0].Adds, eps[0].Reduces, eps[0].RealizedPnL)
+	}
+
+	// entry rows (buys only, in window)
+	entries, err := s.EntryRows("W_B", now.Add(-2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].AmountUSD != 100 || entries[0].ReceivedAt-entries[0].TradeTime != 20 {
+		t.Errorf("entry rows = %+v, want 2 buys with source age 20s", entries)
+	}
+
+	// first sell delay: 60s (b1 → s1); the b2 add does not reset it
+	delays, err := s.FirstSellDelays("W_B", now.Add(-2*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(delays) != 1 || delays[0] != 60 {
+		t.Errorf("first sell delays = %v, want [60]", delays)
+	}
+
+	// PIT cluster snapshot: a sample AFTER the entry must not be returned
+	if err := s.InsertClusterSample(domain.ClusterFeatures{
+		TokenAddress: "TOKEN_X", Window: time.Minute, LastEventAt: base.Add(2 * time.Hour),
+		SmartBuyWallets: 9, KOLBuyWallets: 3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cs, ok, err := s.ClusterStateAt("TOKEN_X", base.Unix(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Errorf("PIT violation: cluster sample at %d returned for entry at %d (sample is AFTER entry)", cs.TS, base.Unix())
+	}
+	// a sample at/before the entry IS returned
+	if err := s.InsertClusterSample(domain.ClusterFeatures{
+		TokenAddress: "TOKEN_X", Window: time.Minute, LastEventAt: base.Add(-time.Minute),
+		SmartBuyWallets: 2, KOLBuyWallets: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cs, ok, err = s.ClusterStateAt("TOKEN_X", base.Unix(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || cs.SmartBuyWallets != 2 {
+		t.Errorf("PIT snapshot = %+v (ok %v), want smart=2 before entry", cs, ok)
+	}
+}

@@ -2,7 +2,7 @@
 
 **Profit Actor Discovery & Strategy Replication Engine.**
 
-版本：`v0.1.4.2-v01-freeze`。
+版本：`v0.2.0-behavior-reconstruction`。
 
 核心问题不是"哪些信号可以买"，而是：
 
@@ -144,7 +144,8 @@ edge 都必须扛住它。样本量远不够下结论，继续积累 5,000+ even
 | `v0.1.4-actor-replication` | Actor 级 coverage-aware replication census（survivor-bias guard）、`actors rank --sort/--frontier`、空 kline 不再直接判死（no_kline_data + backoff）、price_parse_error retry 闭环 |
 | `v0.1.4.1-actor-census-integrity` | census 与 Quality 同窗口（--since）且只统计 BUY（entry replication）、no-kline retry fresh-first（SQL 层排除 backoff token）、frontier/sort 加 min sample gate、inspect chase 标注 observed-only |
 | `v0.1.4.2-v01-freeze`（本版） | inspect alpha decay/chase 遵守 --since、engine tokenOrder 保持 SQL fresh-first 顺序、sample gate 对齐 cons-EV 有效样本（filled+market loss） |
-| `v0.2.0-mechanism` | Mechanism Analyzer（他靠什么赚钱）、Hypothesis 注册、archetype 聚类 |
+| `v0.2.0-behavior-reconstruction`（本版） | Actor Behavior Reconstruction：position episodes → entry context（PIT）→ exit behavior → ActorBehaviorProfile（`followedge actors behavior`） |
+| `v0.2.1-mechanism` | Mechanism Analyzer（他靠什么赚钱）、Hypothesis 注册、archetype 聚类 |
 | `v0.3.0-experiment` | Replay/Experiment Engine（train/val/test）、Strategy 血缘注册 |
 | `v0.4.0-shadow` | 实时 Shadow Copy + Strategy Clone |
 | `v0.5.0-paper` | PaperBroker、PositionManager、退出实验 |

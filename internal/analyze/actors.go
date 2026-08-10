@@ -179,7 +179,10 @@ func rankActors(list []*Actor, sortKey ActorSortKey, frontier bool, minReplMarke
 			if !ei {
 				return false // both ineligible: keep stable order
 			}
-			return list[i].ConsEV > list[j].ConsEV
+			if list[i].ConsEV != list[j].ConsEV {
+				return list[i].ConsEV > list[j].ConsEV
+			}
+			return list[i].Quality > list[j].Quality // tie-breaker: input order is map-random
 		})
 	case SortPnl:
 		sort.SliceStable(list, func(i, j int) bool { return list[i].RealizedPnL > list[j].RealizedPnL })
@@ -193,7 +196,10 @@ func rankActors(list []*Actor, sortKey ActorSortKey, frontier bool, minReplMarke
 			if !ei {
 				return false
 			}
-			return list[i].ObservedEV > list[j].ObservedEV
+			if list[i].ObservedEV != list[j].ObservedEV {
+				return list[i].ObservedEV > list[j].ObservedEV
+			}
+			return list[i].Quality > list[j].Quality
 		})
 	default: // quality
 		sort.SliceStable(list, func(i, j int) bool { return list[i].Quality > list[j].Quality })
