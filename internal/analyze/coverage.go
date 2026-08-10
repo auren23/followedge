@@ -37,13 +37,9 @@ func Coverage(w io.Writer, s *storage.Store, kind string, horizons []time.Durati
 			storage.MarkoutStatusRateLimited,
 			storage.MarkoutStatusLookbackMiss,
 			storage.MarkoutStatusParseError,
-			storage.MarkoutStatusPending,
 		}
 		for _, st := range order {
 			n := counts[st]
-			if st == storage.MarkoutStatusPending {
-				n = pending // not-yet-due rows
-			}
 			if n == 0 {
 				continue
 			}
@@ -52,6 +48,18 @@ func Coverage(w io.Writer, s *storage.Store, kind string, horizons []time.Durati
 				pct = float64(n) / float64(due) * 100
 			}
 			fmt.Fprintf(w, "  %-16s %8d   %5.1f%%\n", st, n, pct)
+		}
+		// due but unclassified (worker lag / backlog) vs not yet due: both
+		// share the 'pending' status, so they must be shown separately.
+		unresolved := counts[storage.MarkoutStatusPending]
+		if unresolved > 0 {
+			fmt.Fprintf(w, "  %-16s %8d   %5.1f%%  (due, worker has not classified yet)\n",
+				"unresolved_due", unresolved, pctOf(unresolved, due))
+		}
+		if pending > 0 {
+			total := due + pending
+			fmt.Fprintf(w, "  %-16s %8d   %5.1f%%  (horizon not yet reached)\n",
+				"not_due", pending, pctOf(pending, total))
 		}
 		filled := counts[storage.MarkoutStatusFilled]
 		fmt.Fprintf(w, "  %-16s %8d   %5.1f%%  (coverage: filled / due)\n",

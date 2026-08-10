@@ -2,6 +2,7 @@ package analyze
 
 import (
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -304,5 +305,62 @@ func TestLatencyEVPendingDueUnresolved(t *testing.T) {
 	}
 	if !strings.Contains(out, "unresolved") {
 		t.Errorf("unresolved column missing: %s", out)
+	}
+}
+
+// TestCoverageSplitsPending pins the P1 fix: `analyze coverage` must show
+// due-but-unclassified rows as unresolved_due (worker lag) separately from
+// not-yet-due rows — previously both were merged under one 'pending' line.
+func TestCoverageSplitsPending(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	// E1: due + filled (20m ago)
+	// E2: due + pending (20m ago, worker never classified)
+	// E3: NOT due yet (created just now) → pending but not_due
+	mk := func(id string, ago time.Duration, fill bool) {
+		ts := now.Add(-ago)
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W", "T_"+id, "buy"),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W", WalletType: domain.WalletSmartMoney,
+			TokenAddress: "T_" + id, Side: domain.Buy, AmountUSD: 10, PriceUSD: 1.0,
+			TradeTime: ts.Add(-10 * time.Second), ReceivedAt: ts,
+		}
+		insert(t, s, ev)
+		entry := 1.0
+		if err := s.CreateMarkouts(ev, storage.MarkoutFollower, &entry, []time.Duration{30 * time.Second}, now); err != nil {
+			t.Fatal(err)
+		}
+		if fill {
+			if err := s.FillMarkout(ev.ID, storage.MarkoutFollower, 30*time.Second, 1.1, 0); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	mk("e1", 20*time.Minute, true)
+	mk("e2", 20*time.Minute, false) // due, status stays pending
+	mk("e3", 0, false)              // just created → horizon not reached
+
+	var buf sink
+	if err := Coverage(&buf, s, storage.MarkoutFollower, []time.Duration{30 * time.Second}, 0); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	t.Log(out)
+
+	if !strings.Contains(out, "unresolved_due") || !strings.Contains(out, "not_due") {
+		t.Fatalf("coverage must split unresolved_due / not_due: %s", out)
+	}
+	// 2 due rows (e1 filled + e2 unresolved), 1 not-due (e3)
+	if !regexp.MustCompile(`unresolved_due\s+1\s`).MatchString(out) {
+		t.Errorf("unresolved_due must be 1 (the due-pending row): %s", out)
+	}
+	if !regexp.MustCompile(`not_due\s+1\s`).MatchString(out) {
+		t.Errorf("not_due must be 1 (the just-created row): %s", out)
 	}
 }

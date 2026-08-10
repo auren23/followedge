@@ -117,11 +117,24 @@ func (s *Store) migrate() error {
 		if err != nil {
 			return err
 		}
-		if _, err := s.db.Exec(string(data)); err != nil {
+		// one transaction per migration: the DDL/DML and the version bump are
+		// atomic, so a crash mid-migration can never leave a half-applied
+		// schema (an ALTER that ran but a version that didn't, which would
+		// make the next Open re-run it and die on a duplicate column).
+		tx, err := s.db.Begin()
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(string(data)); err != nil {
+			tx.Rollback()
 			return fmt.Errorf("apply %s: %w", name, err)
 		}
-		if _, err := s.db.Exec("UPDATE schema_version SET version = ?", ver); err != nil {
+		if _, err := tx.Exec("UPDATE schema_version SET version = ?", ver); err != nil {
+			tx.Rollback()
 			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit %s: %w", name, err)
 		}
 	}
 	return nil

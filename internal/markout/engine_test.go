@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,29 +82,32 @@ func TestFirstCloseAtOrAfter(t *testing.T) {
 		{open: 160, close: 1.2, valid: true},
 		{open: 190, close: 1.3, valid: true},
 	}
+	const res = int64(30)
 
 	cases := []struct {
 		ts   int64
 		want float64
 		ok   bool
 	}{
-		{100, 1.0, true}, // exact open time
-		{115, 1.1, true}, // between candles
-		{190, 1.3, true}, // last candle
-		{191, 0, false},  // past the feed
+		{100, 1.0, true}, // close of open=100 candle (100+30) is exactly ts
+		{115, 1.0, true}, // open=100 (close 130) is already >= 115
+		{131, 1.1, true}, // first close >= 131 is open=130 (close 160)
+		{191, 1.3, true}, // last candle (open=190, close=220)
+		{221, 0, false},  // past the feed (last close = 220)
 		{99, 1.0, true},  // before first candle
+		{159, 1.1, true}, // open=130 close=160 is the first close >= 159
 	}
 	for _, c := range cases {
-		got, ok := firstCloseAtOrAfter(cs, c.ts)
+		got, ok := firstCandleClosingAtOrAfter(cs, c.ts, res)
 		if got.close != c.want || ok != c.ok {
-			t.Errorf("firstCloseAtOrAfter(%d) = (%v, %v), want (%v, %v)", c.ts, got, ok, c.want, c.ok)
+			t.Errorf("firstCandleClosingAtOrAfter(%d) = (%v, %v), want (%v, %v)", c.ts, got, ok, c.want, c.ok)
 		}
 	}
 
 	// invalid candle is found but flagged: parse failure must NOT look like
 	// a dead token (found=true) nor like a valid price (valid=false).
 	bad := []sampledCandle{{open: 100, close: 0, valid: false}}
-	got, found := firstCloseAtOrAfter(bad, 100)
+	got, found := firstCandleClosingAtOrAfter(bad, 100, res)
 	if !found || got.valid {
 		t.Errorf("unparseable candle: found=%v valid=%v, want found=true valid=false", found, got.valid)
 	}
@@ -199,11 +203,12 @@ func TestSampleDue(t *testing.T) {
 	if len(rows) != 1 || !rows[0].ReturnPct.Valid {
 		t.Fatalf("expected 1 filled 30s leader markout, got %+v", rows)
 	}
-	// due = trade_time+30s; observed = close of first candle at/after due.
-	// Recompute the expectation from the same arrays instead of hardcoding
-	// (candle grid depends on truncation of `now`).
+	// due = trade_time+30s; observed = close of the first candle whose CLOSE
+	// time (open+30s) is >= due — i.e. the first candle opening at/after
+	// due-30s. Recompute the expectation from the same arrays instead of
+	// hardcoding (candle grid depends on truncation of `now`).
 	wantIdx := sort.Search(len(fc.candles), func(i int) bool {
-		return fc.candles[i].Time/1000 >= ev.TradeTime.Add(30*time.Second).Unix()
+		return fc.candles[i].Time/1000 >= ev.TradeTime.Add(30*time.Second).Add(-30*time.Second).Unix()
 	})
 	want, _ := strconv.ParseFloat(fc.candles[wantIdx].Close, 64)
 	wantRet := (want/ev.PriceUSD - 1) * 100
@@ -320,10 +325,9 @@ func TestSampleDueStatuses(t *testing.T) {
 
 	eng := NewEngine(s, nil, noopLimiter{}, "sol", "30s", 0, []time.Duration{30 * time.Second})
 	eng.client = &tokenCannedClient{byToken: map[string][]gmgn.Candle{
-		// B: opens at b and b+30s; due = base+30s = b+45s → no candle at/after due
+		// B: only one candle (closes b+30s < due b+45s) → no close at/after due
 		"TOKEN_B": {
 			{Time: b.UnixMilli(), Close: "1.00"},
-			{Time: b.Add(30 * time.Second).UnixMilli(), Close: "1.10"},
 		},
 		// C: candles only start at base+60s → entry (needs open <= base−30s) missing
 		"TOKEN_C": {
@@ -391,7 +395,9 @@ func TestSampleDueFollower(t *testing.T) {
 
 	now := time.Now().UTC()
 	tradeTime := now.Add(-7 * time.Minute)
-	received := now.Add(-5 * time.Minute) // 2-minute GMGN delay
+	// fixed 15s offset from the 30s boundary: keeps the second-truncated
+	// base_ms (ReceivedAt.Unix()) unambiguous for entry/exit candle search.
+	received := now.Add(-5 * time.Minute).Truncate(30 * time.Second).Add(15 * time.Second) // 2-minute GMGN delay
 	ev := domain.TradeEvent{
 		ID:     domain.EventID("sol", "txf", "W1", "TOKEN_F", "buy"),
 		Source: "gmgn_smartmoney", Chain: "sol", TxHash: "txf",
@@ -410,13 +416,14 @@ func TestSampleDueFollower(t *testing.T) {
 	// 30s candles around reception (received = 16:50:07 in the comment grid):
 	//   c0 open=16:49:30 close=1.00  → closed at 16:50:00 <= received ✓ (entry)
 	//   c1 open=16:50:00 close=1.10  → closes at 16:50:30 > received ✗ in progress
-	//   c3 open=16:51:00 close=1.30  → first candle >= due(16:50:37) ✓ (exit)
+	//   c2 open=16:50:30 close=1.30  → closes at 16:51:00 >= due(16:50:37) ✓ (exit,
+	//      first candle whose CLOSE time reaches the horizon; lag 23s)
 	boundary := received.Truncate(30 * time.Second)
 	c0 := boundary.Add(-30 * time.Second)
 	fc := &fakeClient{candles: []gmgn.Candle{
 		{Time: c0.UnixMilli(), Close: "1.00"},
 		{Time: boundary.UnixMilli(), Close: "1.10"}, // trap: must NOT be used
-		{Time: boundary.Add(60 * time.Second).UnixMilli(), Close: "1.30"},
+		{Time: boundary.Add(30 * time.Second).UnixMilli(), Close: "1.30"},
 	}}
 	eng := NewEngine(s, nil, noopLimiter{}, "sol", "30s", 0, []time.Duration{30 * time.Second})
 	eng.client = fc
@@ -551,16 +558,16 @@ func TestSampleDueStaleOutcome(t *testing.T) {
 		}
 	}
 
-	// S1: due = b+45s, next candle opens b+90s (> due+30s) → stale_outcome
+	// S1: due = b+45s, next candle close = b+120s (> due+30s) → stale_outcome
 	mkLeader("s1", "TOKEN_S1")
-	// S2: due = b+45s, next candle opens b+60s (<= due+30s) → strict fill
+	// S2: due = b+45s, next candle close = b+60s (<= due+30s) → strict fill
 	mkLeader("s2", "TOKEN_S2")
 	b := now.Add(-5 * time.Minute).Truncate(30 * time.Second)
 
 	eng := NewEngine(s, nil, noopLimiter{}, "sol", "30s", 0, []time.Duration{30 * time.Second})
 	eng.client = &tokenCannedClient{byToken: map[string][]gmgn.Candle{
 		"TOKEN_S1": {{Time: b.UnixMilli(), Close: "1.00"}, {Time: b.Add(90 * time.Second).UnixMilli(), Close: "1.10"}},
-		"TOKEN_S2": {{Time: b.UnixMilli(), Close: "1.00"}, {Time: b.Add(60 * time.Second).UnixMilli(), Close: "1.10"}},
+		"TOKEN_S2": {{Time: b.UnixMilli(), Close: "1.00"}, {Time: b.Add(30 * time.Second).UnixMilli(), Close: "1.10"}},
 	}}
 	if err := eng.SampleDue(context.Background()); err != nil {
 		t.Fatal(err)
@@ -571,7 +578,7 @@ func TestSampleDueStaleOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 	if st != storage.MarkoutStatusStaleOutcome {
-		t.Errorf("TOKEN_S1 status = %s, want %s (first candle opened past due+res)", st, storage.MarkoutStatusStaleOutcome)
+		t.Errorf("TOKEN_S1 status = %s, want %s (first close landed past due+res)", st, storage.MarkoutStatusStaleOutcome)
 	}
 
 	rows, err := s.MarkoutsAt(storage.MarkoutLeader, 30*time.Second)
@@ -582,8 +589,124 @@ func TestSampleDueStaleOutcome(t *testing.T) {
 		t.Fatalf("expected exactly the strict fill TOKEN_S2, got %+v", rows)
 	}
 	// observed at = candle close instant = open + res
-	wantObs := b.Add(60*time.Second).Unix() + 30
+	wantObs := b.Add(30*time.Second).Unix() + 30
 	if rows[0].OutcomeObservedAt != wantObs {
 		t.Errorf("outcome_observed_at = %d, want %d (candle close instant)", rows[0].OutcomeObservedAt, wantObs)
+	}
+}
+
+// TestDueMarkoutsExcludesTerminal pins the P0.5 fix: rows whose market
+// outcome is final (no_candle / token_inactive / stale_outcome) never fill
+// again — they must not be re-listed every tick, or kline quota burns on
+// rows that can never succeed. Only pending/transient rows stay eligible.
+func TestDueMarkoutsExcludesTerminal(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	mk := func(id string, status string) {
+		base := now.Add(-10 * time.Minute).Truncate(30 * time.Second)
+		ev := domain.TradeEvent{
+			ID:     domain.EventID("sol", id, "W1", "T_"+id, "buy"),
+			Source: "gmgn_smartmoney", Chain: "sol", TxHash: id,
+			Wallet: "W1", WalletType: domain.WalletSmartMoney,
+			TokenAddress: "T_" + id, Side: domain.Buy, AmountUSD: 100, PriceUSD: 1.00,
+			TradeTime: base, ReceivedAt: base,
+		}
+		if _, err := s.InsertEvent(ev); err != nil {
+			t.Fatal(err)
+		}
+		price := ev.PriceUSD
+		if err := s.CreateMarkouts(ev, storage.MarkoutLeader, &price, []time.Duration{30 * time.Second}, now); err != nil {
+			t.Fatal(err)
+		}
+		if status != "" {
+			if err := s.SetMarkoutStatus(ev.ID, storage.MarkoutLeader, 30*time.Second, status); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	mk("a", "")                                 // pending (eligible)
+	mk("b", storage.MarkoutStatusNoCandle)      // terminal
+	mk("c", storage.MarkoutStatusTokenInactive) // terminal
+	mk("d", storage.MarkoutStatusStaleOutcome)  // terminal
+	mk("e", storage.MarkoutStatusLookbackMiss)  // retryable (eligible)
+
+	due, err := s.DueMarkouts(0, now, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, d := range due {
+		got = append(got, d.Token)
+	}
+	sort.Strings(got)
+	want := []string{"T_a", "T_e"} // only pending + retryable
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("DueMarkouts returned %v, want %v (terminal statuses must be excluded)", got, want)
+	}
+}
+
+// TestSampleDueCloseTimeHorizon pins the close-time horizon rule: the exit
+// price is the close of the FIRST candle whose CLOSE time reaches the due
+// time, not the first candle whose OPEN is >= due. With due = b+45s and
+// candles opening at b, b+30, b+60 the open-based search would take the
+// b+60 candle (price at b+90, 45s late); the close-time search takes b+30
+// (price at b+60, 15s late — lag ∈ [0, res]).
+func TestSampleDueCloseTimeHorizon(t *testing.T) {
+	s, err := storage.Open(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	base := now.Add(-5 * time.Minute).Truncate(30 * time.Second).Add(15 * time.Second)
+	ev := domain.TradeEvent{
+		ID:     domain.EventID("sol", "cth", "W1", "TOKEN_CTH", "buy"),
+		Source: "gmgn_smartmoney", Chain: "sol", TxHash: "cth",
+		Wallet: "W1", WalletType: domain.WalletSmartMoney,
+		TokenAddress: "TOKEN_CTH", Side: domain.Buy, AmountUSD: 100, PriceUSD: 1.00,
+		TradeTime: base, ReceivedAt: base,
+	}
+	if _, err := s.InsertEvent(ev); err != nil {
+		t.Fatal(err)
+	}
+	price := ev.PriceUSD
+	if err := s.CreateMarkouts(ev, storage.MarkoutLeader, &price, []time.Duration{30 * time.Second}, now); err != nil {
+		t.Fatal(err)
+	}
+
+	b := base.Truncate(30 * time.Second) // due = base+30s = b+45s
+	eng := NewEngine(s, nil, noopLimiter{}, "sol", "30s", 0, []time.Duration{30 * time.Second})
+	eng.client = &tokenCannedClient{byToken: map[string][]gmgn.Candle{
+		"TOKEN_CTH": {
+			{Time: b.UnixMilli(), Close: "1.00"},
+			{Time: b.Add(30 * time.Second).UnixMilli(), Close: "1.10"}, // closes b+60 >= due b+45 → exit
+			{Time: b.Add(60 * time.Second).UnixMilli(), Close: "1.20"}, // trap: open >= due, but 45s late
+		},
+	}}
+	if err := eng.SampleDue(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := s.MarkoutsAt(storage.MarkoutLeader, 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || !rows[0].ReturnPct.Valid {
+		t.Fatalf("expected 1 filled markout, got %+v", rows)
+	}
+	// exit price 1.10 (b+30 candle), NOT the open-based 1.20
+	if math.Abs(rows[0].ReturnPct.Float64-(1.10/1.00-1)*100) > 0.001 {
+		t.Errorf("return = %.4f%%, want 10%% (close-time horizon must pick the b+30 candle, not b+60)", rows[0].ReturnPct.Float64)
+	}
+	// observation instant = candle close = b+60; lag vs due (b+45) = 15s <= res
+	wantObs := b.Add(30*time.Second).Unix() + 30
+	if rows[0].OutcomeObservedAt != wantObs {
+		t.Errorf("outcome_observed_at = %d, want %d (close time, lag must be in [0, res])", rows[0].OutcomeObservedAt, wantObs)
 	}
 }

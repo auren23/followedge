@@ -58,6 +58,10 @@ type DueMarkout struct {
 //   - follower rows with base_price NULL need their ReceivedAt entry price
 //   - any row with base_price set and base_ms+horizon <= cutoff needs its
 //     horizon price
+//
+// TERMINAL market statuses (no_candle, token_inactive, stale_outcome) are
+// excluded: their observed_price stays NULL forever, so re-listing them
+// every tick would burn kline quota on rows that can never fill.
 func (s *Store) DueMarkouts(grace time.Duration, now time.Time, limit int) ([]DueMarkout, error) {
 	cutoff := now.Add(-grace).Unix()
 	// follower rows first (the measurement that matters), transient failures
@@ -71,6 +75,7 @@ func (s *Store) DueMarkouts(grace time.Duration, now time.Time, limit int) ([]Du
 		JOIN trade_events e ON e.event_id = m.event_id
 		WHERE m.observed_price IS NULL
 		  AND m.base_ms + m.horizon_ms/1000 <= ?
+		  AND m.status IN ('pending','lookback_miss','api_error','rate_limited','price_parse_error')
 		ORDER BY (m.kind = 'follower') DESC,
 		         (m.status IN ('lookback_miss','api_error','rate_limited')) DESC,
 		         m.base_ms + m.horizon_ms/1000 DESC

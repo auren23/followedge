@@ -212,11 +212,11 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 				e.markStatus([]target{t}, storage.MarkoutStatusLookbackMiss)
 				continue // entry unknown; horizon return would be meaningless
 			}
-			c, found := firstCloseAtOrAfter(scs, t.due.Unix())
+			c, found := firstCandleClosingAtOrAfter(scs, t.due.Unix(), e.resSecs)
 			if !found {
-				// the kline window covers the due time (it starts 2 res before
-				// the earliest due) but no candle opens there — the candle
-				// stream ended before the horizon: the token stopped trading.
+				// no candle CLOSES at or after the due time (the stream's last
+				// close is before due): the token stopped trading before the
+				// horizon.
 				e.markStatus([]target{t}, storage.MarkoutStatusNoCandle)
 				continue
 			}
@@ -226,14 +226,16 @@ func (e *Engine) SampleDue(ctx context.Context) error {
 				e.markStatus([]target{t}, storage.MarkoutStatusParseError)
 				continue
 			}
-			if c.open > t.due.Unix()+e.resSecs {
-				// the stream continued, but the first trade after due opened
-				// later than due+res: no executable price AT the fixed
-				// horizon. Market outcome (like no_candle), not measurement.
+			// the horizon price is the close of the first candle whose CLOSE
+			// time (open+res) is >= due; observation lag is therefore strictly
+			// in [0, res]. If even that close lands after due+res (open > due)
+			// there was no executable price at the fixed horizon.
+			closeTime := c.open + e.resSecs
+			if closeTime > t.due.Unix()+e.resSecs {
 				e.markStatus([]target{t}, storage.MarkoutStatusStaleOutcome)
 				continue
 			}
-			if err := e.store.FillMarkout(t.event, t.kind, t.horizon, c.close, c.open+e.resSecs); err != nil {
+			if err := e.store.FillMarkout(t.event, t.kind, t.horizon, c.close, closeTime); err != nil {
 				e.log.Warn("fill markout failed", "event", t.event, "horizon", t.horizon, "err", err)
 			}
 		}
@@ -268,11 +270,14 @@ type sampledCandle struct {
 	valid bool
 }
 
-// firstCloseAtOrAfter returns the first candle opening at or after ts.
-// found=false means the candle stream ended before ts; the returned candle
+// firstCandleClosingAtOrAfter returns the first candle whose CLOSE time
+// (open+res) is at or after ts — i.e. the first candle with open >= ts-res.
+// The observation instant of the returned price is open+res, so the lag vs
+// ts is bounded by [0, res], not [0, 2×res] as an open-based search would
+// allow. found=false means the stream ended before ts; the returned candle
 // may still be invalid (unparseable close). cs must be ascending by open.
-func firstCloseAtOrAfter(cs []sampledCandle, ts int64) (sampledCandle, bool) {
-	i := sort.Search(len(cs), func(i int) bool { return cs[i].open >= ts })
+func firstCandleClosingAtOrAfter(cs []sampledCandle, ts, resSecs int64) (sampledCandle, bool) {
+	i := sort.Search(len(cs), func(i int) bool { return cs[i].open >= ts-resSecs })
 	if i == len(cs) {
 		return sampledCandle{}, false
 	}
