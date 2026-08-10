@@ -15,12 +15,14 @@ type EntryRow struct {
 }
 
 // EntryRows lists a wallet's BUY events since `since` (entry context).
+// Same-second trades are ordered by received_at, event_id (approximate
+// without a chain tx index).
 func (s *Store) EntryRows(wallet string, since time.Time) ([]EntryRow, error) {
 	rows, err := s.db.Query(`
 		SELECT token_address, amount_usd, trade_time, received_at
 		FROM trade_events
 		WHERE wallet = ? AND side = 'buy' AND trade_time >= ?
-		ORDER BY trade_time`, wallet, since.Unix())
+		ORDER BY trade_time, received_at, event_id`, wallet, since.Unix())
 	if err != nil {
 		return nil, err
 	}
@@ -36,104 +38,66 @@ func (s *Store) EntryRows(wallet string, since time.Time) ([]EntryRow, error) {
 	return out, rows.Err()
 }
 
-// EpisodesFor lists a wallet's reconstructed position episodes, newest first.
-func (s *Store) EpisodesFor(wallet string) ([]Episode, error) {
+// EntryObservation is the chase feature of ONE entry, knowable at entry
+// time (follower entry price sampled) — deliberately NOT conditioned on the
+// horizon markout being filled, so median chase has no survivor bias.
+type EntryObservation struct {
+	EventID   string
+	TradeTime int64
+	ChasePct  float64 // (entry price / leader price - 1) * 100
+}
+
+// EntryObservations returns one chase observation per buy entry of the
+// wallet whose follower entry price was sampled (base_price NOT NULL).
+// Requires the entry observation, never the horizon outcome.
+func (s *Store) EntryObservations(wallet string, since time.Time, horizon time.Duration) ([]EntryObservation, error) {
 	rows, err := s.db.Query(`
-		SELECT wallet, token, opened_at, closed_at, adds, reduces,
-		       capital_in, capital_out, realized_pnl, hold_duration_s, status
-		FROM position_episodes
-		WHERE wallet = ?
-		ORDER BY opened_at DESC`, wallet)
+		SELECT e.event_id, e.trade_time, m.base_price, e.price_usd
+		FROM markouts m
+		JOIN trade_events e ON e.event_id = m.event_id
+		WHERE m.kind = 'follower' AND m.horizon_ms = ?
+		  AND m.base_price IS NOT NULL
+		  AND e.side = 'buy' AND e.wallet = ? AND e.trade_time >= ?
+		ORDER BY e.trade_time`, horizon.Milliseconds(), wallet, since.Unix())
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Episode
+	var out []EntryObservation
 	for rows.Next() {
-		var e Episode
-		var closed, hold sql.NullInt64
-		if err := rows.Scan(&e.Wallet, &e.Token, &e.OpenedAt, &closed, &e.Adds,
-			&e.Reduces, &e.CapitalIn, &e.CapitalOut, &e.RealizedPnL, &hold, &e.Status); err != nil {
+		var e EventRow
+		var base, leader sql.NullFloat64
+		if err := rows.Scan(&e.ID, &e.TradeTime, &base, &leader); err != nil {
 			return nil, err
 		}
-		e.ClosedAt = closed.Int64
-		e.HoldDurationS = hold.Int64
-		out = append(out, e)
+		if base.Valid && leader.Valid && base.Float64 > 0 && leader.Float64 > 0 {
+			out = append(out, EntryObservation{
+				EventID:   e.ID,
+				TradeTime: e.TradeTime,
+				ChasePct:  (base.Float64/leader.Float64 - 1) * 100,
+			})
+		}
 	}
 	return out, rows.Err()
 }
 
-// FirstSellDelays returns, per position episode, the seconds between the
-// episode's opening buy and its FIRST sell leg (time-to-first-sell).
-// Episodes that never sold are skipped. Reconstructed in Go from the same
-// ordered event stream as RebuildEpisodes.
-func (s *Store) FirstSellDelays(wallet string, since time.Time) ([]int64, error) {
-	rows, err := s.db.Query(`
-		SELECT token_address, side, token_amount, trade_time
+// PriorFlowAt counts distinct smart-money and KOL BUYERS of a token whose
+// trades happened in [entryTime-window, entryTime) — the market context the
+// actor saw BEFORE its entry, recomputed historically from trade_events.
+//
+// The upper bound is STRICTLY < entryTime: without a chain tx index the
+// same-second ordering is unknowable, so same-second trades are conserva-
+// tively excluded (they could be the actor's own buy).
+func (s *Store) PriorFlowAt(token string, entryTime int64, window time.Duration) (smart, kol int, err error) {
+	err = s.db.QueryRow(`
+		SELECT COUNT(DISTINCT CASE WHEN wallet_type = 'smart_money' AND side = 'buy' THEN wallet END),
+		       COUNT(DISTINCT CASE WHEN wallet_type = 'kol' AND side = 'buy' THEN wallet END)
 		FROM trade_events
-		WHERE wallet = ? AND trade_time >= ?
-		ORDER BY token_address, trade_time`, wallet, since.Unix())
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []int64
-	var curToken string
-	var openTime int64
-	qty := 0.0
-	firstSold := false
-	for rows.Next() {
-		var token, side string
-		var amt, ts float64
-		if err := rows.Scan(&token, &side, &amt, &ts); err != nil {
-			return nil, err
-		}
-		if token != curToken {
-			curToken, openTime, qty, firstSold = token, int64(ts), 0, false
-		}
-		if side == "buy" {
-			if qty <= 0 {
-				openTime = int64(ts) // (re)opening buy
-				firstSold = false
-			}
-			qty += amt
-		} else if qty > 0 {
-			if !firstSold {
-				out = append(out, int64(ts)-openTime) // first sell leg of this episode
-				firstSold = true
-			}
-			qty -= amt
-			if qty <= 0 {
-				firstSold = false // episode closed; next buy opens a new one
-			}
-		}
-	}
-	return out, rows.Err()
-}
-
-// ClusterStateAt returns the most recent cluster snapshot for a token whose
-// window state is knowable AT or BEFORE `at` — point-in-time: a snapshot
-// taken after the entry must not describe the entry's context.
-func (s *Store) ClusterStateAt(token string, at int64, window time.Duration) (ClusterSampleRow, bool, error) {
-	var r ClusterSampleRow
-	var wms int64
-	err := s.db.QueryRow(`
-		SELECT token_address, window_ms, ts,
-		       smart_buy_wallets, smart_sell_wallets, kol_buy_wallets, kol_sell_wallets,
-		       net_smart_flow_usd, event_count
-		FROM cluster_samples
-		WHERE token_address = ? AND window_ms = ? AND ts <= ?
-		ORDER BY ts DESC LIMIT 1`,
-		token, window.Milliseconds(), at).
-		Scan(&r.TokenAddress, &wms, &r.TS,
-			&r.SmartBuyWallets, &r.SmartSellWallets, &r.KOLBuyWallets, &r.KOLSellWallets,
-			&r.NetFlowUSD, &r.EventCount)
+		WHERE token_address = ? AND trade_time >= ? AND trade_time < ?`,
+		token, entryTime-window.Milliseconds()/1000, entryTime).
+		Scan(&smart, &kol)
 	if err == sql.ErrNoRows {
-		return ClusterSampleRow{}, false, nil
+		return 0, 0, nil
 	}
-	if err != nil {
-		return ClusterSampleRow{}, false, err
-	}
-	r.Window = time.Duration(wms) * time.Millisecond
-	return r, true, nil
+	return smart, kol, err
 }

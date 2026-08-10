@@ -7,80 +7,98 @@ import (
 	"github.com/auren23/followedge/internal/storage"
 )
 
-// TestBuildProfile pins the behavior profile facts: token reuse, medians,
-// cluster share, exit ratios and PnL aggregation.
+// TestBuildProfile pins the v0.2.0.1 semantics: reentry rate (not buy
+// count), real partial exits (PartialExitLegs, not data-gap status),
+// closed-only pnl stats, per-feature sample sizes, and n/a on missing data.
 func TestBuildProfile(t *testing.T) {
 	episodes := []storage.Episode{
-		// closed, profitable, one add, one reduce, hold 100s
-		{Wallet: "W", Token: "T1", OpenedAt: 100, ClosedAt: 200, Adds: 1, Reduces: 1,
-			CapitalIn: 100, CapitalOut: 150, RealizedPnL: 50, HoldDurationS: 100, Status: storage.EpisodeClosed},
-		// closed, losing, hold 300s
-		{Wallet: "W", Token: "T2", OpenedAt: 500, ClosedAt: 800, Adds: 2, Reduces: 1,
-			CapitalIn: 200, CapitalOut: 100, RealizedPnL: -100, HoldDurationS: 300, Status: storage.EpisodeClosed},
-		// partial (data gap), hold 60s
-		{Wallet: "W", Token: "T3", OpenedAt: 900, ClosedAt: 960, Adds: 0, Reduces: 2,
-			CapitalIn: 50, CapitalOut: 80, RealizedPnL: 30, HoldDurationS: 60, Status: storage.EpisodePartial},
-		// open
-		{Wallet: "W", Token: "T4", OpenedAt: 1000, ClosedAt: 0, Adds: 0, Reduces: 0,
-			CapitalIn: 30, CapitalOut: 0, RealizedPnL: 0, HoldDurationS: 0, Status: storage.EpisodeOpen},
+		// closed, profitable: one add, one REAL partial exit (s1), close at 180s
+		{Wallet: "W", Token: "T1", OpenedAt: 100, ClosedAt: 280, Adds: 1, Reduces: 2,
+			CapitalIn: 150, CapitalOut: 200, RealizedPnL: 50, HoldDurationS: 180,
+			Status:      storage.EpisodeClosed,
+			FirstSellAt: 160, InitialBuyUSD: 100, AddBuyUSD: 50,
+			SellLegs: 2, PartialExitLegs: 1, DataGap: false},
+		// closed, losing, no partial exit
+		{Wallet: "W", Token: "T2", OpenedAt: 500, ClosedAt: 800, Adds: 0, Reduces: 1,
+			CapitalIn: 200, CapitalOut: 100, RealizedPnL: -100, HoldDurationS: 300,
+			Status:      storage.EpisodeClosed,
+			FirstSellAt: 800, InitialBuyUSD: 200, AddBuyUSD: 0,
+			SellLegs: 1, PartialExitLegs: 0, DataGap: false},
+		// data-gap (partial status): sells exceeded visible position — NOT
+		// a partial exit; excluded from closed pnl
+		{Wallet: "W", Token: "T3", OpenedAt: 900, ClosedAt: 960, Adds: 0, Reduces: 1,
+			CapitalIn: 50, CapitalOut: 80, RealizedPnL: 30, HoldDurationS: 60,
+			Status:      storage.EpisodePartial,
+			FirstSellAt: 960, InitialBuyUSD: 0, AddBuyUSD: 0,
+			SellLegs: 1, PartialExitLegs: 0, DataGap: true},
+		// open (never exited) — SAME token T1 as the first episode: re-entry
+		{Wallet: "W", Token: "T1", OpenedAt: 1000, ClosedAt: 0, Adds: 0, Reduces: 0,
+			CapitalIn: 30, CapitalOut: 0, RealizedPnL: 0, HoldDurationS: 0,
+			Status:      storage.EpisodeOpen,
+			FirstSellAt: 0, InitialBuyUSD: 30, AddBuyUSD: 0,
+			SellLegs: 0, PartialExitLegs: 0, DataGap: false},
 	}
-	// 5 entries: T1×2 (reuse), T2, T3, T4 → reuse = 1 - 4/5 = 0.20
+	// 4 buys: T1×3 (one add + one re-entry), T2 — reentry rate over EPISODES:
+	// 4 episodes, 3 distinct tokens → 1 - 3/4 = 0.25
 	entries := []storage.EntryRow{
-		{Token: "T1", AmountUSD: 100, TradeTime: 100, ReceivedAt: 130},   // age 30s
-		{Token: "T1", AmountUSD: 50, TradeTime: 150, ReceivedAt: 190},    // age 40s
-		{Token: "T2", AmountUSD: 200, TradeTime: 500, ReceivedAt: 560},   // age 60s
-		{Token: "T3", AmountUSD: 300, TradeTime: 900, ReceivedAt: 960},   // age 60s
-		{Token: "T4", AmountUSD: 400, TradeTime: 1000, ReceivedAt: 1010}, // age 10s
+		{Token: "T1", AmountUSD: 100, TradeTime: 100, ReceivedAt: 130},  // age 30s
+		{Token: "T1", AmountUSD: 50, TradeTime: 150, ReceivedAt: 190},   // age 40s
+		{Token: "T2", AmountUSD: 200, TradeTime: 500, ReceivedAt: 560},  // age 60s
+		{Token: "T1", AmountUSD: 30, TradeTime: 1000, ReceivedAt: 1010}, // age 10s
 	}
-	firstSells := []int64{60, 150, 30}
 	chases := []float64{1.0, 2.0, 3.0, 4.0, 5.0}
 	smartPrior := []float64{1, 2, 3, 4, 5}
 	kolPrior := []float64{0, 0, 1, 1, 2}
 
-	p := BuildProfile("W", episodes, entries, firstSells, chases, smartPrior, kolPrior)
+	p := BuildProfile("W", episodes, entries, chases, smartPrior, kolPrior)
 
 	// ENTRY
-	if p.Entry.Count != 5 || math.Abs(p.Entry.TokenReuse-0.20) > 0.001 {
-		t.Errorf("entry count/reuse = %d/%.2f, want 5/0.20", p.Entry.Count, p.Entry.TokenReuse)
+	if p.Entry.Count != 4 || math.Abs(p.Entry.ReentryRate-0.25) > 0.001 {
+		t.Errorf("entry count/reentry = %d/%.2f, want 4/0.25", p.Entry.Count, p.Entry.ReentryRate)
 	}
-	if p.Entry.MedianSize != 200 { // sorted: 50,100,200,300,400
-		t.Errorf("median size = %.0f, want 200", p.Entry.MedianSize)
+	if p.Entry.MedianInitialBuy.Value != 65 || p.Entry.MedianInitialBuy.N != 4 { // [100,200,0,30] → sorted → (30+100)/2
+		t.Errorf("initial buy = %.0f (n%d), want 65 (n4)", p.Entry.MedianInitialBuy.Value, p.Entry.MedianInitialBuy.N)
 	}
-	if p.Entry.MedianAge != 40 { // sorted: 10,30,40,60,60
-		t.Errorf("median age = %.0f, want 40", p.Entry.MedianAge)
+	if p.Entry.MedianChase.Value != 3 || p.Entry.MedianChase.N != 5 {
+		t.Errorf("median chase = %.0f (n%d), want 3 (n5)", p.Entry.MedianChase.Value, p.Entry.MedianChase.N)
 	}
-	if p.Entry.MedianChase != 3 || p.Entry.SmartPriorP50 != 3 {
-		t.Errorf("median chase/smart = %.0f/%.0f, want 3/3", p.Entry.MedianChase, p.Entry.SmartPriorP50)
+	if p.Entry.SmartPriorP50.Value != 3 || p.Entry.PriorFlowN != 5 {
+		t.Errorf("prior smart = %.0f (n%d), want 3 (n5)", p.Entry.SmartPriorP50.Value, p.Entry.PriorFlowN)
 	}
 	if math.Abs(p.Entry.Cluster3Plus-0.60) > 0.001 { // 3,4,5 of 5 >= 3
 		t.Errorf("cluster3plus = %.2f, want 0.60", p.Entry.Cluster3Plus)
 	}
 
-	// POSITION
+	// POSITION — hold median only over closed (180, 300)
 	if p.Position.Episodes != 4 {
 		t.Errorf("episodes = %d, want 4", p.Position.Episodes)
 	}
-	if p.Position.MedianAdds != 0.5 { // sorted: 0,0,1,2
-		t.Errorf("median adds = %.1f, want 0.5", p.Position.MedianAdds)
-	}
-	if p.Position.MedianHoldSecs != 100 { // closed+partial: 60,100,300
-		t.Errorf("median hold = %.0f, want 100", p.Position.MedianHoldSecs)
+	if p.Position.MedianHoldSecs.Value != 240 || p.Position.MedianHoldSecs.N != 2 {
+		t.Errorf("median hold = %.0f (n%d), want 240 (n2, closed only)", p.Position.MedianHoldSecs.Value, p.Position.MedianHoldSecs.N)
 	}
 
-	// EXIT
-	if math.Abs(p.Exit.PartialRatio-0.25) > 0.001 || math.Abs(p.Exit.FullRatio-0.50) > 0.001 {
-		t.Errorf("exit ratios = partial %.2f / full %.2f, want 0.25/0.50", p.Exit.PartialRatio, p.Exit.FullRatio)
+	// EXIT — real partial exits: only T1 (1 of 2 observable episodes)
+	if math.Abs(p.Exit.PartialExitRatio-0.50) > 0.001 || p.Exit.PartialExitN != 1 || p.Exit.ObservableN != 2 {
+		t.Errorf("partial exits = %.2f (%d of %d), want 0.50 (1 of 2)", p.Exit.PartialExitRatio, p.Exit.PartialExitN, p.Exit.ObservableN)
 	}
-	if p.Exit.MedianFirstSellSecs != 60 { // sorted: 30,60,150
-		t.Errorf("first sell P50 = %.0f, want 60", p.Exit.MedianFirstSellSecs)
+	if p.Exit.FirstSellP50.Value != 180 || p.Exit.FirstSellP50.N != 2 { // 160-100=60, 800-500=300 → 180
+		t.Errorf("first sell P50 = %.0f (n%d), want 180 (n2)", p.Exit.FirstSellP50.Value, p.Exit.FirstSellP50.N)
 	}
-	if p.Exit.MedianCloseSecs != 100 { // closed: 100,300
-		t.Errorf("close P50 = %.0f, want 100", p.Exit.MedianCloseSecs)
+	if p.Exit.CloseP50.Value != 240 || p.Exit.CloseP50.N != 2 {
+		t.Errorf("close P50 = %.0f (n%d), want 240 (n2)", p.Exit.CloseP50.Value, p.Exit.CloseP50.N)
 	}
-	if p.Exit.TotalPnl != -20 { // 50 - 100 + 30
-		t.Errorf("total pnl = %.0f, want -20", p.Exit.TotalPnl)
+	// closed-only pnl: 50 + (-100) = -50; the data-gap +30 shown separately
+	if p.Exit.ClosedPnl != -50 || math.Abs(p.Exit.ClosedWinRate-0.50) > 0.001 {
+		t.Errorf("closed pnl/win = %.0f/%.2f, want -50/0.50", p.Exit.ClosedPnl, p.Exit.ClosedWinRate)
 	}
-	if math.Abs(p.Exit.ProfitableRatio-2.0/3.0) > 0.001 { // 2 of 3 realized (closed+partial) profitable
-		t.Errorf("profitable ratio = %.2f, want %.2f", p.Exit.ProfitableRatio, 2.0/3.0)
+	if math.Abs(p.Exit.IncompleteRatio-0.25) > 0.001 || p.Exit.IncompletePnl != 30 {
+		t.Errorf("incomplete = %.2f pnl %.0f, want 0.25/30", p.Exit.IncompleteRatio, p.Exit.IncompletePnl)
+	}
+
+	// missing data → n/a (N=0), not a fabricated zero
+	empty := BuildProfile("W", nil, nil, nil, nil, nil)
+	if empty.Entry.MedianChase.N != 0 || empty.Entry.MedianAge.N != 0 ||
+		empty.Exit.FirstSellP50.N != 0 || empty.Exit.CloseP50.N != 0 {
+		t.Errorf("empty profile must carry N=0, got %+v", empty)
 	}
 }

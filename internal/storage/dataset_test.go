@@ -480,9 +480,9 @@ func TestDueMarkoutsFreshFirst(t *testing.T) {
 	}
 }
 
-// TestBehaviorQueries pins the v0.2.0 behavior-reconstruction queries:
-// entry rows, episodes, first-sell delays, and the PIT cluster snapshot
-// (a snapshot taken AFTER the entry must not describe it).
+// TestBehaviorQueries pins the v0.2.0.1 behavior queries: on-demand episode
+// reconstruction (with behavior fields), prior flow at entry (PIT, strict <),
+// and entry chase observations (never future-conditioned).
 func TestBehaviorQueries(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
@@ -506,69 +506,121 @@ func TestBehaviorQueries(t *testing.T) {
 		}
 	}
 	mk("b1", "buy", base, 100, 100, 0)                       // open
-	mk("s1", "sell", base.Add(60*time.Second), 60, 70, 60)   // partial: 100-60=40 left, first sell +60s
+	mk("s1", "sell", base.Add(60*time.Second), 60, 70, 60)   // partial exit: qty 40 left
 	mk("b2", "buy", base.Add(120*time.Second), 50, 50, 0)    // add: qty 90
 	mk("s2", "sell", base.Add(180*time.Second), 90, 130, 90) // close at +180s
 
-	// episodes
-	if _, err := s.RebuildEpisodes(now.Add(-2 * time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	eps, err := s.EpisodesFor("W_B")
+	// on-demand reconstruction — does NOT depend on the materialized table
+	eps, err := s.ReconstructEpisodesFor("W_B", now.Add(-2*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(eps) != 1 || eps[0].Status != EpisodeClosed || eps[0].HoldDurationS != 180 {
-		t.Fatalf("episode = %+v, want 1 closed episode hold 180s", eps)
+	if len(eps) != 1 {
+		t.Fatalf("episodes = %+v, want 1", eps)
 	}
-	if eps[0].Adds != 1 || eps[0].Reduces != 2 || eps[0].RealizedPnL != 50 {
-		t.Errorf("episode = adds %d reduces %d pnl %.0f, want 1/2/50", eps[0].Adds, eps[0].Reduces, eps[0].RealizedPnL)
+	e := eps[0]
+	if e.Status != EpisodeClosed || e.HoldDurationS != 180 {
+		t.Errorf("episode = status %s hold %d, want closed/180", e.Status, e.HoldDurationS)
 	}
-
-	// entry rows (buys only, in window)
-	entries, err := s.EntryRows("W_B", now.Add(-2*time.Hour))
-	if err != nil {
-		t.Fatal(err)
+	if e.Adds != 1 || e.Reduces != 2 || e.RealizedPnL != 50 {
+		t.Errorf("episode = adds %d reduces %d pnl %.0f, want 1/2/50", e.Adds, e.Reduces, e.RealizedPnL)
 	}
-	if len(entries) != 2 || entries[0].AmountUSD != 100 || entries[0].ReceivedAt-entries[0].TradeTime != 20 {
-		t.Errorf("entry rows = %+v, want 2 buys with source age 20s", entries)
+	// behavior fields: s1 left qty>0 → a REAL partial exit leg
+	if e.PartialExitLegs != 1 || e.SellLegs != 2 || e.FirstSellAt != base.Unix()+60 {
+		t.Errorf("behavior fields = partialLegs %d sellLegs %d firstSell %d, want 1/2/%d",
+			e.PartialExitLegs, e.SellLegs, e.FirstSellAt, base.Unix()+60)
 	}
-
-	// first sell delay: 60s (b1 → s1); the b2 add does not reset it
-	delays, err := s.FirstSellDelays("W_B", now.Add(-2*time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(delays) != 1 || delays[0] != 60 {
-		t.Errorf("first sell delays = %v, want [60]", delays)
+	if e.InitialBuyUSD != 100 || e.AddBuyUSD != 50 || e.DataGap {
+		t.Errorf("behavior fields = init %.0f add %.0f gap %v, want 100/50/false",
+			e.InitialBuyUSD, e.AddBuyUSD, e.DataGap)
 	}
 
-	// PIT cluster snapshot: a sample AFTER the entry must not be returned
-	if err := s.InsertClusterSample(domain.ClusterFeatures{
-		TokenAddress: "TOKEN_X", Window: time.Minute, LastEventAt: base.Add(2 * time.Hour),
-		SmartBuyWallets: 9, KOLBuyWallets: 3,
+	// data-gap episode: a sell with no visible position is gap, not partial exit
+	if _, err := s.InsertEvent(domain.TradeEvent{
+		ID:     domain.EventID("sol", "gap1", "W_B", "TOKEN_G", "sell"),
+		Source: "gmgn_smartmoney", Chain: "sol", TxHash: "gap1",
+		Wallet: "W_B", WalletType: domain.WalletSmartMoney,
+		TokenAddress: "TOKEN_G", Side: domain.Sell, AmountUSD: 10,
+		TokenAmount: 5, PriceUSD: 1.0, BuyCostUSD: 3,
+		TradeTime: base.Add(10 * time.Minute), ReceivedAt: base.Add(10*time.Minute + 20*time.Second),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	cs, ok, err := s.ClusterStateAt("TOKEN_X", base.Unix(), time.Minute)
+	eps, err = s.ReconstructEpisodesFor("W_B", now.Add(-2*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok {
-		t.Errorf("PIT violation: cluster sample at %d returned for entry at %d (sample is AFTER entry)", cs.TS, base.Unix())
+	var gap *Episode
+	for i := range eps {
+		if eps[i].Token == "TOKEN_G" {
+			gap = &eps[i]
+		}
 	}
-	// a sample at/before the entry IS returned
-	if err := s.InsertClusterSample(domain.ClusterFeatures{
-		TokenAddress: "TOKEN_X", Window: time.Minute, LastEventAt: base.Add(-time.Minute),
-		SmartBuyWallets: 2, KOLBuyWallets: 1,
+	if gap == nil || !gap.DataGap || gap.PartialExitLegs != 0 || gap.Status != EpisodePartial {
+		t.Errorf("gap episode = %+v, want DataGap=true PartialExitLegs=0 status=partial", gap)
+	}
+
+	// prior flow at entry: strict [T-window, T) — same-second trades excluded
+	if _, err := s.InsertEvent(domain.TradeEvent{
+		ID:     domain.EventID("sol", "prior1", "OTHER_SMART", "TOKEN_X", "buy"),
+		Source: "gmgn_smartmoney", Chain: "sol", TxHash: "prior1",
+		Wallet: "OTHER_SMART", WalletType: domain.WalletSmartMoney,
+		TokenAddress: "TOKEN_X", Side: domain.Buy, AmountUSD: 10,
+		TokenAmount: 10, PriceUSD: 1.0, BuyCostUSD: 0,
+		TradeTime: base.Add(-30 * time.Second), ReceivedAt: base.Add(-30*time.Second + 20*time.Second),
 	}); err != nil {
 		t.Fatal(err)
 	}
-	cs, ok, err = s.ClusterStateAt("TOKEN_X", base.Unix(), time.Minute)
+	// same-second buy (excluded conservatively)
+	if _, err := s.InsertEvent(domain.TradeEvent{
+		ID:     domain.EventID("sol", "prior2", "SAME_SEC", "TOKEN_X", "buy"),
+		Source: "gmgn_smartmoney", Chain: "sol", TxHash: "prior2",
+		Wallet: "SAME_SEC", WalletType: domain.WalletSmartMoney,
+		TokenAddress: "TOKEN_X", Side: domain.Buy, AmountUSD: 10,
+		TokenAmount: 10, PriceUSD: 1.0, BuyCostUSD: 0,
+		TradeTime: base, ReceivedAt: base.Add(20 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	smart, kol, err := s.PriorFlowAt("TOKEN_X", base.Unix(), time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !ok || cs.SmartBuyWallets != 2 {
-		t.Errorf("PIT snapshot = %+v (ok %v), want smart=2 before entry", cs, ok)
+	if smart != 1 || kol != 0 {
+		t.Errorf("prior flow = smart %d kol %d, want 1/0 (same-second buy must be excluded)", smart, kol)
+	}
+
+	// entry chase observations: base_price set, NO horizon fill required
+	ev := domain.TradeEvent{
+		ID:     domain.EventID("sol", "ch1", "W_B", "TOKEN_CH", "buy"),
+		Source: "gmgn_smartmoney", Chain: "sol", TxHash: "ch1",
+		Wallet: "W_B", WalletType: domain.WalletSmartMoney,
+		TokenAddress: "TOKEN_CH", Side: domain.Buy, AmountUSD: 10,
+		TokenAmount: 10, PriceUSD: 1.0, BuyCostUSD: 0,
+		TradeTime: base, ReceivedAt: base,
+	}
+	if _, err := s.InsertEvent(ev); err != nil {
+		t.Fatal(err)
+	}
+	entry := 1.1 // follower entry 10% above leader price → chase +10%
+	if err := s.CreateMarkouts(ev, MarkoutFollower, &entry, []time.Duration{30 * time.Second}, now); err != nil {
+		t.Fatal(err)
+	}
+	// NO FillMarkout: the 5m outcome is missing; chase must still be observable
+	obs, err := s.EntryObservations("W_B", now.Add(-2*time.Hour), 30*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, o := range obs {
+		if o.EventID == ev.ID {
+			found = true
+			if math.Abs(o.ChasePct-10) > 0.001 {
+				t.Errorf("chase = %.2f%%, want +10%%", o.ChasePct)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("entry observation missing for unfilled horizon — chase must not depend on outcome: %+v", obs)
 	}
 }

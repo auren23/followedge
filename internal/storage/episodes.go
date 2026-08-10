@@ -14,6 +14,12 @@ const (
 )
 
 // Episode is one reconstructed position round-trip of a (wallet, token).
+//
+// Status semantics (v0.2.0.1): "partial" means the sell legs EXCEEDED the
+// visible position — a DATA GAP (our window missed the opening buys), NOT
+// an intentional partial-exit behavior. Real partial exits are counted
+// separately in PartialExitLegs: sell legs that left a positive visible
+// quantity behind.
 type Episode struct {
 	Wallet        string
 	Token         string
@@ -26,85 +32,36 @@ type Episode struct {
 	RealizedPnL   float64
 	HoldDurationS int64
 	Status        string
+
+	// v0.2.0.1 behavior facts (reconstructed; not persisted in
+	// position_episodes — behavior analysis never depends on the table).
+	FirstSellAt     int64   // first sell leg time, 0 = never sold
+	InitialBuyUSD   float64 // opening buy notional (0 if opening buy unseen)
+	AddBuyUSD       float64 // total notional of add buys
+	SellLegs        int     // total sell legs
+	PartialExitLegs int     // sell legs that left visible qty > 0 (real partial exit)
+	DataGap         bool    // opening buy (or part of the position) unseen
 }
 
-// RebuildEpisodes reconstructs position episodes from trade_events since
-// `since` (per wallet+token, ordered by trade_time). Deterministic and
-// idempotent: the table is wiped and rebuilt.
-//
-// Limits: the feed shows only recent trades, so an episode whose opening
-// buys predate our window looks "partial" when sells exceed visible
-// position; that is recorded explicitly rather than guessed.
+// RebuildEpisodes reconstructs ALL wallets' position episodes since `since`
+// and materializes them into position_episodes. Deterministic and idempotent
+// (table wiped and rebuilt). Same-second trades are ordered by
+// received_at then event_id — approximate without a chain tx index.
 func (s *Store) RebuildEpisodes(since time.Time) (int, error) {
 	rows, err := s.db.Query(`
 		SELECT wallet, token_address, side, token_amount, amount_usd,
-		       buy_cost_usd, trade_time
+		       buy_cost_usd, trade_time, received_at, event_id
 		FROM trade_events
 		WHERE trade_time >= ?
-		ORDER BY wallet, token_address, trade_time`, since.Unix())
+		ORDER BY wallet, token_address, trade_time, received_at, event_id`, since.Unix())
 	if err != nil {
 		return 0, err
 	}
 	defer rows.Close()
-
-	var eps []Episode
-	var cur *Episode
-	var curWallet, curToken string
-	var qty float64 // visible token quantity
-
-	flush := func() {
-		if cur != nil {
-			eps = append(eps, *cur)
-			cur = nil
-		}
-		qty = 0
-	}
-
-	for rows.Next() {
-		var wallet, token, side string
-		var tokenAmount, amountUSD, ts float64
-		var buyCost sql.NullFloat64
-		if err := rows.Scan(&wallet, &token, &side, &tokenAmount, &amountUSD, &buyCost, &ts); err != nil {
-			return 0, err
-		}
-		if cur == nil || wallet != curWallet || token != curToken {
-			flush()
-			curWallet, curToken = wallet, token
-			cur = &Episode{Wallet: wallet, Token: token, OpenedAt: int64(ts), Status: EpisodeOpen}
-		}
-		if side == "buy" {
-			qty += tokenAmount
-			cur.CapitalIn += amountUSD
-			if qty-tokenAmount <= 0 { // first buy of the episode
-				cur.OpenedAt = int64(ts)
-			} else {
-				cur.Adds++
-			}
-		} else { // sell
-			qty -= tokenAmount
-			cur.Reduces++
-			cur.CapitalOut += amountUSD
-			if buyCost.Valid && buyCost.Float64 > 0 {
-				cur.RealizedPnL += amountUSD - buyCost.Float64
-			}
-			if qty <= 0 {
-				if qty < 0 {
-					cur.Status = EpisodePartial // sold more than visible position
-				} else {
-					cur.Status = EpisodeClosed
-				}
-				qty = 0
-				cur.ClosedAt = int64(ts)
-				cur.HoldDurationS = cur.ClosedAt - cur.OpenedAt
-				flush()
-			}
-		}
-	}
-	if err := rows.Err(); err != nil {
+	eps, err := reconstructEpisodes(rows)
+	if err != nil {
 		return 0, err
 	}
-	// the last episode per group stays open
-	flush()
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -137,6 +94,107 @@ func (s *Store) RebuildEpisodes(since time.Time) (int, error) {
 		return 0, err
 	}
 	return len(eps), nil
+}
+
+// ReconstructEpisodesFor rebuilds ONE wallet's episodes on demand, straight
+// from trade_events — the behavior card must never depend on a stale or
+// never-materialized position_episodes table.
+func (s *Store) ReconstructEpisodesFor(wallet string, since time.Time) ([]Episode, error) {
+	rows, err := s.db.Query(`
+		SELECT wallet, token_address, side, token_amount, amount_usd,
+		       buy_cost_usd, trade_time, received_at, event_id
+		FROM trade_events
+		WHERE wallet = ? AND trade_time >= ?
+		ORDER BY token_address, trade_time, received_at, event_id`, wallet, since.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return reconstructEpisodes(rows)
+}
+
+// reconstructEpisodes builds episodes from an ordered event stream
+// (wallet, token, side, token_amount, amount_usd, buy_cost_usd, trade_time,
+// received_at, event_id — ascending by time). Shared by the global rebuild
+// and the per-wallet on-demand reconstruction.
+func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
+	var eps []Episode
+	var cur *Episode
+	var curWallet, curToken string
+	var qty float64 // visible token quantity
+
+	flush := func() {
+		if cur != nil {
+			eps = append(eps, *cur)
+			cur = nil
+		}
+		qty = 0
+	}
+
+	for rows.Next() {
+		var wallet, token, side string
+		var tokenAmount, amountUSD, ts, received float64
+		var buyCost sql.NullFloat64
+		if err := rows.Scan(&wallet, &token, &side, &tokenAmount, &amountUSD,
+			&buyCost, &ts, &received, new(string)); err != nil {
+			return nil, err
+		}
+		if cur == nil || wallet != curWallet || token != curToken {
+			flush()
+			curWallet, curToken = wallet, token
+			cur = &Episode{Wallet: wallet, Token: token, OpenedAt: int64(ts), Status: EpisodeOpen}
+			cur.DataGap = side == "sell" // window opened on a sell: opening buy unseen
+		}
+		if side == "buy" {
+			if qty <= 0 {
+				// opening buy (or re-opening after a full close)
+				cur.OpenedAt = int64(ts)
+				cur.InitialBuyUSD = amountUSD
+				cur.DataGap = false
+				cur.FirstSellAt = 0
+			} else {
+				cur.Adds++
+				cur.AddBuyUSD += amountUSD
+			}
+			qty += tokenAmount
+			cur.CapitalIn += amountUSD
+		} else { // sell
+			if qty <= 0 {
+				cur.DataGap = true // selling with no visible position
+			}
+			if cur.FirstSellAt == 0 {
+				cur.FirstSellAt = int64(ts)
+			}
+			cur.SellLegs++
+			cur.Reduces++
+			qty -= tokenAmount
+			cur.CapitalOut += amountUSD
+			if buyCost.Valid && buyCost.Float64 > 0 {
+				cur.RealizedPnL += amountUSD - buyCost.Float64
+			}
+			if qty > 0 {
+				cur.PartialExitLegs++ // position remains: a REAL partial exit
+			}
+			if qty <= 0 {
+				if qty < 0 {
+					cur.Status = EpisodePartial // sold more than visible position
+					cur.DataGap = true
+				} else {
+					cur.Status = EpisodeClosed
+				}
+				qty = 0
+				cur.ClosedAt = int64(ts)
+				cur.HoldDurationS = cur.ClosedAt - cur.OpenedAt
+				flush()
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// the last episode per group stays open
+	flush()
+	return eps, nil
 }
 
 // EpisodeCounts aggregates episodes for analysis.

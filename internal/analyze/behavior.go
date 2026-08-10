@@ -14,8 +14,9 @@ import (
 // entry context, position management, exit behavior. Facts only; archetype
 // classification and hypothesis generation come in later milestones.
 //
-// Point-in-time: entry-context features (prior smart/KOL buyers, chase) only
-// use data knowable at each entry's trade_time.
+// Point-in-time: entry-context features (prior flow, chase) only use data
+// knowable at each entry's trade_time. Episodes are reconstructed on demand
+// from trade_events — never from the possibly-stale materialized table.
 func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 	horizon time.Duration, noExitLoss float64, grace time.Duration, clusterWindow time.Duration) error {
 	// ---- QUALITY (same window) ----
@@ -72,82 +73,93 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 		fmt.Fprintf(w, "  cons EV        %s\n", consStr)
 	}
 
-	// ---- BEHAVIOR (episodes + entry context, same window) ----
-	episodes, err := s.EpisodesFor(wallet)
+	// ---- BEHAVIOR (on-demand reconstruction, same window) ----
+	episodes, err := s.ReconstructEpisodesFor(wallet, since)
 	if err != nil {
 		return err
-	}
-	var inWindow []storage.Episode
-	for _, e := range episodes {
-		if e.OpenedAt >= since.Unix() {
-			inWindow = append(inWindow, e)
-		}
 	}
 	entries, err := s.EntryRows(wallet, since)
 	if err != nil {
 		return err
 	}
-	firstSells, err := s.FirstSellDelays(wallet, since)
+	obs, err := s.EntryObservations(wallet, since, horizon)
 	if err != nil {
 		return err
 	}
-	chases, err := walletChases(s, wallet, horizon, since)
-	if err != nil {
-		return err
+	var chases []float64
+	for _, o := range obs {
+		chases = append(chases, o.ChasePct)
 	}
 	var smartPrior, kolPrior []float64
 	for _, e := range entries {
-		cs, ok, err := s.ClusterStateAt(e.Token, e.TradeTime, clusterWindow)
+		smart, kol, err := s.PriorFlowAt(e.Token, e.TradeTime, clusterWindow)
 		if err != nil {
 			return err
 		}
-		if ok {
-			smartPrior = append(smartPrior, float64(cs.SmartBuyWallets))
-			kolPrior = append(kolPrior, float64(cs.KOLBuyWallets))
-		}
+		smartPrior = append(smartPrior, float64(smart))
+		kolPrior = append(kolPrior, float64(kol))
 	}
 
-	prof := mechanism.BuildProfile(wallet, inWindow, entries, firstSells, chases, smartPrior, kolPrior)
+	prof := mechanism.BuildProfile(wallet, episodes, entries, chases, smartPrior, kolPrior)
 
 	fmt.Fprintf(w, "\nBEHAVIOR (since %s)\n", since.Format("2006-01-02"))
 	fmt.Fprintf(w, "\nENTRY\n")
 	fmt.Fprintf(w, "  entries         %d\n", prof.Entry.Count)
-	fmt.Fprintf(w, "  token reuse     %.0f%%\n", prof.Entry.TokenReuse*100)
-	fmt.Fprintf(w, "  median size     $%.0f\n", prof.Entry.MedianSize)
-	fmt.Fprintf(w, "  median age      %.0fs\n", prof.Entry.MedianAge)
-	fmt.Fprintf(w, "  median chase    %+.1f%%\n", prof.Entry.MedianChase)
-	fmt.Fprintf(w, "  prior smart P50 %.1f\n", prof.Entry.SmartPriorP50)
-	fmt.Fprintf(w, "  prior KOL P50   %.1f\n", prof.Entry.KOLPriorP50)
-	fmt.Fprintf(w, "  cluster >=3     %.0f%%\n", prof.Entry.Cluster3Plus*100)
+	fmt.Fprintf(w, "  reentry rate    %.0f%%\n", prof.Entry.ReentryRate*100)
+	fmt.Fprintf(w, "  initial buy     %s\n", usd(prof.Entry.MedianInitialBuy))
+	fmt.Fprintf(w, "  add buy         %s\n", usd(prof.Entry.MedianAddBuy))
+	fmt.Fprintf(w, "  total capital   %s\n", usd(prof.Entry.MedianCapitalIn))
+	fmt.Fprintf(w, "  median age      %s\n", secs(prof.Entry.MedianAge))
+	fmt.Fprintf(w, "  median chase    %s\n", pctMed(prof.Entry.MedianChase))
+	fmt.Fprintf(w, "  prior smart P50 %s\n", num(prof.Entry.SmartPriorP50))
+	fmt.Fprintf(w, "  prior KOL P50   %s\n", num(prof.Entry.KOLPriorP50))
+	fmt.Fprintf(w, "  cluster >=3     %.0f%% (%d observed)\n",
+		prof.Entry.Cluster3Plus*100, prof.Entry.PriorFlowN)
 	fmt.Fprintf(w, "\nPOSITION\n")
 	fmt.Fprintf(w, "  episodes        %d\n", prof.Position.Episodes)
-	fmt.Fprintf(w, "  median adds     %.0f\n", prof.Position.MedianAdds)
-	fmt.Fprintf(w, "  median reduces  %.0f\n", prof.Position.MedianReduces)
-	fmt.Fprintf(w, "  median capital  $%.0f in / $%.0f out\n",
-		prof.Position.MedianCapitalIn, prof.Position.MedianCapitalOut)
-	fmt.Fprintf(w, "  median hold     %.0fs\n", prof.Position.MedianHoldSecs)
+	fmt.Fprintf(w, "  median adds     %s\n", num(prof.Position.MedianAdds))
+	fmt.Fprintf(w, "  median reduces  %s\n", num(prof.Position.MedianReduces))
+	fmt.Fprintf(w, "  median hold     %s\n", secs(prof.Position.MedianHoldSecs))
 	fmt.Fprintf(w, "\nEXIT\n")
-	fmt.Fprintf(w, "  partial exit    %.0f%%\n", prof.Exit.PartialRatio*100)
-	fmt.Fprintf(w, "  full close      %.0f%%\n", prof.Exit.FullRatio*100)
-	fmt.Fprintf(w, "  first sell P50  %.0fs\n", prof.Exit.MedianFirstSellSecs)
-	fmt.Fprintf(w, "  full close P50  %.0fs\n", prof.Exit.MedianCloseSecs)
-	fmt.Fprintf(w, "  pnl             $%.0f  (%.0f%% profitable closed)\n",
-		prof.Exit.TotalPnl, prof.Exit.ProfitableRatio*100)
+	if prof.Exit.ObservableN > 0 {
+		fmt.Fprintf(w, "  partial exits   %.0f%% (%d of %d observable)\n",
+			prof.Exit.PartialExitRatio*100, prof.Exit.PartialExitN, prof.Exit.ObservableN)
+	} else {
+		fmt.Fprintf(w, "  partial exits   n/a (no observable exits)\n")
+	}
+	fmt.Fprintf(w, "  first sell P50  %s\n", secs(prof.Exit.FirstSellP50))
+	fmt.Fprintf(w, "  full close P50  %s\n", secs(prof.Exit.CloseP50))
+	fmt.Fprintf(w, "  closed pnl      $%.0f  (%.0f%% win rate, %d closed)\n",
+		prof.Exit.ClosedPnl, prof.Exit.ClosedWinRate*100, prof.Exit.CloseP50.N)
+	fmt.Fprintf(w, "  incomplete      %.0f%%  (data gap: opening buys unseen) pnl $%.0f\n",
+		prof.Exit.IncompleteRatio*100, prof.Exit.IncompletePnl)
 	return nil
 }
 
-// walletChases collects the follower entry chase % of a wallet's buys in the
-// window (PIT: chase is known at entry).
-func walletChases(s *storage.Store, wallet string, horizon time.Duration, since time.Time) ([]float64, error) {
-	rows, err := s.MarkoutsAt(storage.MarkoutFollower, horizon)
-	if err != nil {
-		return nil, err
+func usd(m mechanism.MedianStat) string {
+	if m.N == 0 {
+		return "n/a"
 	}
-	var out []float64
-	for _, m := range rows {
-		if m.Wallet == wallet && m.Side == "buy" && m.TradeTime >= since.Unix() {
-			out = append(out, m.ChasePct)
-		}
+	return fmt.Sprintf("$%.0f (%d)", m.Value, m.N)
+}
+
+func secs(m mechanism.MedianStat) string {
+	if m.N == 0 {
+		return "n/a"
 	}
-	return out, nil
+	return fmt.Sprintf("%.0fs (%d)", m.Value, m.N)
+}
+
+func num(m mechanism.MedianStat) string {
+	if m.N == 0 {
+		return "n/a"
+	}
+	return fmt.Sprintf("%.1f (%d)", m.Value, m.N)
+}
+
+func pctMed(m mechanism.MedianStat) string {
+	if m.N == 0 {
+		return "n/a"
+	}
+	return fmt.Sprintf("%+.1f%% (%d)", m.Value, m.N)
 }

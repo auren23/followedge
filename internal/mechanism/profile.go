@@ -2,9 +2,12 @@
 // into an actor's BEHAVIOR PROFILE — facts only, no scoring, no archetypes.
 //
 // Point-in-time discipline carries over from v0.1: entry-context features
-// (cluster state, chase) only ever use data knowable at the entry's
-// trade_time. The profile is descriptive (what does this actor DO), not
-// prescriptive (what should we copy) — archetypes and hypotheses come later.
+// (prior flow, chase) only ever use data knowable at the entry's trade_time.
+// Semantic notes (v0.2.0.1):
+//   - "partial exit" = sell legs that LEFT visible quantity (PartialExitLegs),
+//     never the data-gap status EpisodePartial;
+//   - chase comes from entry observations only (never future-conditioned);
+//   - every feature that can be missing carries its sample size (N).
 package mechanism
 
 import (
@@ -13,36 +16,59 @@ import (
 	"github.com/auren23/followedge/internal/storage"
 )
 
+// MedianStat is a median with its sample size — 0/0 means "no data", NOT a
+// median of zero.
+type MedianStat struct {
+	Value float64
+	N     int
+}
+
 // EntryStats are facts about HOW the actor enters positions.
 type EntryStats struct {
-	Count         int     // buy events in window
-	TokenReuse    float64 // 0-1: (entries - distinct tokens) / entries; 0 = never re-buys
-	MedianSize    float64 // median first-buy USD notional per episode
-	MedianAge     float64 // median source age (received - trade), seconds
-	MedianChase   float64 // median follower entry chase % (from markouts)
-	SmartPriorP50 float64 // median smart_buy_wallets visible at entry (PIT)
-	KOLPriorP50   float64 // median kol_buy_wallets visible at entry (PIT)
-	Cluster3Plus  float64 // 0-1 share of entries with >= 3 prior smart buyers
+	Count int // buy events in window
+
+	// ReentryRate: (episodes - distinct tokens) / episodes — how often the
+	// actor comes back to a token it already traded (scale-ins are counted
+	// separately as adds, not as re-entry).
+	ReentryRate float64
+
+	MedianInitialBuy MedianStat // opening buy notional per episode
+	MedianAddBuy     MedianStat // add-buy notional per episode
+	MedianCapitalIn  MedianStat // total capital in per episode
+	MedianAge        MedianStat // median source age (received - trade), seconds
+
+	MedianChase   MedianStat // median entry chase % (entry observations only)
+	SmartPriorP50 MedianStat // median prior smart buyers at entry (PIT)
+	KOLPriorP50   MedianStat // median prior KOL buyers at entry (PIT)
+	Cluster3Plus  float64    // share of entries with >= 3 prior smart buyers
+	PriorFlowN    int        // entries with a prior-flow observation
 }
 
 // PositionStats are facts about how the actor manages positions.
 type PositionStats struct {
-	Episodes         int
-	MedianAdds       float64
-	MedianReduces    float64
-	MedianCapitalIn  float64
-	MedianCapitalOut float64
-	MedianHoldSecs   float64 // closed episodes only
+	Episodes       int
+	MedianAdds     MedianStat
+	MedianReduces  MedianStat
+	MedianHoldSecs MedianStat // closed episodes only
 }
 
 // ExitStats are facts about how the actor exits.
 type ExitStats struct {
-	PartialRatio        float64 // partial-status episodes / all episodes
-	FullRatio           float64 // closed episodes / all episodes
-	MedianFirstSellSecs float64 // seconds from opening buy to first sell leg
-	MedianCloseSecs     float64 // seconds from opening buy to full close
-	TotalPnl            float64
-	ProfitableRatio     float64 // closed episodes with pnl > 0
+	// PartialExitRatio: episodes with PartialExitLegs > 0 among episodes
+	// with observable exits (at least one sell leg) — REAL partial exits,
+	// not data-gap statuses.
+	PartialExitRatio float64
+	PartialExitN     int
+	ObservableN      int // episodes with at least one visible sell leg
+
+	FirstSellP50 MedianStat // seconds from opening buy to first sell leg
+	CloseP50     MedianStat // seconds from opening buy to full close (closed only)
+
+	ClosedPnl     float64 // realized pnl of truly closed episodes
+	ClosedWinRate float64 // profitable / closed
+
+	IncompleteRatio float64 // data-gap episodes / all episodes
+	IncompletePnl   float64 // realized pnl of data-gap episodes (shown separately)
 }
 
 // ActorBehaviorProfile is the complete fact card of one actor's behavior.
@@ -56,27 +82,42 @@ type ActorBehaviorProfile struct {
 // BuildProfile computes the behavior profile from raw facts. All inputs are
 // pre-filtered to the same window by the caller.
 func BuildProfile(wallet string, episodes []storage.Episode, entries []storage.EntryRow,
-	firstSellSecs []int64, chasePcts []float64, smartPrior, kolPrior []float64) ActorBehaviorProfile {
+	chases []float64, smartPrior, kolPrior []float64) ActorBehaviorProfile {
 	p := ActorBehaviorProfile{Wallet: wallet}
 
 	// ---- ENTRY ----
 	p.Entry.Count = len(entries)
 	tokens := map[string]bool{}
-	var sizes []float64
 	var ages []float64
 	for _, e := range entries {
 		tokens[e.Token] = true
-		sizes = append(sizes, e.AmountUSD)
 		ages = append(ages, float64(e.ReceivedAt-e.TradeTime))
 	}
-	if p.Entry.Count > 0 {
-		p.Entry.TokenReuse = 1 - float64(len(tokens))/float64(p.Entry.Count)
+	p.Entry.MedianAge = median(ages)
+	if len(episodes) > 0 {
+		distinct := 0
+		seen := map[string]bool{}
+		for _, e := range episodes {
+			if !seen[e.Token] {
+				seen[e.Token] = true
+				distinct++
+			}
+		}
+		p.Entry.ReentryRate = 1 - float64(distinct)/float64(len(episodes))
 	}
-	p.Entry.MedianSize = medianF(sizes)
-	p.Entry.MedianAge = medianF(ages)
-	p.Entry.MedianChase = medianF(chasePcts)
-	p.Entry.SmartPriorP50 = medianF(smartPrior)
-	p.Entry.KOLPriorP50 = medianF(kolPrior)
+	var initBuys, addBuys, capIn []float64
+	for _, e := range episodes {
+		initBuys = append(initBuys, e.InitialBuyUSD)
+		addBuys = append(addBuys, e.AddBuyUSD)
+		capIn = append(capIn, e.CapitalIn)
+	}
+	p.Entry.MedianInitialBuy = median(initBuys)
+	p.Entry.MedianAddBuy = median(addBuys)
+	p.Entry.MedianCapitalIn = median(capIn)
+	p.Entry.MedianChase = median(chases)
+	p.Entry.SmartPriorP50 = median(smartPrior)
+	p.Entry.KOLPriorP50 = median(kolPrior)
+	p.Entry.PriorFlowN = len(smartPrior)
 	if len(smartPrior) > 0 {
 		n3 := 0
 		for _, n := range smartPrior {
@@ -89,73 +130,76 @@ func BuildProfile(wallet string, episodes []storage.Episode, entries []storage.E
 
 	// ---- POSITION ----
 	p.Position.Episodes = len(episodes)
-	var adds, reduces, capIn, capOut, holds []float64
+	var adds, reduces, holds []float64
 	for _, e := range episodes {
 		adds = append(adds, float64(e.Adds))
 		reduces = append(reduces, float64(e.Reduces))
-		capIn = append(capIn, e.CapitalIn)
-		capOut = append(capOut, e.CapitalOut)
-		if e.ClosedAt > 0 {
+		if e.Status == storage.EpisodeClosed {
 			holds = append(holds, float64(e.HoldDurationS))
 		}
 	}
-	p.Position.MedianAdds = medianF(adds)
-	p.Position.MedianReduces = medianF(reduces)
-	p.Position.MedianCapitalIn = medianF(capIn)
-	p.Position.MedianCapitalOut = medianF(capOut)
-	p.Position.MedianHoldSecs = medianF(holds)
+	p.Position.MedianAdds = median(adds)
+	p.Position.MedianReduces = median(reduces)
+	p.Position.MedianHoldSecs = median(holds)
 
 	// ---- EXIT ----
-	if len(episodes) > 0 {
-		closed, partial := 0, 0
-		for _, e := range episodes {
-			switch e.Status {
-			case storage.EpisodeClosed:
-				closed++
-			case storage.EpisodePartial:
-				partial++
-			}
-		}
-		p.Exit.PartialRatio = float64(partial) / float64(len(episodes))
-		p.Exit.FullRatio = float64(closed) / float64(len(episodes))
-	}
-	p.Exit.MedianFirstSellSecs = medianF(toF64(firstSellSecs))
-	var closeSecs []float64
-	var wins int
-	var winsN int
+	var observable, partialN int
+	var firstSells, closes []float64
+	var closedN, closedWins int
+	var incompleteN int
 	for _, e := range episodes {
-		if e.ClosedAt > 0 {
-			closeSecs = append(closeSecs, float64(e.HoldDurationS))
-			p.Exit.TotalPnl += e.RealizedPnL
-			winsN++
+		if e.DataGap {
+			incompleteN++
+			p.Exit.IncompletePnl += e.RealizedPnL
+		}
+		// partial-exit behavior only makes sense for fully visible episodes:
+		// a data-gap episode's opening buy is unseen, so its sell timing and
+		// exit behavior are not attributable.
+		if e.SellLegs > 0 && !e.DataGap {
+			observable++
+			if e.PartialExitLegs > 0 {
+				partialN++
+			}
+			if e.FirstSellAt > 0 {
+				firstSells = append(firstSells, float64(e.FirstSellAt-e.OpenedAt))
+			}
+		}
+		if e.Status == storage.EpisodeClosed {
+			closes = append(closes, float64(e.HoldDurationS))
+			p.Exit.ClosedPnl += e.RealizedPnL
+			closedN++
 			if e.RealizedPnL > 0 {
-				wins++
+				closedWins++
 			}
 		}
 	}
-	p.Exit.MedianCloseSecs = medianF(closeSecs)
-	if winsN > 0 {
-		p.Exit.ProfitableRatio = float64(wins) / float64(winsN)
+	p.Exit.FirstSellP50 = median(firstSells)
+	p.Exit.CloseP50 = median(closes)
+	p.Exit.ObservableN = observable
+	if observable > 0 {
+		p.Exit.PartialExitRatio = float64(partialN) / float64(observable)
+		p.Exit.PartialExitN = partialN
+	}
+	if closedN > 0 {
+		p.Exit.ClosedWinRate = float64(closedWins) / float64(closedN)
+	}
+	if len(episodes) > 0 {
+		p.Exit.IncompleteRatio = float64(incompleteN) / float64(len(episodes))
 	}
 	return p
 }
 
-func medianF(a []float64) float64 {
+func median(a []float64) MedianStat {
 	if len(a) == 0 {
-		return 0
+		return MedianStat{}
 	}
 	sort.Float64s(a)
 	mid := len(a) / 2
+	var v float64
 	if len(a)%2 == 1 {
-		return a[mid]
+		v = a[mid]
+	} else {
+		v = (a[mid-1] + a[mid]) / 2
 	}
-	return (a[mid-1] + a[mid]) / 2
-}
-
-func toF64(a []int64) []float64 {
-	out := make([]float64, len(a))
-	for i, v := range a {
-		out[i] = float64(v)
-	}
-	return out
+	return MedianStat{Value: v, N: len(a)}
 }
