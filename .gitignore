@@ -1,5 +1,11 @@
 bin/
-data/
+# data/: only the SQLite DB + raw snapshots stay local (collector privacy +
+# repo hygiene). data/reports/ (compact daily report + dated history) is
+# tracked so the longitudinal series is readable from GitHub in later
+# sessions; raw per-window snapshots stay on the collector machine.
+data/*
+!data/reports/
+data/reports/raw/
 *.db
 *.db-wal
 *.db-shm

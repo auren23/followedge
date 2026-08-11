@@ -20,6 +20,11 @@
 # REACHED is a signal for a HUMAN to review — the script never starts
 # Discovery or changes any configuration on its own.
 #
+# SYNC: the compact report (dated copy + latest) is committed and pushed to
+# the repo's origin so the longitudinal series is readable from GitHub in
+# later sessions (the SQLite DB and raw per-window snapshots stay local).
+# A sync failure only degrades to SYNC WARN — it never touches the trigger.
+#
 # Intended to run from a systemd user timer (Persistent=true) or cron.
 # No measurement/cohort/pattern-gate logic lives here — this is ops only,
 # the Go discovery code is frozen.
@@ -29,7 +34,8 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="$REPO/bin/followedge"
 REPORT="$REPO/data/reports/matrix-daily.txt"
 RAW="$REPO/data/reports/raw"
-mkdir -p "$RAW"
+HISTORY="$REPO/data/reports/history"
+mkdir -p "$RAW" "$HISTORY"
 
 # The /tmp tmpfs on this box hits its quota during go builds; point the
 # go temp/build space at local disk.
@@ -48,6 +54,24 @@ if [ ! -x "$BIN" ]; then
 fi
 
 DB_MTIME="$(stat -c '%y' "$REPO/data/followedge.db" 2>/dev/null || echo 'n/a')"
+
+# sync_report: commit + push the compact report (dated copy + latest) so it
+# is readable from GitHub in later sessions. Best-effort — a failure is a
+# SYNC WARN line in the report, never an ERROR (the trigger is about data,
+# not about sync).
+sync_report() {
+    cp "$REPORT" "$HISTORY/matrix-$DATE.txt"
+    if git -C "$REPO" status --porcelain -- data/reports | grep -q .; then
+        git -C "$REPO" add data/reports/matrix-daily.txt data/reports/history/
+        if ! git -C "$REPO" commit -q -m "chore(reports): daily matrix snapshot $DATE"; then
+            echo "SYNC WARN — git commit failed; report is local only" | tee -a "$REPORT"
+            return 0
+        fi
+        if ! git -C "$REPO" push -q; then
+            echo "SYNC WARN — git push failed; report committed locally only" | tee -a "$REPORT"
+        fi
+    fi
+}
 
 {
     echo "# Matrix Daily — $DATE (discovery freeze $FREEZE_SHA)"
@@ -72,6 +96,7 @@ for win in 24h 72h 168h; do
             echo "$matrix_out"
         } >> "$REPORT"
         echo "STATUS: ERROR — matrix command failed for $win (exit $matrix_err); trigger not evaluated" >> "$REPORT"
+        sync_report
         exit 1
     fi
 
@@ -130,4 +155,5 @@ else
 fi
 
 echo "STATUS: $status" >> "$REPORT"
+sync_report
 echo "$status"
