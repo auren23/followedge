@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# matrix-daily — daily v0.2.1 discovery snapshot (measurement freeze 4e761e9).
+#
+# Runs the three observation windows (24h/72h/168h) of the cross-actor
+# matrix and writes a compact daily report to data/reports/matrix-daily.txt;
+# full raw output is retained under data/reports/raw/. The report carries
+# the reopen-trigger check: KEEP COLLECTING until A/B/C each >= 10 (the
+# 10-15 range; default the lower bound) AND flagship pattern evaluability
+# coverage on the discovery side >= 50%.
+#
+# Intended to run from a systemd user timer (Persistent=true) or cron.
+# No measurement/cohort/pattern-gate logic lives here — this is ops only,
+# the Go discovery code is frozen.
+set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="$REPO/bin/followedge"
+REPORT="$REPO/data/reports/matrix-daily.txt"
+RAW="$REPO/data/reports/raw"
+mkdir -p "$RAW"
+
+# The /tmp tmpfs on this box hits its quota during go builds; point the
+# go temp/build space at local disk.
+export TMPDIR="${TMPDIR:-$HOME/.tmp-gotest}"
+mkdir -p "$TMPDIR"
+
+FREEZE_SHA="4e761e9"
+DATE="$(date +%Y-%m-%d)"
+THRESHOLD_A=10  # reopen range is A >= 10-15; default to the lower bound
+THRESHOLD_B=10
+THRESHOLD_C=10
+COV_GATE=50     # flagship pattern side-A evaluability coverage, percent
+
+if [ ! -x "$BIN" ]; then
+    (cd "$REPO" && go build -o "$BIN" ./cmd/followedge)
+fi
+
+DB_MTIME="$(stat -c '%y' "$REPO/data/followedge.db" 2>/dev/null || echo 'n/a')"
+
+{
+    echo "# Matrix Daily — $DATE (discovery freeze $FREEZE_SHA)"
+    echo "# gates: min-repl 20/5 · quality 30 · horizon 5m"
+    echo "# db last write: $DB_MTIME  (collector freshness)"
+    echo
+} > "$REPORT"
+
+max_a=0; max_b=0; max_c=0; max_cov=0
+
+for win in 24h 72h 168h; do
+    matrix_out="$("$BIN" actors matrix --since "$win" --horizon 5m 2>&1 || true)"
+    rank_out="$("$BIN" actors rank --since "$win" --horizon 5m --limit 20 2>&1 || true)"
+    echo "$matrix_out" > "$RAW/matrix-daily-$DATE-$win.txt"
+    echo "$rank_out"   > "$RAW/matrix-daily-$DATE-$win-rank.txt"
+
+    # OUTCOME 2x2: "  quality high  A      6      B      4"
+    a=$(echo "$matrix_out" | awk '/quality high/ {print $4}'); a=${a:-0}
+    b=$(echo "$matrix_out" | awk '/quality high/ {print $6}'); b=${b:-0}
+    c=$(echo "$matrix_out" | awk '/quality low/  {print $4}'); c=${c:-0}
+    d=$(echo "$matrix_out" | awk '/quality low/  {print $6}'); d=${d:-0}
+    # EVIDENCE COVERAGE: "  A    15   0    150   9   6    150" (research = $7)
+    ra=$(echo "$matrix_out" | awk '/^  A /{print $7}'); ra=${ra:-0}
+    rb=$(echo "$matrix_out" | awk '/^  B /{print $7}'); rb=${rb:-0}
+    rc=$(echo "$matrix_out" | awk '/^  C /{print $7}'); rc=${rc:-0}
+    rd=$(echo "$matrix_out" | awk '/^  D /{print $7}'); rd=${rd:-0}
+    # flagship pattern side-A coverage in the PROFIT contrast (may be absent
+    # when cell A is empty — the pipeline then yields "" → 0)
+    cov=$(echo "$matrix_out" | awk '/CONTRAST: PROFIT/,0' \
+        | grep -m1 'early independent entry' \
+        | grep -o 'cov [0-9]*%' | head -1 | tr -dc '0-9' || true)
+    cov=${cov:-0}
+
+    # Track maxima for the reopen trigger: the longest window is not
+    # necessarily the largest on every metric (ConsEV can flip sign across
+    # windows), so trigger on the best-observed window.
+    [ "$a" -gt "$max_a" ] && max_a=$a
+    [ "$b" -gt "$max_b" ] && max_b=$b
+    [ "$c" -gt "$max_c" ] && max_c=$c
+    [ "$cov" -gt "$max_cov" ] && max_cov=$cov
+
+    {
+        echo "--- $win ---"
+        echo "cells:        A=$a B=$b C=$c D=$d"
+        echo "research eps: A=$ra B=$rb C=$rc D=$rd"
+        echo "flagship cov (side A): ${cov}%"
+        echo "patterns/gates:"
+        echo "$matrix_out" | sed -n '/PATTERNS — prevalence per side/,/^HYPOTHESES/p' \
+            | grep -v '^HYPOTHESES' | head -16 || true
+        echo "replication (effective N / filled / coverage): see raw/$DATE-$win-rank.txt"
+        echo
+    } >> "$REPORT"
+done
+
+if [ "$max_a" -ge "$THRESHOLD_A" ] && [ "$max_b" -ge "$THRESHOLD_B" ] \
+   && [ "$max_c" -ge "$THRESHOLD_C" ] && [ "$max_cov" -ge "$COV_GATE" ]; then
+    status="REACHED — best window A=$max_a B=$max_b C=$max_c, flagship cov=${max_cov}% >= ${COV_GATE}%; prepare Discovery window"
+else
+    status="KEEP COLLECTING — need A/B/C >= $THRESHOLD_A/$THRESHOLD_B/$THRESHOLD_C and flagship cov >= ${COV_GATE}% (best: A=$max_a B=$max_b C=$max_c cov=${max_cov}%)"
+fi
+
+echo "STATUS: $status" >> "$REPORT"
+echo "$status"
