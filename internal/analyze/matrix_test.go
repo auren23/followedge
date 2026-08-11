@@ -164,9 +164,12 @@ func TestSplitCellsPartition(t *testing.T) {
 	for i := 0; i < 9; i++ {
 		rows = append(rows, mk(tWallet(30+i), 20, -1)) // D
 	}
-	a, b, c, d, dropped, note := splitCells(rows, 30)
+	a, b, c, d, dropped, lo, hi, note := splitCells(rows, 30)
 	if len(a) != 6 || len(b) != 4 || len(c) != 3 || len(d) != 9 || dropped != 0 || note != "" {
 		t.Errorf("split = A%d B%d C%d D%d dropped %d note %q, want 6/4/3/9/0", len(a), len(b), len(c), len(d), dropped, note)
+	}
+	if lo != 5 || hi != 20 { // A median 10 → band [5, 20]
+		t.Errorf("band = %d-%d, want 5-20", lo, hi)
 	}
 	if len(a)+len(b)+len(c)+len(d)+dropped != len(rows) {
 		t.Errorf("partition lost rows: %d", len(a)+len(b)+len(c)+len(d)+dropped)
@@ -176,9 +179,55 @@ func TestSplitCellsPartition(t *testing.T) {
 	rows = []mechanism.MechanismMatrixRow{
 		mk("B_A", 30, 1), mk("B_B", 30, 0), mk("B_C", 29, 1), mk("B_D", 29, 0),
 	}
-	a, b, c, d, _, _ = splitCells(rows, 30)
+	a, b, c, d, _, _, _, _ = splitCells(rows, 30)
 	if len(a) != 1 || len(b) != 1 || len(c) != 1 || len(d) != 1 {
 		t.Errorf("boundary split = A%d B%d C%d D%d, want 1/1/1/1", len(a), len(b), len(c), len(d))
+	}
+}
+
+// TestSplitCellsBandAppliesToA is trap T12 (v0.2.1.3): the activity band
+// must be applied to cell A ITSELF, not only to B/C/D. With raw A trades
+// {10,100,100,100,1000} → median 100 → band [50,200], the 10- and 1000-trade
+// A-label actors are dropped exactly like band outliers in the other cells —
+// otherwise a pattern separation could be an activity difference in disguise.
+func TestSplitCellsBandAppliesToA(t *testing.T) {
+	mk := func(wallet string, q, consEV float64, trades int) mechanism.MechanismMatrixRow {
+		return mechanism.MechanismMatrixRow{
+			Wallet: wallet, WalletType: "sm", Quality: q, ConsEV: consEV, Trades: trades,
+		}
+	}
+	rows := []mechanism.MechanismMatrixRow{
+		mk("A1", 50, 5, 10),   // A-label, below band → dropped
+		mk("A2", 50, 5, 100),  // A
+		mk("A3", 50, 5, 100),  // A
+		mk("A4", 50, 5, 100),  // A
+		mk("A5", 50, 5, 1000), // A-label, above band → dropped
+		mk("B1", 50, -1, 60),  // B, in band
+		mk("B2", 50, -1, 300), // B, outside band → dropped
+		mk("C1", 20, 5, 70),   // C, in band
+		mk("C2", 20, 5, 5000), // C, outside band → dropped
+		mk("D1", 20, -1, 80),  // D, in band
+	}
+	a, b, c, d, dropped, lo, hi, _ := splitCells(rows, 30)
+	if lo != 50 || hi != 200 {
+		t.Fatalf("band = %d-%d, want 50-200 (raw A median 100)", lo, hi)
+	}
+	if len(a) != 3 || len(b) != 1 || len(c) != 1 || len(d) != 1 || dropped != 4 {
+		t.Errorf("split = A%d B%d C%d D%d dropped %d, want 3/1/1/1/4", len(a), len(b), len(c), len(d), dropped)
+	}
+	for _, r := range a {
+		if r.Wallet == "A1" || r.Wallet == "A5" {
+			t.Errorf("band outlier %s leaked into cell A: %+v", r.Wallet, a)
+		}
+	}
+	wallets := map[string]bool{}
+	for _, r := range a {
+		wallets[r.Wallet] = true
+	}
+	for _, w := range []string{"A2", "A3", "A4"} {
+		if !wallets[w] {
+			t.Errorf("cell A missing %s: %+v", w, a)
+		}
 	}
 }
 

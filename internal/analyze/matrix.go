@@ -79,16 +79,15 @@ func Matrix(w io.Writer, s *storage.Store, since time.Time, horizon, grace time.
 		return nil
 	}
 
-	a, b, c, d, dropped, bandNote := splitCells(rows, minQuality)
+	a, b, c, d, dropped, bandLo, bandHi, bandNote := splitCells(rows, minQuality)
 
 	fmt.Fprintf(w, "MECHANISM MATRIX (since %s, horizon %v, quality gate %.0f)\n",
 		since.Format("2006-01-02"), horizon, minQuality)
 	if bandNote != "" {
 		fmt.Fprintf(w, "  %s\n", bandNote)
 	} else {
-		med := medianInt(rowsOf(a))
-		fmt.Fprintf(w, "  matching: activity band %d-%d trades (cell A median %d) · wallet types %s\n",
-			int(float64(med)*0.5), int(float64(med)*2.0), med, typeSummary(typesOf(a)))
+		fmt.Fprintf(w, "  matching: activity band %d-%d trades (cell A raw median) · wallet types %s\n",
+			bandLo, bandHi, typeSummary(typesOf(a)))
 	}
 	if excluded > 0 {
 		fmt.Fprintf(w, "  (%d actors excluded: no replication evidence or below the sample gate)\n", excluded)
@@ -191,25 +190,33 @@ func matrixRowFor(s *storage.Store, a *Actor, since time.Time, clusterWindow tim
 }
 
 // splitCells partitions repl-eligible rows into the Quality × Replicability
-// 2×2 outcome cells (v0.2.1.2):
+// 2×2 outcome cells (v0.2.1.2, band applied to ALL four cells in
+// v0.2.1.3):
 //
 //	              ConsEV > 0      ConsEV <= 0
 //	Quality >= g   A (target)     B
 //	Quality <  g   C              D
 //
-// The activity band (trades within [0.5, 2] × A's median) and the wallet-type
-// set are computed ONCE from cell A and applied to every cell — cells differ
-// in OUTCOME, not in who they are. Rows outside the band are dropped and
-// counted. If cell A is empty the band cannot be derived: rows are bucketed
-// by labels only and a note is returned (no contrast can run — both involve
-// A, but the 2×2 layout stays printable as the diagnostic).
-func splitCells(rows []mechanism.MechanismMatrixRow, minQuality float64) (a, b, c, d []mechanism.MechanismMatrixRow, dropped int, bandNote string) {
+// The activity band (trades within [0.5, 2] × the RAW A median) and the
+// wallet-type set are derived from cell A's candidates, then applied in ONE
+// pass to EVERY row — cells differ in OUTCOME, not in who they are, and
+// cell A is band-matched exactly like B/C/D (an A-label outlier can never
+// confound the contrasts with an activity difference). Rows outside the
+// band are dropped and counted. If cell A has no candidates the band cannot
+// be derived: rows are bucketed by labels only and a note is returned (no
+// contrast can run — both involve A, but the 2×2 layout stays printable as
+// the diagnostic).
+func splitCells(rows []mechanism.MechanismMatrixRow, minQuality float64) (a, b, c, d []mechanism.MechanismMatrixRow, dropped int, bandLo, bandHi int, bandNote string) {
+	// Pass 1: rawA = all A-LABEL rows (unfiltered) — the band's derivation
+	// population. Only the median and type set of rawA matter; A itself is
+	// band-filtered in pass 2 like every other cell.
+	var rawA []mechanism.MechanismMatrixRow
 	for _, r := range rows {
 		if r.ConsEV > 0 && r.Quality >= minQuality {
-			a = append(a, r)
+			rawA = append(rawA, r)
 		}
 	}
-	if len(a) == 0 {
+	if len(rawA) == 0 {
 		for _, r := range rows {
 			switch {
 			case r.Quality >= minQuality:
@@ -220,26 +227,28 @@ func splitCells(rows []mechanism.MechanismMatrixRow, minQuality float64) (a, b, 
 				d = append(d, r)
 			}
 		}
-		return a, b, c, d, 0, "(no cell A — activity band unavailable; all rows bucketed by label)"
+		return a, b, c, d, 0, 0, 0, "(no cell A — activity band unavailable; all rows bucketed by label)"
 	}
 	var trades []int
 	types := map[string]bool{}
-	for _, r := range a {
+	for _, r := range rawA {
 		trades = append(trades, r.Trades)
 		types[r.WalletType] = true
 	}
 	sort.Ints(trades)
 	med := trades[len(trades)/2]
-	lo, hi := float64(med)*0.5, float64(med)*2.0
+	bandLo, bandHi = int(float64(med)*0.5), int(float64(med)*2.0)
+
+	// Pass 2: ONE band-filtered pass over ALL rows — A/B/C/D all come from
+	// the same matched population.
 	for _, r := range rows {
-		if r.ConsEV > 0 && r.Quality >= minQuality {
-			continue // already cell A
-		}
-		if float64(r.Trades) < lo || float64(r.Trades) > hi || !types[r.WalletType] {
+		if r.Trades < bandLo || r.Trades > bandHi || !types[r.WalletType] {
 			dropped++
 			continue
 		}
 		switch {
+		case r.ConsEV > 0 && r.Quality >= minQuality:
+			a = append(a, r)
 		case r.Quality >= minQuality:
 			b = append(b, r)
 		case r.ConsEV > 0:
@@ -248,7 +257,7 @@ func splitCells(rows []mechanism.MechanismMatrixRow, minQuality float64) (a, b, 
 			d = append(d, r)
 		}
 	}
-	return a, b, c, d, dropped, ""
+	return a, b, c, d, dropped, bandLo, bandHi, ""
 }
 
 // runContrast prints one contrast's header + PATTERNS table and returns the
@@ -507,22 +516,6 @@ func shortAddr(a string) string {
 		return a
 	}
 	return a[:6] + "..." + a[len(a)-4:]
-}
-
-func rowsOf(rows []mechanism.MechanismMatrixRow) []int {
-	out := make([]int, 0, len(rows))
-	for _, r := range rows {
-		out = append(out, r.Trades)
-	}
-	return out
-}
-
-func medianInt(vals []int) int {
-	if len(vals) == 0 {
-		return 0
-	}
-	sort.Ints(vals)
-	return vals[len(vals)/2]
 }
 
 func typesOf(rows []mechanism.MechanismMatrixRow) map[string]int {
