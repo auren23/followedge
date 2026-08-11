@@ -27,7 +27,7 @@ import (
 	"github.com/auren23/followedge/internal/storage"
 )
 
-const version = "0.2.1.1-mechanism-matrix"
+const version = "0.2.1.2-matrix-integrity"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -74,6 +74,8 @@ usage:
   followedge actors inspect [--config ...] <wallet> [--since 24h]
   followedge actors behavior [--config ...] <wallet> [--since 24h] [--horizon 5m]
   followedge actors matrix [--config ...] [--since 24h] [--horizon 5m] [--min-quality 30]
+                             [--min-side-a-n 5] [--min-side-b-n 5] [--min-side-*-coverage 0.5]
+                             [--max-coverage-gap 0.30] [--min-prevalence 0.40] [--min-separation 0.25]
   followedge analyze latency   [--config ...] [--since 1h]
   followedge analyze latency-ev [--config ...] [--horizon 5m] [--side buy] [--by-chase]
   followedge analyze chase     [--config ...] [--horizon 30s] [--side buy]
@@ -271,6 +273,13 @@ func cmdActors(ctx context.Context, args []string) error {
 	minReplMarket := fs.Int("min-repl-market", 20, "min effective market rows (filled + market loss) for frontier/replication sort eligibility")
 	minReplFilled := fs.Int("min-repl-filled", 5, "min filled replication rows for frontier/replication sort eligibility")
 	minQuality := fs.Float64("min-quality", 30, "target cohort quality gate (matrix)")
+	minSideAN := fs.Int("min-side-a-n", 5, "matrix: min evaluable actors, discovery side A")
+	minSideBN := fs.Int("min-side-b-n", 5, "matrix: min evaluable actors, comparison side B (P0 gate)")
+	minSideACoverage := fs.Float64("min-side-a-coverage", 0.5, "matrix: min evaluable fraction of side A's cell")
+	minSideBCoverage := fs.Float64("min-side-b-coverage", 0.5, "matrix: min evaluable fraction of side B's cell")
+	maxCoverageGap := fs.Float64("max-coverage-gap", 0.30, "matrix: max |coverageA - coverageB|")
+	minPrevalence := fs.Float64("min-prevalence", 0.40, "matrix: min prevalence on the discovery side")
+	minSeparation := fs.Float64("min-separation", 0.25, "matrix: min prevalence separation vs the comparison side")
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
@@ -332,8 +341,16 @@ func cmdActors(ctx context.Context, args []string) error {
 		if len(windows) > 0 {
 			clusterWindow = windows[0]
 		}
-		opts := mechanism.DefaultHypothesisOpts()
-		opts.Window = *sinceStr
+		opts := mechanism.HypothesisOpts{
+			MinSideAN:          *minSideAN,
+			MinSideBN:          *minSideBN,
+			MinSideAPrevalence: *minPrevalence,
+			MinSeparation:      *minSeparation,
+			MinSideACoverage:   *minSideACoverage,
+			MinSideBCoverage:   *minSideBCoverage,
+			MaxCoverageGap:     *maxCoverageGap,
+			Window:             *sinceStr,
+		}
 		return analyze.Matrix(os.Stdout, store, sinceT, h, cfg.Markout.Grace,
 			*noExitLoss, clusterWindow, *minReplMarket, *minReplFilled,
 			*minQuality, opts)

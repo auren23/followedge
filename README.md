@@ -2,7 +2,7 @@
 
 **Profit Actor Discovery & Strategy Replication Engine.**
 
-版本：`v0.2.1.1-mechanism-matrix`。
+版本：`v0.2.1.2-matrix-integrity`。
 
 核心问题不是"哪些信号可以买"，而是：
 
@@ -78,7 +78,7 @@ bin/followedge analyze clusters --window 60s      # 钱包汇聚分布
 | `actors rank` | Actor 排行榜：Quality + coverage-aware Replication census（`--sort` / `--frontier`） |
 | `actors inspect <wallet>` | 单个 actor 研究卡：PnL 事实 + 证据等级 + 各 horizon EV 衰减 |
 | `actors behavior <wallet>` | 单个 actor 行为画像：entry（initial/add、chase、prior flow）、position、exit，双证据通道（confirmed/inferred） |
-| `actors matrix` | **Cross-Actor 机制矩阵**：profitable+copyable TARGET vs CONTROL cohort，行为特征对比 + 模式 prevalence + 可审计 hypothesis（`--min-quality`） |
+| `actors matrix` | **Cross-Actor 机制矩阵**：Quality × Replicability 2×2 outcome cells（A/B/C/D），Profit（A vs C）+ Copyability（A vs B）双 contrast，覆盖度门 + 可审计 hypothesis（`--min-side-a-n` / `--min-side-b-n` / `--min-*-coverage` / `--max-coverage-gap` / `--min-prevalence` / `--min-separation`） |
 | `analyze latency` | 源延迟分布（trade_time → received_at） |
 | `analyze latency-ev` | **source-age × follower EV**（DUE/FILLED/COVER + 保守 EV；`--by-chase` 二维矩阵）|
 | `analyze coverage` | markout 状态普查（filled/no_candle/token_inactive/...）—— selection bias 防线 |
@@ -155,7 +155,8 @@ edge 都必须扛住它。样本量远不够下结论，继续积累 5,000+ even
 | `v0.2.0.4-behavior-freeze` | positionBook 生命周期（full close 重置 peak）、OriginKnown 左审查、ClassifiedEntry 拆 TokenAmount/AmountUSD、RebuildEpisodes 明确 legacy/debug 缓存 |
 | `v0.2.0.5-censoring-semantics` | OriginKnown bool → OriginQuality 三态（Censored/VisibleZero/ConfirmedZero）：可见账本归零 ≠ 真实仓位归零，Confirmed 目前无数据源可达 |
 | `v0.2.1-mechanism-evidence` | 双证据通道：全部统计以 confirmed / inferred 双列输出（Strict=ConfirmedZero，Research=VisibleZero+ConfirmedZero 排除 Censored/DataGap）；Oversold 降级 origin 回 Censored；pnl 拆互斥三桶（research / censored-complete / data-gap）；trap：生产路径永不产生 Confirmed |
-| `v0.2.1.1-mechanism-matrix`（本版） | Entry↔Episode 最终证据血缘（单遍 `ReconstructBehaviorFor`：episode finalize 后统一赋 OriginQuality/DataGap，episode 说不可信 entry 必不可信）；`EvidenceCounts` 统一 provenance（Matrix/CLI/Hypothesis 同源）；ReentryRate 改为 reconstruction 期固定的 `IsReentry`（censored 首次 episode 也算 re-entry）；Cross-Actor Matrix：TARGET（ConsEV>0+Quality gate）vs CONTROL（activity-band 匹配），label 不进特征向量，pattern prevalence 分离门槛 → `MechanismHypothesis`（INFERRED/DISCOVERED，先可审计假设不做 KMeans） |
+| `v0.2.1.1-mechanism-matrix` | Entry↔Episode 最终证据血缘（单遍 `ReconstructBehaviorFor`：episode finalize 后统一赋 OriginQuality/DataGap，episode 说不可信 entry 必不可信）；`EvidenceCounts` 统一 provenance（Matrix/CLI/Hypothesis 同源）；ReentryRate 改为 reconstruction 期固定的 `IsReentry`（censored 首次 episode 也算 re-entry）；Cross-Actor Matrix：TARGET（ConsEV>0+Quality gate）vs CONTROL（activity-band 匹配），label 不进特征向量，pattern prevalence 分离门槛 → `MechanismHypothesis`（INFERRED/DISCOVERED，先可审计假设不做 KMeans） |
+| `v0.2.1.2-matrix-integrity`（本版） | Matrix 研究完整性：`MinSideBN`（P0：零 evaluable control 永不毕业）；evaluability coverage 门（双侧 ≥50% + `|Δcoverage|≤30pp`，float-epsilon 边界）；**Quality × Replicability 2×2 outcome matrix**（A/B/C/D，Profit=A vs C / Copyability=A vs B 双 contrast，D 仅诊断，旧 TARGET/CONTROL 删除）；hypothesis 诚实 N（total/evaluable/matched actor+episode，`MatchedEpisodeN` 只累加 matched actor）；行为卡/矩阵列名统一 `confirmed   research`（StrictN/ResearchN） |
 | `v0.2.1-mechanism` | Mechanism Analyzer（他靠什么赚钱）、Hypothesis 注册、archetype 聚类 |
 | `v0.3.0-experiment` | Replay/Experiment Engine（train/val/test）、Strategy 血缘注册 |
 | `v0.4.0-shadow` | 实时 Shadow Copy + Strategy Clone |

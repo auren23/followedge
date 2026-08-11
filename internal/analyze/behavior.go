@@ -135,15 +135,17 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 	prof := mechanism.BuildProfile(wallet, episodes, facts)
 
 	fmt.Fprintf(w, "\nBEHAVIOR COHORT — positions opened since %s\n", since.Format("2006-01-02"))
-	fmt.Fprintf(w, "\n                         confirmed   inferred\n")
+	fmt.Fprintf(w, "\n                         confirmed   research\n")
 	fmt.Fprintf(w, "\nENTRY\n")
-	fmt.Fprintf(w, "  initial buys        %-11s %-11s (%d censored, %d gap, origin unknown)\n",
-		fmt.Sprintf("%d", prof.Entry.Initial.Confirmed),
-		fmt.Sprintf("%d", prof.Entry.Initial.Visible),
+	fmt.Fprintf(w, "  initial buys        %-11s %-11s  confirmed %d · visible %d · censored %d · gap %d\n",
+		fmt.Sprintf("%d", prof.Entry.Initial.StrictN()),
+		fmt.Sprintf("%d", prof.Entry.Initial.ResearchN()),
+		prof.Entry.Initial.Confirmed, prof.Entry.Initial.Visible,
 		prof.Entry.Initial.Censored, prof.Entry.Initial.DataGap)
-	fmt.Fprintf(w, "  add buys            %-11s %-11s (%d censored, %d gap, origin unknown)\n",
-		fmt.Sprintf("%d", prof.Entry.Add.Confirmed),
-		fmt.Sprintf("%d", prof.Entry.Add.Visible),
+	fmt.Fprintf(w, "  add buys            %-11s %-11s  confirmed %d · visible %d · censored %d · gap %d\n",
+		fmt.Sprintf("%d", prof.Entry.Add.StrictN()),
+		fmt.Sprintf("%d", prof.Entry.Add.ResearchN()),
+		prof.Entry.Add.Confirmed, prof.Entry.Add.Visible,
 		prof.Entry.Add.Censored, prof.Entry.Add.DataGap)
 	fmt.Fprintf(w, "  reentry rate        %s\n", twoPct(prof.Entry.ReentryRate))
 	fmt.Fprintf(w, "  initial buy         %s\n", twoUsd(prof.Entry.MedianInitialBuy))
@@ -158,7 +160,7 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 	fmt.Fprintf(w, "  prior KOL P50       %s\n", twoNum(prof.Entry.KOLPriorP50))
 	fmt.Fprintf(w, "  cluster >=3         %s\n", twoPct(prof.Entry.Cluster3Plus))
 	fmt.Fprintf(w, "\nPOSITION\n")
-	fmt.Fprintf(w, "  episodes            %d  (confirmed %d · inferred %d · censored %d · gap %d)\n",
+	fmt.Fprintf(w, "  episodes            %d  (confirmed %d · visible %d · censored %d · gap %d)\n",
 		prof.Position.Episodes,
 		prof.Position.Evidence.Confirmed, prof.Position.Evidence.Visible,
 		prof.Position.Evidence.Censored, prof.Position.Evidence.DataGap)
@@ -176,7 +178,7 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 		fmt.Fprintf(w, "  censored pnl        $%.0f (origin unknown, complete data)\n", prof.Exit.CensoredPnl)
 	}
 	fmt.Fprintf(w, "\n  confirmed = independently proven zero balance (no source yet → n/a)\n")
-	fmt.Fprintf(w, "  inferred  = visible ledger zero — research use only, never fact\n")
+	fmt.Fprintf(w, "  research  = visible + confirmed zero balance — research use only, never fact\n")
 	return nil
 }
 

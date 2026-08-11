@@ -1,16 +1,31 @@
-// Matrix and hypothesis contracts (v0.2.1.1): the cross-actor mechanism
-// matrix keeps OUTCOME LABELS strictly separate from BEHAVIOR FEATURES —
-// Quality / ConsEV are labels, never clustering input — and produces
-// AUDITABLE hypotheses by comparing a TARGET cohort against a CONTROL
-// cohort on hand-defined, interpretable patterns.
+// Matrix and hypothesis contracts (v0.2.1.2 — research-integrity): the
+// cross-actor mechanism matrix keeps OUTCOME LABELS strictly separate from
+// BEHAVIOR FEATURES — Quality / ConsEV are labels, never clustering input —
+// and produces AUDITABLE hypotheses by comparing outcome cells on
+// hand-defined, interpretable patterns.
 //
-// Deliberately no KMeans: a cluster's story is only as good as the
-// prevalence separation behind it. "11/15 target vs 3/18 control" is a
-// hypothesis; "cluster #3 = swing traders" is a story.
+// The mechanism layer is OUTCOME-AGNOSTIC: it measures "does pattern P
+// separate population X from population Y" (sideA vs sideB) with no
+// knowledge of Quality/ConsEV. The analyze layer decides WHICH populations
+// to compare (the Quality × Replicability 2×2: profit = A vs C, copyability
+// = A vs B) and stamps the contrast name.
+//
+// Research-integrity gates (v0.2.1.2):
+//   - MinSideBN: zero evaluable comparison actors can never graduate a
+//     hypothesis — missing control evidence is NOT 0% prevalence (P0).
+//   - Coverage gates: a pattern is only claimable where its features are
+//     observable, on a representative fraction of each side's cell, and the
+//     two sides' evaluability fractions must be comparable.
+//   - Honest Ns: hypotheses expose total/evaluable/matched actor AND episode
+//     counts per side; MatchedEpisodeN sums only the matched actors.
+//
+// Deliberately no KMeans: "11/15 target vs 3/18 control" is a hypothesis;
+// "cluster #3 = swing traders" is a story.
 package mechanism
 
 import (
 	"fmt"
+	"math"
 	"sort"
 
 	"github.com/auren23/followedge/internal/storage"
@@ -198,37 +213,61 @@ func (p Pattern) matches(r *MechanismMatrixRow) (bool, bool) {
 	return true, true
 }
 
-// PatternPrevalence is one pattern's support in each cohort (denominators
-// exclude actors whose referenced features were missing).
-type PatternPrevalence struct {
-	Name       string
-	TargetN    int
-	TargetHit  int
-	ControlN   int
-	ControlHit int
+// evaluatePattern is the single walk shared by EvaluatePatterns and
+// GenerateHypotheses: it returns the indices of rows where the pattern was
+// evaluable and where it matched, so prevalence numbers and episode sums
+// come from the SAME walk and can never disagree.
+func evaluatePattern(p Pattern, rows []MechanismMatrixRow) (evaluable, matched []int) {
+	for i := range rows {
+		if m, ok := p.matches(&rows[i]); ok {
+			evaluable = append(evaluable, i)
+			if m {
+				matched = append(matched, i)
+			}
+		}
+	}
+	return
 }
 
-// EvaluatePatterns measures every pattern's prevalence in both cohorts.
-func EvaluatePatterns(target, control []MechanismMatrixRow, patterns []Pattern) []PatternPrevalence {
+// PatternPrevalence is one pattern's support in each side, WITH cohort
+// totals (v0.2.1.2): the denominator is the evaluable count, but the total
+// cohort size is carried so evaluability coverage is gated and visible.
+type PatternPrevalence struct {
+	Name string
+	// SideATotal/SideBTotal are the side's cell size (band-matched population
+	// — rows dropped by the activity/wallet band are excluded here and
+	// reported separately).
+	SideATotal int
+	SideAN     int // rows where the pattern was evaluable
+	SideAHit   int // evaluable rows that matched
+	SideBTotal int
+	SideBN     int
+	SideBHit   int
+}
+
+// SideACoverage / SideBCoverage: the evaluable fraction of each side's cell.
+func (p PatternPrevalence) SideACoverage() float64 { return coverage(p.SideAN, p.SideATotal) }
+func (p PatternPrevalence) SideBCoverage() float64 { return coverage(p.SideBN, p.SideBTotal) }
+
+// coverage: the evaluable fraction of a cohort. A cohort with zero rows has
+// coverage 0 — nothing observable, never 100%, never NaN.
+func coverage(n, total int) float64 {
+	if total == 0 {
+		return 0
+	}
+	return float64(n) / float64(total)
+}
+
+// EvaluatePatterns measures every pattern's prevalence and evaluability in
+// both sides.
+func EvaluatePatterns(sideA, sideB []MechanismMatrixRow, patterns []Pattern) []PatternPrevalence {
 	out := make([]PatternPrevalence, 0, len(patterns))
 	for _, p := range patterns {
-		pp := PatternPrevalence{Name: p.Name}
-		for _, r := range target {
-			if m, ok := p.matches(&r); ok {
-				pp.TargetN++
-				if m {
-					pp.TargetHit++
-				}
-			}
-		}
-		for _, r := range control {
-			if m, ok := p.matches(&r); ok {
-				pp.ControlN++
-				if m {
-					pp.ControlHit++
-				}
-			}
-		}
+		pp := PatternPrevalence{Name: p.Name, SideATotal: len(sideA), SideBTotal: len(sideB)}
+		evA, maA := evaluatePattern(p, sideA)
+		pp.SideAN, pp.SideAHit = len(evA), len(maA)
+		evB, maB := evaluatePattern(p, sideB)
+		pp.SideBN, pp.SideBHit = len(evB), len(maB)
 		out = append(out, pp)
 	}
 	return out
@@ -243,7 +282,7 @@ const (
 	EvidenceProvisional EvidenceLevel = "PROVISIONAL" // a hunch, not yet measured
 )
 
-// HypothesisStatus is the hypothesis' lifecycle state. v0.2.1.1 only ever
+// HypothesisStatus is the hypothesis' lifecycle state. v0.2.1.x only ever
 // produces DISCOVERED; TESTING/SUPPORTED/REJECTED are for the replication
 // milestone (holdout cohort / out-of-sample).
 type HypothesisStatus string
@@ -255,97 +294,179 @@ const (
 	HypothesisRejected   HypothesisStatus = "REJECTED"
 )
 
+// SideSupport is one side's honest hypothesis evidence (v0.2.1.2): the
+// three actor counts and the two episode counts. TotalN == the side's cell
+// size; EvaluableEpisodeN / MatchedEpisodeN sum research episodes over
+// evaluable / matched rows ONLY — cohort episodes of non-evaluable or
+// non-matching actors are never hypothesis evidence.
+type SideSupport struct {
+	TotalN            int // all rows in the contrast side's cohort (cell)
+	EvaluableN        int // rows where the pattern was evaluable
+	MatchedN          int // evaluable rows that matched
+	EvaluableEpisodeN int // Σ research episodes over EVALUABLE rows
+	MatchedEpisodeN   int // Σ research episodes over MATCHED rows
+}
+
+// Prevalence is the matched fraction of the evaluable side (0 when nothing
+// evaluable — never NaN, never a fabricated 0% claim on no data).
+func (s SideSupport) Prevalence() float64 {
+	if s.EvaluableN == 0 {
+		return 0
+	}
+	return float64(s.MatchedN) / float64(s.EvaluableN)
+}
+
 // MechanismHypothesis is an AUDITABLE candidate mechanism: the exact
-// conditions, the target/control prevalence it came from, and the evidence
-// level it is allowed to claim. No cluster names, no stories — only this.
+// conditions, both sides' full support, and the evidence level it is
+// allowed to claim. No cluster names, no stories — only this.
+//
+// Contrast is stamped by the analyze layer ("profit" | "copyability");
+// SourceActors are the side-A (discovery-side) matched actors. Hypotheses
+// across the two contrasts share the cell-A discovery side and are NOT
+// independent confirmations.
 type MechanismHypothesis struct {
 	ID              string
 	Name            string
+	Contrast        string
 	EvidenceLevel   EvidenceLevel
 	DiscoveryWindow string
-	ActorN          int     // target actors the pattern was evaluated on
-	EpisodeN        int     // research episodes across those target actors
-	TargetSupport   float64 // hit / evaluable target actors
-	ControlSupport  float64
+	SideA           SideSupport
+	SideB           SideSupport
 	Conditions      []FeatureCondition
-	SourceActors    []string
+	SourceActors    []string // sorted, side-A matched actors
 	Status          HypothesisStatus
 }
 
-// HypothesisOpts gates which patterns graduate to hypotheses: minimum
-// target sample, minimum target prevalence, and minimum prevalence
-// separation vs control.
+// HypothesisOpts gates which patterns graduate to hypotheses. Two families:
+// absolute EVALUABLE-actor floors (MinSideAN/MinSideBN) and relative
+// evaluability-coverage floors on each side's cell (MinSideACoverage /
+// MinSideBCoverage), plus the coverage-gap cap and the prevalence gates.
 type HypothesisOpts struct {
-	MinTargetN          int
-	MinTargetPrevalence float64
-	MinSeparation       float64
-	Window              string
+	MinSideAN          int     // default 5 — min evaluable actors, discovery side
+	MinSideBN          int     // default 5 — min evaluable actors, comparison side (the P0 gate)
+	MinSideAPrevalence float64 // default 0.40 — min prevalence on the discovery side
+	MinSeparation      float64 // default 0.25 — min prevalence separation vs the comparison side
+	MinSideACoverage   float64 // default 0.50 — min evaluable fraction of side A's cell
+	MinSideBCoverage   float64 // default 0.50 — min evaluable fraction of side B's cell
+	MaxCoverageGap     float64 // default 0.30 — max |coverageA - coverageB|
+	Window             string  // default "24h"
 }
 
-// DefaultHypothesisOpts mirrors the review example (11/15 vs 3/18 needs
-// separation of ~0.57; 0.25 is a lenient floor for the first pass).
+// DefaultHypothesisOpts: the evidential bar is identical for both contrasts
+// (§5.13) — the owner's decision is to keep MinSideBN=5 for copyability too
+// and wait for real data if cell B is scarce.
 func DefaultHypothesisOpts() HypothesisOpts {
 	return HypothesisOpts{
-		MinTargetN:          5,
-		MinTargetPrevalence: 0.40,
-		MinSeparation:       0.25,
-		Window:              "24h",
+		MinSideAN:          5,
+		MinSideBN:          5,
+		MinSideAPrevalence: 0.40,
+		MinSeparation:      0.25,
+		MinSideACoverage:   0.50,
+		MinSideBCoverage:   0.50,
+		MaxCoverageGap:     0.30,
+		Window:             "24h",
 	}
 }
 
+// GateStatus evaluates the gate pipeline for one pattern prevalence, in
+// short-circuit order. It returns pass and, when blocked, the FIRST failing
+// gate's reason: "side-a-n", "side-b-n", "coverage-a", "coverage-b",
+// "coverage-gap", "prevalence", "separation", or "OK".
+//
+// Order (does not change outcomes; only decides the reported reason):
+//  1. SideAN >= MinSideAN AND SideBN >= MinSideBN        (P0 — no control evidence)
+//  2. coverageA >= MinSideACoverage AND coverageB >= ... (evaluability floors)
+//  3. |coverageA - coverageB| < MaxCoverageGap + 1e-9    (float-epsilon boundary)
+//  4. pA >= MinSideAPrevalence AND pA - pB >= MinSeparation
+func GateStatus(pp PatternPrevalence, opts HypothesisOpts) (bool, string) {
+	if pp.SideAN < opts.MinSideAN || pp.SideBN < opts.MinSideBN {
+		if pp.SideAN < opts.MinSideAN {
+			return false, "side-a-n"
+		}
+		return false, "side-b-n"
+	}
+	covA, covB := pp.SideACoverage(), pp.SideBCoverage()
+	if covA < opts.MinSideACoverage {
+		return false, "coverage-a"
+	}
+	if covB < opts.MinSideBCoverage {
+		return false, "coverage-b"
+	}
+	if math.Abs(covA-covB) >= opts.MaxCoverageGap+1e-9 {
+		return false, "coverage-gap"
+	}
+	pA, pB := pp.SideAHit, pp.SideBHit
+	if float64(pA) < opts.MinSideAPrevalence*float64(pp.SideAN) {
+		return false, "prevalence"
+	}
+	// pA - pB >= MinSeparation  ⇔  pA*SideBN - pB*SideAN >= MinSeparation*SideAN*SideBN
+	if float64(pA)*float64(pp.SideBN)-float64(pB)*float64(pp.SideAN) <
+		opts.MinSeparation*float64(pp.SideAN)*float64(pp.SideBN) {
+		return false, "separation"
+	}
+	return true, "OK"
+}
+
 // GenerateHypotheses turns evaluated patterns into auditable hypotheses:
-// only patterns with enough target support AND a real prevalence separation
-// vs control graduate. The evidence level is INFERRED (research channel;
-// the strict channel is empty by design on the production path) and the
-// status DISCOVERED — replication has not tested it yet.
-func GenerateHypotheses(target, control []MechanismMatrixRow, patterns []Pattern, opts HypothesisOpts) []MechanismHypothesis {
+// only patterns that clear ALL gates graduate. The evidence level is
+// INFERRED (research channel; the strict channel is empty by design on the
+// production path) and the status DISCOVERED — replication has not tested
+// it yet. IDs are numbered per call (HYP-001…); the analyze layer renumbers
+// globally across contrasts and stamps Contrast.
+func GenerateHypotheses(sideA, sideB []MechanismMatrixRow, patterns []Pattern, opts HypothesisOpts) []MechanismHypothesis {
 	byName := map[string]*Pattern{}
 	for i := range patterns {
 		byName[patterns[i].Name] = &patterns[i]
 	}
 	var out []MechanismHypothesis
-	for _, pp := range EvaluatePatterns(target, control, patterns) {
-		if pp.TargetN < opts.MinTargetN {
-			continue
-		}
-		tSup := float64(pp.TargetHit) / float64(pp.TargetN)
-		cSup := 0.0
-		if pp.ControlN > 0 {
-			cSup = float64(pp.ControlHit) / float64(pp.ControlN)
-		}
-		if tSup < opts.MinTargetPrevalence || tSup-cSup < opts.MinSeparation {
+	for _, pp := range EvaluatePatterns(sideA, sideB, patterns) {
+		if pass, _ := GateStatus(pp, opts); !pass {
 			continue
 		}
 		p := byName[pp.Name]
-		episodes := 0
+		evA, maA := evaluatePattern(*p, sideA)
+		evalEpA, matchEpA := 0, 0
+		for _, i := range evA {
+			evalEpA += sideA[i].OriginCounts.ResearchN()
+		}
 		var src []string
-		for _, r := range target {
-			episodes += r.OriginCounts.ResearchN()
-			if m, ok := p.matches(&r); ok && m {
-				src = append(src, r.Wallet)
-			}
+		for _, i := range maA {
+			matchEpA += sideA[i].OriginCounts.ResearchN()
+			src = append(src, sideA[i].Wallet)
 		}
 		sort.Strings(src)
+		evB, maB := evaluatePattern(*p, sideB)
+		evalEpB, matchEpB := 0, 0
+		for _, i := range evB {
+			evalEpB += sideB[i].OriginCounts.ResearchN()
+		}
+		for _, i := range maB {
+			matchEpB += sideB[i].OriginCounts.ResearchN()
+		}
 		out = append(out, MechanismHypothesis{
 			ID:              fmt.Sprintf("HYP-%03d", len(out)+1),
 			Name:            pp.Name,
 			EvidenceLevel:   EvidenceInferred,
 			DiscoveryWindow: opts.Window,
-			ActorN:          pp.TargetN,
-			EpisodeN:        episodes,
-			TargetSupport:   tSup,
-			ControlSupport:  cSup,
-			Conditions:      p.Conditions,
-			SourceActors:    src,
-			Status:          HypothesisDiscovered,
+			SideA: SideSupport{
+				TotalN: pp.SideATotal, EvaluableN: pp.SideAN, MatchedN: pp.SideAHit,
+				EvaluableEpisodeN: evalEpA, MatchedEpisodeN: matchEpA,
+			},
+			SideB: SideSupport{
+				TotalN: pp.SideBTotal, EvaluableN: pp.SideBN, MatchedN: pp.SideBHit,
+				EvaluableEpisodeN: evalEpB, MatchedEpisodeN: matchEpB,
+			},
+			Conditions:   p.Conditions,
+			SourceActors: src,
+			Status:       HypothesisDiscovered,
 		})
 	}
 	return out
 }
 
-// DefaultPatterns are the v0.2.1.1 candidate mechanisms: hand-defined,
-// interpretable, and compared target-vs-control. They are hypotheses to
-// test, not clusters to name. add_chase > initial_chase is expressed as a
+// DefaultPatterns are the v0.2.1.x candidate mechanisms: hand-defined,
+// interpretable, and compared side-vs-side. They are hypotheses to test,
+// not clusters to name. add_chase > initial_chase is expressed as a
 // cross-feature condition (gt_feature).
 var DefaultPatterns = []Pattern{
 	{

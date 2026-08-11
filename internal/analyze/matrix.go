@@ -3,6 +3,7 @@ package analyze
 import (
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"time"
 
@@ -10,16 +11,20 @@ import (
 	"github.com/auren23/followedge/internal/storage"
 )
 
-// Matrix builds the v0.2.1.1 cross-actor mechanism matrix: one row per
+// Matrix builds the v0.2.1.2 cross-actor mechanism matrix: one row per
 // actor with replication evidence (labels from the rank census, behavior
-// features from the RESEARCH channel of the behavior profile), splits a
-// TARGET cohort (profitable + copyable) against a CONTROL cohort (same
-// source/window, similar activity, but ConsEV <= 0 or low quality), and
-// reports pattern prevalence + generated hypotheses.
+// features from the RESEARCH channel of the behavior profile), split into
+// the Quality × Replicability 2×2 outcome cells, and compared under two
+// first-class contrasts:
+//
+//	Profit      A vs C — both ConsEV > 0, differ in actor quality
+//	Copyability A vs B — both quality-high, differ in follower ConsEV
 //
 // Labels (Quality/ConsEV/EffectiveN/...) never enter the behavior feature
-// vector: the question is whether a BEHAVIOR pattern separates the cohorts,
-// not whether the cohorts separate on their own labels.
+// vector. Every pattern prevalence is produced under BOTH contrasts with
+// coverage gates and honest per-side Ns; hypotheses graduate only when
+// both sides are measured and comparable (P0: zero evaluable comparison
+// actors can never graduate).
 func Matrix(w io.Writer, s *storage.Store, since time.Time, horizon, grace time.Duration,
 	noExitLoss float64, clusterWindow time.Duration, minReplMarket, minReplFilled int,
 	minQuality float64, opts mechanism.HypothesisOpts) error {
@@ -74,30 +79,54 @@ func Matrix(w io.Writer, s *storage.Store, since time.Time, horizon, grace time.
 		return nil
 	}
 
-	// ---- cohort split ----
-	target, control := splitCohorts(rows, minQuality)
-	excluded += len(rows) - len(target) - len(control)
+	a, b, c, d, dropped, bandNote := splitCells(rows, minQuality)
 
 	fmt.Fprintf(w, "MECHANISM MATRIX (since %s, horizon %v, quality gate %.0f)\n",
 		since.Format("2006-01-02"), horizon, minQuality)
-	fmt.Fprintf(w, "  target  = profitable + copyable: ConsEV > 0, quality >= %.0f, effective-n/coverage gate passed\n", minQuality)
-	fmt.Fprintf(w, "  control = same source & window, similar activity, but ConsEV <= 0 / below quality gate\n")
+	if bandNote != "" {
+		fmt.Fprintf(w, "  %s\n", bandNote)
+	} else {
+		med := medianInt(rowsOf(a))
+		fmt.Fprintf(w, "  matching: activity band %d-%d trades (cell A median %d) · wallet types %s\n",
+			int(float64(med)*0.5), int(float64(med)*2.0), med, typeSummary(typesOf(a)))
+	}
 	if excluded > 0 {
 		fmt.Fprintf(w, "  (%d actors excluded: no replication evidence or below the sample gate)\n", excluded)
 	}
+	if dropped > 0 {
+		fmt.Fprintf(w, "  (%d actors dropped: outside the cell-A activity/wallet band)\n", dropped)
+	}
 
-	printCohorts(w, target, control)
+	printOutcome2x2(w, a, b, c, d)
+	printCellCoverage(w, a, b, c, d)
+	printCellFeatures(w, a, b, c, d)
 
-	// ---- evidence coverage ----
-	printEvidenceCoverage(w, target, control)
-
-	// ---- features ----
-	printFeatureComparison(w, target, control)
-
-	// ---- patterns + hypotheses ----
+	// ---- contrasts (both always run) ----
 	patterns := mechanism.DefaultPatterns
-	printPatterns(w, target, control, patterns)
-	printHypotheses(w, target, control, patterns, opts)
+	profitHyps := runContrast(w, "PROFIT", "C", "profit", a, c, patterns, opts)
+	for i := range profitHyps {
+		profitHyps[i].ID = fmt.Sprintf("HYP-%03d", i+1)
+		profitHyps[i].Contrast = "profit"
+	}
+	printHypothesisBlock(w, "PROFIT (A vs C)", profitHyps, a, c, patterns, opts)
+
+	copyHyps := runContrast(w, "COPYABILITY", "B", "copyability", a, b, patterns, opts)
+	for i := range copyHyps {
+		copyHyps[i].ID = fmt.Sprintf("HYP-%03d", len(profitHyps)+i+1)
+		copyHyps[i].Contrast = "copyability"
+	}
+	printHypothesisBlock(w, "COPYABILITY (A vs B)", copyHyps, a, b, patterns, opts)
+
+	// ---- footer notes (multiplicity + precision + next step) ----
+	fmt.Fprintf(w, "\n  next step: replication cohort (ConsEV > 0, effective n >= 20) — these are DISCOVERED, not SUPPORTED\n")
+	fmt.Fprintf(w, "  note: %d patterns × 2 contrasts = %d screenings per window, re-run on overlapping cohorts —\n",
+		len(patterns), len(patterns)*2)
+	fmt.Fprintf(w, "        DISCOVERED is a screened candidate list, not a finding.\n")
+	fmt.Fprintf(w, "  note: at per-side N = %d–15 and prevalence near 0.5, SE(Δ) ranges roughly ±18–30pp (worst ~±30pp\n",
+		opts.MinSideAN)
+	fmt.Fprintf(w, "        at the gates' floors); a Δ below ~2 SE of zero is not distinguishable from noise —\n")
+	fmt.Fprintf(w, "        treat the numbers as candidates, not estimates; formal inference is deferred to the\n")
+	fmt.Fprintf(w, "        replication milestone.\n")
 	return nil
 }
 
@@ -161,118 +190,256 @@ func matrixRowFor(s *storage.Store, a *Actor, since time.Time, clusterWindow tim
 	return row, nil
 }
 
-// splitCohorts assigns repl-eligible rows to TARGET / CONTROL. Control is
-// banded to the target's activity (trade count within [0.5, 2]× of the
-// target median, wallet type from the target's set) — the two cohorts must
-// differ in OUTCOME, not in who they are.
-func splitCohorts(rows []mechanism.MechanismMatrixRow, minQuality float64) (target, control []mechanism.MechanismMatrixRow) {
+// splitCells partitions repl-eligible rows into the Quality × Replicability
+// 2×2 outcome cells (v0.2.1.2):
+//
+//	              ConsEV > 0      ConsEV <= 0
+//	Quality >= g   A (target)     B
+//	Quality <  g   C              D
+//
+// The activity band (trades within [0.5, 2] × A's median) and the wallet-type
+// set are computed ONCE from cell A and applied to every cell — cells differ
+// in OUTCOME, not in who they are. Rows outside the band are dropped and
+// counted. If cell A is empty the band cannot be derived: rows are bucketed
+// by labels only and a note is returned (no contrast can run — both involve
+// A, but the 2×2 layout stays printable as the diagnostic).
+func splitCells(rows []mechanism.MechanismMatrixRow, minQuality float64) (a, b, c, d []mechanism.MechanismMatrixRow, dropped int, bandNote string) {
 	for _, r := range rows {
 		if r.ConsEV > 0 && r.Quality >= minQuality {
-			target = append(target, r)
+			a = append(a, r)
 		}
 	}
-	if len(target) == 0 {
-		return target, nil
+	if len(a) == 0 {
+		for _, r := range rows {
+			switch {
+			case r.Quality >= minQuality:
+				b = append(b, r)
+			case r.ConsEV > 0:
+				c = append(c, r)
+			default:
+				d = append(d, r)
+			}
+		}
+		return a, b, c, d, 0, "(no cell A — activity band unavailable; all rows bucketed by label)"
 	}
-	var targetTrades []int
-	targetTypes := map[string]bool{}
-	for _, r := range target {
-		targetTrades = append(targetTrades, r.Trades)
-		targetTypes[r.WalletType] = true
+	var trades []int
+	types := map[string]bool{}
+	for _, r := range a {
+		trades = append(trades, r.Trades)
+		types[r.WalletType] = true
 	}
-	sort.Ints(targetTrades)
-	med := targetTrades[len(targetTrades)/2]
+	sort.Ints(trades)
+	med := trades[len(trades)/2]
 	lo, hi := float64(med)*0.5, float64(med)*2.0
 	for _, r := range rows {
 		if r.ConsEV > 0 && r.Quality >= minQuality {
-			continue // already target
+			continue // already cell A
 		}
-		if float64(r.Trades) < lo || float64(r.Trades) > hi {
-			continue // activity band: not comparable to the target
+		if float64(r.Trades) < lo || float64(r.Trades) > hi || !types[r.WalletType] {
+			dropped++
+			continue
 		}
-		if !targetTypes[r.WalletType] {
-			continue // wallet-type band: same kinds of actors
+		switch {
+		case r.Quality >= minQuality:
+			b = append(b, r)
+		case r.ConsEV > 0:
+			c = append(c, r)
+		default:
+			d = append(d, r)
 		}
-		control = append(control, r)
 	}
-	return target, control
+	return a, b, c, d, dropped, ""
 }
 
-func printCohorts(w io.Writer, target, control []mechanism.MechanismMatrixRow) {
-	medTrades := func(rs []mechanism.MechanismMatrixRow) (int, string) {
-		if len(rs) == 0 {
-			return 0, "-"
+// runContrast prints one contrast's header + PATTERNS table and returns the
+// hypotheses that cleared the gates (IDs per-call; the caller renumbers
+// globally and stamps the contrast). Empty side → not-evaluable note, no
+// pattern table, no hypotheses (the empty-side reporting rule).
+func runContrast(w io.Writer, name, emptyCell, contrast string,
+	sideA, sideB []mechanism.MechanismMatrixRow, patterns []mechanism.Pattern,
+	opts mechanism.HypothesisOpts) []mechanism.MechanismHypothesis {
+
+	if len(sideA) == 0 || len(sideB) == 0 {
+		cell := emptyCell
+		if len(sideA) == 0 {
+			cell = "A"
 		}
-		vals := make([]int, 0, len(rs))
-		types := map[string]int{}
-		for _, r := range rs {
-			vals = append(vals, r.Trades)
-			types[r.WalletType]++
-		}
-		sort.Ints(vals)
-		return vals[len(vals)/2], typeSummary(types)
+		fmt.Fprintf(w, "\nCONTRAST: %s — not evaluable\n", name)
+		fmt.Fprintf(w, "  (contrast not evaluable: cell %s is empty — 0 rows matched the A band)\n", cell)
+		return nil
 	}
-	medN := func(rs []mechanism.MechanismMatrixRow) (int, int) {
-		if len(rs) == 0 {
-			return 0, 0
-		}
-		vals := make([]int, 0, len(rs))
-		cov := make([]float64, 0, len(rs))
-		for _, r := range rs {
-			vals = append(vals, r.EffectiveN)
-			cov = append(cov, r.ReplCoverage)
-		}
-		sort.Ints(vals)
-		sort.Float64s(cov)
-		return vals[len(vals)/2], int(cov[len(cov)/2] * 100)
+	desc := ""
+	switch contrast {
+	case "profit":
+		desc = "both cells ConsEV > 0; the question is what separates strong from weak actors"
+	case "copyability":
+		desc = "both cells quality >= gate; the question is what separates the copyable edge"
 	}
-	fmt.Fprintf(w, "\nCOHORTS\n")
-	fmt.Fprintf(w, "  %-8s %4s %12s  %-18s %14s %12s\n", "cohort", "n", "trades(med)", "wallet types", "effN(med)", "cov(med)")
-	tr, tt := medTrades(target)
-	tn, tc := medN(target)
-	fmt.Fprintf(w, "  %-8s %4d %12d  %-18s %14d %11d%%\n", "TARGET", len(target), tr, tt, tn, tc)
-	cr, ct := medTrades(control)
-	cn, cc := medN(control)
-	fmt.Fprintf(w, "  %-8s %4d %12d  %-18s %14d %11d%%\n", "CONTROL", len(control), cr, ct, cn, cc)
-	if len(control) == 0 {
-		fmt.Fprintf(w, "  (no control cohort matched the activity band — prevalence comparisons below are one-sided)\n")
+	fmt.Fprintf(w, "\nCONTRAST: %s — %s\n", name, desc)
+
+	// data-missing is pattern-independent: rows with NO research episodes
+	// (nothing measurable for any pattern). absent is per-pattern.
+	dataMissingA := countDataMissing(sideA)
+	dataMissingB := countDataMissing(sideB)
+	labels := map[string]string{}
+	for _, p := range patterns {
+		labels[p.Name] = absentLabelFor(p)
+	}
+
+	fmt.Fprintf(w, "\nPATTERNS — prevalence per side\n")
+	fmt.Fprintf(w, "  (canonical per side: matched M/E · evaluable E/T · total T · cov P%% · un-eval U/V: N data · M label)\n")
+	fmt.Fprintf(w, "  %-44s %-52s   %-52s   %6s  %s\n", "pattern", "side A", "side B", "Δ", "gate")
+	for _, pp := range mechanism.EvaluatePatterns(sideA, sideB, patterns) {
+		label := labels[pp.Name]
+		cellA := sideCellStr(pp.SideATotal, pp.SideAN, pp.SideAHit, dataMissingA, label, 0, 0, false)
+		cellB := sideCellStr(pp.SideBTotal, pp.SideBN, pp.SideBHit, dataMissingB, label, 0, 0, false)
+		pass, reason := mechanism.GateStatus(pp, opts)
+		gate := "OK"
+		if !pass {
+			gate = reason
+		}
+		delta := "-"
+		if pp.SideAN > 0 && pp.SideBN > 0 {
+			d := float64(pp.SideAHit)/float64(pp.SideAN) - float64(pp.SideBHit)/float64(pp.SideBN)
+			delta = fmt.Sprintf("%+.0fpp", d*100)
+		}
+		fmt.Fprintf(w, "  %-44s %-52s   %-52s   %6s  %s\n", pp.Name, cellA, cellB, delta, gate)
+	}
+	return mechanism.GenerateHypotheses(sideA, sideB, patterns, opts)
+}
+
+func countDataMissing(rows []mechanism.MechanismMatrixRow) int {
+	n := 0
+	for _, r := range rows {
+		if r.OriginCounts.ResearchN() == 0 {
+			n++
+		}
+	}
+	return n
+}
+
+// absentLabelFor decides the un-eval bucket label for a pattern: the
+// bucket's internal name is "absent", NEVER printed verbatim. Patterns
+// referencing only add-family features (add_delay, add_chase — the only
+// class whose N=0 can genuinely mean "the behavior never occurred") print
+// "no-add-evidence"; every other pattern prints "unobservable", so a
+// coverage-blocked chase pattern can never read as "cell C doesn't chase".
+func absentLabelFor(p mechanism.Pattern) string {
+	addFamily := map[string]bool{mechanism.FeatureAddDelay: true, mechanism.FeatureAddChase: true}
+	for _, c := range p.Conditions {
+		if c.Op == "gt_feature" && !addFamily[c.Other] {
+			return "unobservable"
+		}
+		if !addFamily[c.Feature] {
+			return "unobservable"
+		}
+	}
+	return "no-add-evidence"
+}
+
+// sideCellStr renders the canonical per-side format shared by the PATTERNS
+// table and the HYPOTHESES block: "matched M/E · evaluable E/T · total T",
+// then context fields. withEpisodes renders "· episodes X/Y" (the REAL
+// evaluable/matched episode sums — never cohort totals); otherwise "· cov
+// P%". When coverage < 100% the un-eval split with its label is appended.
+func sideCellStr(total, n, hit, dataMissing int, label string, evalEp, matchEp int, withEpisodes bool) string {
+	s := fmt.Sprintf("matched %d/%d · evaluable %d/%d · total %d", hit, n, n, total, total)
+	if withEpisodes {
+		s += fmt.Sprintf(" · episodes %d/%d", evalEp, matchEp)
+	}
+	if n < total {
+		absent := total - n - dataMissing
+		cov := 0
+		if total > 0 {
+			cov = int(math.Round(float64(n) / float64(total) * 100))
+		}
+		s += fmt.Sprintf(" · cov %d%% (un-eval %d/%d: %d data · %d %s)", cov, total-n, total, dataMissing, absent, label)
+	} else if !withEpisodes {
+		s += " · cov 100%"
+	}
+	return s
+}
+
+func printOutcome2x2(w io.Writer, a, b, c, d []mechanism.MechanismMatrixRow) {
+	fmt.Fprintf(w, "\nOUTCOME 2×2 (matched population — every cell respects the activity/wallet band)\n")
+	fmt.Fprintf(w, "                ConsEV > 0     ConsEV <= 0\n")
+	fmt.Fprintf(w, "  quality high  A %6d      B %6d\n", len(a), len(b))
+	fmt.Fprintf(w, "  quality low   C %6d      D %6d\n", len(c), len(d))
+}
+
+func printCellCoverage(w io.Writer, a, b, c, d []mechanism.MechanismMatrixRow) {
+	fmt.Fprintf(w, "\nEVIDENCE COVERAGE (episodes per cell)\n")
+	fmt.Fprintf(w, "  cell  n    confirmed  visible  censored  gap  research\n")
+	for _, cell := range []struct {
+		name string
+		rows []mechanism.MechanismMatrixRow
+	}{{"A", a}, {"B", b}, {"C", c}, {"D", d}} {
+		var ec mechanism.EvidenceCounts
+		for _, r := range cell.rows {
+			ec.Confirmed += r.OriginCounts.Confirmed
+			ec.Visible += r.OriginCounts.Visible
+			ec.Censored += r.OriginCounts.Censored
+			ec.DataGap += r.OriginCounts.DataGap
+		}
+		fmt.Fprintf(w, "  %-4s %-4d %10d %9d %9d %5d %9d\n",
+			cell.name, len(cell.rows), ec.Confirmed, ec.Visible, ec.Censored, ec.DataGap, ec.ResearchN())
 	}
 }
 
-func typeSummary(types map[string]int) string {
-	keys := make([]string, 0, len(types))
-	for k := range types {
-		keys = append(keys, k)
+func printCellFeatures(w io.Writer, a, b, c, d []mechanism.MechanismMatrixRow) {
+	fmt.Fprintf(w, "\nFEATURES (research medians per cell — N in parens)\n")
+	fmt.Fprintf(w, "  %-18s %14s %14s %14s %14s\n", "feature", "A", "B", "C", "D")
+	for _, f := range matrixFeatures {
+		fmt.Fprintf(w, "  %-18s %14s %14s %14s %14s\n", f.label,
+			cellFeature(f, a), cellFeature(f, b), cellFeature(f, c), cellFeature(f, d))
 	}
-	sort.Strings(keys)
-	out := ""
-	for i, k := range keys {
-		if i > 0 {
-			out += " "
-		}
-		out += fmt.Sprintf("%s×%d", k, types[k])
-	}
-	return out
 }
 
-func printEvidenceCoverage(w io.Writer, target, control []mechanism.MechanismMatrixRow) {
-	sum := func(rs []mechanism.MechanismMatrixRow) mechanism.EvidenceCounts {
-		var c mechanism.EvidenceCounts
-		for _, r := range rs {
-			c.Confirmed += r.OriginCounts.Confirmed
-			c.Visible += r.OriginCounts.Visible
-			c.Censored += r.OriginCounts.Censored
-			c.DataGap += r.OriginCounts.DataGap
+func cellFeature(f featureInfo, rows []mechanism.MechanismMatrixRow) string {
+	var vals []float64
+	for _, r := range rows {
+		if m := f.get(r); m.N > 0 {
+			vals = append(vals, m.Value)
 		}
-		return c
 	}
-	t, c := sum(target), sum(control)
-	fmt.Fprintf(w, "\nEVIDENCE COVERAGE (cohort episodes)\n")
-	fmt.Fprintf(w, "  %-8s %9s %9s %9s %9s %9s\n", "cohort", "confirmed", "inferred", "censored", "gap", "researchN")
-	fmt.Fprintf(w, "  %-8s %9d %9d %9d %9d %9d\n", "TARGET", t.Confirmed, t.Visible, t.Censored, t.DataGap, t.ResearchN())
-	fmt.Fprintf(w, "  %-8s %9d %9d %9d %9d %9d\n", "CONTROL", c.Confirmed, c.Visible, c.Censored, c.DataGap, c.ResearchN())
+	if len(vals) == 0 {
+		return "n/a"
+	}
+	return fmt.Sprintf("%s (%d)", fmtFeature(median(vals), f.unit), len(vals))
 }
 
+func printHypothesisBlock(w io.Writer, name string, hyps []mechanism.MechanismHypothesis,
+	sideA, sideB []mechanism.MechanismMatrixRow, patterns []mechanism.Pattern, opts mechanism.HypothesisOpts) {
+	fmt.Fprintf(w, "\nHYPOTHESES — %s · %s · %s (research channel, not yet replicated)\n",
+		name, mechanism.HypothesisDiscovered, mechanism.EvidenceInferred)
+	if len(hyps) == 0 {
+		fmt.Fprintf(w, "  (no pattern cleared the gates: side n >= %d each, coverage >= %.0f%% each, |Δ coverage| <= %.0fpp, prevalence >= %.0f%%, separation >= %.0fpp)\n",
+			opts.MinSideAN, opts.MinSideACoverage*100, opts.MaxCoverageGap*100,
+			opts.MinSideAPrevalence*100, opts.MinSeparation*100)
+		fmt.Fprintf(w, "  (the cov / un-eval columns above show which patterns were coverage-blocked; override any gate with\n")
+		fmt.Fprintf(w, "   --min-side-a-n --min-side-b-n --min-side-a-coverage --min-side-b-coverage --max-coverage-gap --min-prevalence --min-separation)\n")
+		return
+	}
+	dmA, dmB := countDataMissing(sideA), countDataMissing(sideB)
+	labels := map[string]string{}
+	for _, p := range patterns {
+		labels[p.Name] = absentLabelFor(p)
+	}
+	for _, h := range hyps {
+		label := labels[h.Name]
+		fmt.Fprintf(w, "\n  %s  %s\n", h.ID, h.Name)
+		fmt.Fprintf(w, "    A: %s\n", sideCellStr(h.SideA.TotalN, h.SideA.EvaluableN, h.SideA.MatchedN, dmA, label,
+			h.SideA.EvaluableEpisodeN, h.SideA.MatchedEpisodeN, true))
+		fmt.Fprintf(w, "    B: %s\n", sideCellStr(h.SideB.TotalN, h.SideB.EvaluableN, h.SideB.MatchedN, dmB, label,
+			h.SideB.EvaluableEpisodeN, h.SideB.MatchedEpisodeN, true))
+		fmt.Fprintf(w, "    Δ %+.0fpp · conditions: %s\n", (h.SideA.Prevalence()-h.SideB.Prevalence())*100, condString(h.Conditions))
+		if len(h.SourceActors) > 0 {
+			fmt.Fprintf(w, "    source actors (A): %s\n", joinWallets(h.SourceActors))
+		}
+	}
+}
+
+// featureInfo and matrixFeatures drive the per-cell FEATURES table.
 type featureInfo struct {
 	key   string
 	label string
@@ -304,79 +471,6 @@ func fmtFeature(v float64, unit string) string {
 	default:
 		return fmt.Sprintf("%.1f", v)
 	}
-}
-
-func printFeatureComparison(w io.Writer, target, control []mechanism.MechanismMatrixRow) {
-	fmt.Fprintf(w, "\nFEATURES (research channel — cohort medians of per-actor medians)\n")
-	fmt.Fprintf(w, "  %-20s %-18s %-18s %s\n", "feature", "target", "control", "present t/c")
-	coh := func(rs []mechanism.MechanismMatrixRow, get func(mechanism.MechanismMatrixRow) mechanism.MedianStat) (mechanism.MedianStat, int) {
-		var vals []float64
-		for _, r := range rs {
-			if m := get(r); m.N > 0 {
-				vals = append(vals, m.Value)
-			}
-		}
-		if len(vals) == 0 {
-			return mechanism.MedianStat{}, 0
-		}
-		return mechanism.MedianStat{Value: median(vals), N: len(vals)}, len(vals)
-	}
-	for _, f := range matrixFeatures {
-		tm, tn := coh(target, f.get)
-		cm, cn := coh(control, f.get)
-		tStr := "n/a"
-		if tn > 0 {
-			tStr = fmt.Sprintf("%s (%d)", fmtFeature(tm.Value, f.unit), tn)
-		}
-		cStr := "n/a"
-		if cn > 0 {
-			cStr = fmt.Sprintf("%s (%d)", fmtFeature(cm.Value, f.unit), cn)
-		}
-		fmt.Fprintf(w, "  %-20s %-18s %-18s %d/%d · %d/%d\n", f.label, tStr, cStr, tn, len(target), cn, len(control))
-	}
-}
-
-func printPatterns(w io.Writer, target, control []mechanism.MechanismMatrixRow, patterns []mechanism.Pattern) {
-	fmt.Fprintf(w, "\nPATTERNS — prevalence (matched / evaluable)\n")
-	fmt.Fprintf(w, "  %-52s %-16s %-16s %s\n", "pattern", "target", "control", "Δ")
-	for _, pp := range mechanism.EvaluatePatterns(target, control, patterns) {
-		tStr, cStr := "n/a", "n/a"
-		delta := "-"
-		if pp.TargetN > 0 {
-			tSup := float64(pp.TargetHit) / float64(pp.TargetN)
-			tStr = fmt.Sprintf("%d/%d %.0f%%", pp.TargetHit, pp.TargetN, tSup*100)
-		}
-		if pp.ControlN > 0 {
-			cSup := float64(pp.ControlHit) / float64(pp.ControlN)
-			cStr = fmt.Sprintf("%d/%d %.0f%%", pp.ControlHit, pp.ControlN, cSup*100)
-			if pp.TargetN > 0 {
-				delta = fmt.Sprintf("%+.0fpp", (float64(pp.TargetHit)/float64(pp.TargetN)-cSup)*100)
-			}
-		}
-		fmt.Fprintf(w, "  %-52s %-16s %-16s %s\n", pp.Name, tStr, cStr, delta)
-	}
-}
-
-func printHypotheses(w io.Writer, target, control []mechanism.MechanismMatrixRow, patterns []mechanism.Pattern, opts mechanism.HypothesisOpts) {
-	hyps := mechanism.GenerateHypotheses(target, control, patterns, opts)
-	fmt.Fprintf(w, "\nHYPOTHESES (%s · %s — research channel, not yet replicated)\n",
-		mechanism.HypothesisDiscovered, mechanism.EvidenceInferred)
-	if len(hyps) == 0 {
-		fmt.Fprintf(w, "  (no pattern cleared the gates: target n >= %d, target prevalence >= %.0f%%, separation >= %.0fpp)\n",
-			opts.MinTargetN, opts.MinTargetPrevalence*100, opts.MinSeparation*100)
-		return
-	}
-	for _, h := range hyps {
-		fmt.Fprintf(w, "\n  %s  %s\n", h.ID, h.Name)
-		fmt.Fprintf(w, "    target %d/%d (%.0f%%) · control %.0f%% · episodes %d\n",
-			int(h.TargetSupport*float64(h.ActorN)), h.ActorN, h.TargetSupport*100,
-			h.ControlSupport*100, h.EpisodeN)
-		fmt.Fprintf(w, "    conditions: %s\n", condString(h.Conditions))
-		if len(h.SourceActors) > 0 {
-			fmt.Fprintf(w, "    source actors: %s\n", joinWallets(h.SourceActors))
-		}
-	}
-	fmt.Fprintf(w, "\n  next step: replication cohort (ConsEV > 0, effective n >= %d) — these are DISCOVERED, not SUPPORTED\n", 20)
 }
 
 func condString(conds []mechanism.FeatureCondition) string {
@@ -413,4 +507,44 @@ func shortAddr(a string) string {
 		return a
 	}
 	return a[:6] + "..." + a[len(a)-4:]
+}
+
+func rowsOf(rows []mechanism.MechanismMatrixRow) []int {
+	out := make([]int, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.Trades)
+	}
+	return out
+}
+
+func medianInt(vals []int) int {
+	if len(vals) == 0 {
+		return 0
+	}
+	sort.Ints(vals)
+	return vals[len(vals)/2]
+}
+
+func typesOf(rows []mechanism.MechanismMatrixRow) map[string]int {
+	types := map[string]int{}
+	for _, r := range rows {
+		types[r.WalletType]++
+	}
+	return types
+}
+
+func typeSummary(types map[string]int) string {
+	keys := make([]string, 0, len(types))
+	for k := range types {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := ""
+	for i, k := range keys {
+		if i > 0 {
+			out += " "
+		}
+		out += fmt.Sprintf("%s×%d", k, types[k])
+	}
+	return out
 }
