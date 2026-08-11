@@ -1,6 +1,6 @@
 # Matrix Daily — 2026-08-11 (discovery freeze 4e761e9)
 # gates: min-repl 20/5 · quality 30 · horizon 5m
-# db last write: 2026-08-11 14:31:11.321784992 +0800  (collector freshness)
+# db last write: 2026-08-11 14:58:24.187871463 +0800  (collector freshness)
 
 --- 24h ---
 cells:        A=0 B=1 C=0 D=0
