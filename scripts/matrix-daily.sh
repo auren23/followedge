@@ -59,8 +59,20 @@ DB_MTIME="$(stat -c '%y' "$REPO/data/followedge.db" 2>/dev/null || echo 'n/a')"
 # is readable from GitHub in later sessions. Best-effort — a failure is a
 # SYNC WARN line in the report, never an ERROR (the trigger is about data,
 # not about sync).
+#
+# Index isolation: a plain `git commit` commits EVERYTHING already staged.
+# If the index holds files outside data/reports/ (e.g. a coding agent staged
+# internal/foo.go but has not committed yet), the report commit would drag
+# them along. Fail-safe: detect foreign staged files BEFORE staging the
+# report and skip the auto-commit with a WARN — never touch the agent's
+# index.
 sync_report() {
     cp "$REPORT" "$HISTORY/matrix-$DATE.txt"
+    if git -C "$REPO" diff --cached --name-only | grep -v '^data/reports/' | grep -q .; then
+        echo "SYNC WARN — index has staged files outside data/reports/; skipped auto-commit (report is local only)" \
+            | tee -a "$REPORT"
+        return 0
+    fi
     if git -C "$REPO" status --porcelain -- data/reports | grep -q .; then
         git -C "$REPO" add data/reports/matrix-daily.txt data/reports/history/
         if ! git -C "$REPO" commit -q -m "chore(reports): daily matrix snapshot $DATE"; then
