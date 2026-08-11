@@ -1,0 +1,29 @@
+# Matrix Daily — 2026-08-11 (discovery freeze 4e761e9)
+# gates: min-repl 20/5 · quality 30 · horizon 5m
+# db last write: 2026-08-11 14:31:11.321784992 +0800  (collector freshness)
+
+--- 24h ---
+cells:        A=0 B=1 C=0 D=0
+research eps: A=0 B=1 C=0 D=0
+flagship cov (side A): 0%
+rank: ok
+patterns/gates:
+full raw: data/reports/raw/matrix-daily-2026-08-11-24h.txt (+ -rank.txt)
+
+--- 72h ---
+cells:        A=0 B=1 C=0 D=0
+research eps: A=0 B=1 C=0 D=0
+flagship cov (side A): 0%
+rank: ok
+patterns/gates:
+full raw: data/reports/raw/matrix-daily-2026-08-11-72h.txt (+ -rank.txt)
+
+--- 168h ---
+cells:        A=0 B=1 C=0 D=0
+research eps: A=0 B=1 C=0 D=0
+flagship cov (side A): 0%
+rank: ok
+patterns/gates:
+full raw: data/reports/raw/matrix-daily-2026-08-11-168h.txt (+ -rank.txt)
+
+STATUS: KEEP COLLECTING — need at least ONE full window with A/B/C >= 10/10/10 AND flagship cov >= 50%; none qualified today
