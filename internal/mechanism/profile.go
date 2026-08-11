@@ -16,6 +16,13 @@
 //
 // Censored episodes are counted and their pnl shown separately as
 // diagnostics — dataset-coverage information, not mechanism evidence.
+//
+// ENTRY↔EPISODE LINEAGE (v0.2.1.1): entries carry their episode's FINAL
+// evidence (OriginQuality + DataGap, assigned at episode finalize by the
+// unified reconstruction walker). An entry can never be research-eligible
+// while its episode is not — a DataGap episode excludes its opening buy
+// and its adds together, never one without the other. Evidence counts
+// everywhere use the single EvidenceCounts provenance.
 package mechanism
 
 import (
@@ -29,6 +36,43 @@ import (
 type MedianStat struct {
 	Value float64
 	N     int
+}
+
+// EvidenceCounts is the unified provenance tally (v0.2.1.1): every episode
+// or buy lands in EXACTLY ONE of four mutually exclusive buckets, so
+// StrictN / ResearchN mean the same thing everywhere — matrix, CLI,
+// hypothesis — instead of being re-derived ad hoc per call site.
+type EvidenceCounts struct {
+	Confirmed int // OriginConfirmedZero, complete trajectory
+	Visible   int // OriginVisibleZero, complete trajectory — inferred, research only
+	Censored  int // OriginCensored, complete trajectory (hidden position may exist)
+	DataGap   int // trajectory gap (oversold / unseen opening) — never research
+}
+
+// StrictN is the independently-proven channel. Empty by design: no current
+// source can prove a real zero balance, so Confirmed stays 0 on the
+// production path.
+func (c EvidenceCounts) StrictN() int { return c.Confirmed }
+
+// ResearchN is the inferred channel: VisibleZero + ConfirmedZero, DataGap
+// excluded. Research use only, never dressed up as fact.
+func (c EvidenceCounts) ResearchN() int { return c.Confirmed + c.Visible }
+
+// add buckets one observation by origin quality and trajectory gap (a gap
+// always wins — the trajectory is broken regardless of origin).
+func (c *EvidenceCounts) add(q storage.OriginQuality, gap bool) {
+	if gap {
+		c.DataGap++
+		return
+	}
+	switch q {
+	case storage.OriginConfirmedZero:
+		c.Confirmed++
+	case storage.OriginVisibleZero:
+		c.Visible++
+	default:
+		c.Censored++
+	}
 }
 
 // TwoStat carries one statistic under the two evidence policies. N=0 on
@@ -52,26 +96,29 @@ type EntryFact struct {
 	KOLPrior         int
 	PriorValid       bool  // prior-flow window lies inside the dataset (not truncated)
 	SinceInitialSecs int64 // adds only: time since the episode's opening buy
-	// OriginQuality rates the evidence behind this buy's episode (initial
-	// or add). Initial-entry and add features are consumed per evidence
-	// policy; Censored means a hidden pre-dataset position may exist.
+	// OriginQuality and DataGap are the entry's EPISODE's final evidence
+	// (v0.2.1.1 lineage): assigned at episode finalize, so an entry can
+	// never claim research eligibility its episode later lost.
 	OriginQuality storage.OriginQuality
+	DataGap       bool
 }
 
 // EntryStats are facts about HOW the actor enters positions.
 type EntryStats struct {
 	InitialCount int // opening buys
 	AddCount     int // add buys
-	// Opening buys split by origin quality. Only ConfirmedZero feeds the
-	// Strict side; VisibleZero is an inference (ledger zero ≠ real zero)
-	// and Censored means a hidden position may exist.
-	InitialConfirmed int
-	InitialVisible   int
-	InitialCensored  int
+	// Opening buys / add buys split by the four mutually exclusive evidence
+	// buckets. Only Confirmed feeds the Strict side; Visible is an inference
+	// (ledger zero ≠ real zero); Censored means a hidden position may exist;
+	// DataGap means the episode's trajectory broke (never research).
+	Initial EvidenceCounts
+	Add     EvidenceCounts
 
-	// ReentryRate: (episodes - distinct tokens) / episodes — how often the
-	// actor comes back to a token it already traded (scale-ins are counted
-	// separately as adds, not as re-entry).
+	// ReentryRate: episodes that came back to a token it already had an
+	// episode on (IsReentry, fixed over full history) / episodes. The
+	// evidence policy decides which episodes ENTER the denominator — it
+	// never changes the feature itself, so a re-entry from a censored
+	// first episode still counts as a re-entry.
 	ReentryRate TwoStat
 
 	MedianInitialBuy TwoStat // opening buy notional per complete episode
@@ -91,11 +138,12 @@ type EntryStats struct {
 
 // PositionStats are facts about how the actor manages positions.
 // Core statistics are TwoStat (Strict=Confirmed, Research=Visible+Confirmed);
-// censored episodes are counted and reported separately.
+// Evidence carries the full episode provenance split (confirmed / inferred /
+// censored / gap — mutually exclusive, so StrictN() and ResearchN() are
+// well-defined).
 type PositionStats struct {
-	Episodes int // all episodes in the cohort
-	Trusted  int // OriginConfirmedZero
-	Censored int // everything else (Censored + VisibleZero)
+	Episodes int
+	Evidence EvidenceCounts
 
 	MedianAdds     TwoStat
 	MedianReduces  TwoStat
@@ -104,8 +152,11 @@ type PositionStats struct {
 
 // ExitStats are facts about how the actor exits. Core statistics are
 // TwoStat; censored pnl and data-gap pnl are MUTUALLY EXCLUSIVE diagnostic
-// buckets (a data-gap episode always has OriginCensored — its opening buy
-// is unseen — so the three buckets partition realized pnl).
+// buckets of CLOSED-EPISODE realized pnl (a data-gap episode always has
+// OriginCensored — its opening buy is unseen). They do NOT partition ALL
+// realized pnl: an open episode that already realized pnl via partial sells
+// is not bucketed here — "closed pnl" means exactly closed-episode realized
+// pnl, never the actor's total.
 type ExitStats struct {
 	PartialExitRatio TwoStat // episodes with PartialExitLegs > 0 / observable exits
 	FirstSellP50     TwoStat // seconds from opening buy to first sell leg
@@ -138,50 +189,49 @@ func BuildProfile(wallet string, episodes []storage.Episode, entries []EntryFact
 	var addChasesStrict, addChasesResearch, sinceStrict, sinceResearch []float64
 	var smartStrict, smartResearch, kolStrict, kolResearch []float64
 	for _, e := range entries {
+		// Entry evidence is the episode's FINAL lineage (v0.2.1.1): a
+		// DataGap entry can never reach the research channel, exactly like
+		// its episode. Strict also excludes gaps so the median channels'
+		// N always equals EvidenceCounts.StrictN/ResearchN.
+		strict := e.OriginQuality == storage.OriginConfirmedZero && !e.DataGap
+		research := (e.OriginQuality == storage.OriginConfirmedZero ||
+			e.OriginQuality == storage.OriginVisibleZero) && !e.DataGap
 		if e.Initial {
 			p.Entry.InitialCount++
-			switch e.OriginQuality {
-			case storage.OriginConfirmedZero:
-				p.Entry.InitialConfirmed++
+			p.Entry.Initial.add(e.OriginQuality, e.DataGap)
+			if strict {
 				agesStrict = append(agesStrict, float64(e.ReceivedAt-e.TradeTime))
+			}
+			if research {
 				agesResearch = append(agesResearch, float64(e.ReceivedAt-e.TradeTime))
-				if e.HasChase {
-					chasesStrict = append(chasesStrict, e.ChasePct)
-					chasesResearch = append(chasesResearch, e.ChasePct)
-				}
-				if e.PriorValid {
-					smartStrict = append(smartStrict, float64(e.SmartPrior))
-					smartResearch = append(smartResearch, float64(e.SmartPrior))
-					kolStrict = append(kolStrict, float64(e.KOLPrior))
-					kolResearch = append(kolResearch, float64(e.KOLPrior))
-				}
-			case storage.OriginVisibleZero:
-				p.Entry.InitialVisible++
-				agesResearch = append(agesResearch, float64(e.ReceivedAt-e.TradeTime))
-				if e.HasChase {
-					chasesResearch = append(chasesResearch, e.ChasePct)
-				}
-				if e.PriorValid {
-					smartResearch = append(smartResearch, float64(e.SmartPrior))
-					kolResearch = append(kolResearch, float64(e.KOLPrior))
-				}
-			default:
-				p.Entry.InitialCensored++
+			}
+			if strict && e.HasChase {
+				chasesStrict = append(chasesStrict, e.ChasePct)
+			}
+			if research && e.HasChase {
+				chasesResearch = append(chasesResearch, e.ChasePct)
+			}
+			if strict && e.PriorValid {
+				smartStrict = append(smartStrict, float64(e.SmartPrior))
+				kolStrict = append(kolStrict, float64(e.KOLPrior))
+			}
+			if research && e.PriorValid {
+				smartResearch = append(smartResearch, float64(e.SmartPrior))
+				kolResearch = append(kolResearch, float64(e.KOLPrior))
 			}
 		} else {
 			p.Entry.AddCount++
-			switch e.OriginQuality {
-			case storage.OriginConfirmedZero:
-				if e.HasChase {
-					addChasesStrict = append(addChasesStrict, e.ChasePct)
-					addChasesResearch = append(addChasesResearch, e.ChasePct)
-				}
+			p.Entry.Add.add(e.OriginQuality, e.DataGap)
+			if strict && e.HasChase {
+				addChasesStrict = append(addChasesStrict, e.ChasePct)
+			}
+			if research && e.HasChase {
+				addChasesResearch = append(addChasesResearch, e.ChasePct)
+			}
+			if strict {
 				sinceStrict = append(sinceStrict, float64(e.SinceInitialSecs))
-				sinceResearch = append(sinceResearch, float64(e.SinceInitialSecs))
-			case storage.OriginVisibleZero:
-				if e.HasChase {
-					addChasesResearch = append(addChasesResearch, e.ChasePct)
-				}
+			}
+			if research {
 				sinceResearch = append(sinceResearch, float64(e.SinceInitialSecs))
 			}
 		}
@@ -201,20 +251,19 @@ func BuildProfile(wallet string, episodes []storage.Episode, entries []EntryFact
 	var initStrict, initResearch, capStrict, capResearch []float64
 	var addBuyStrict, addBuyResearch []float64
 	var addedStrict, addedResearch, episodeN int
-	tokens := map[string]bool{}
-	tokensStrict := map[string]bool{}
-	tokensResearch := map[string]bool{}
 	strictN, researchN := 0, 0
+	reentryS, reentryR := 0, 0
 	for _, e := range episodes {
 		episodeN++
-		tokens[e.Token] = true
-		strict := e.OriginQuality == storage.OriginConfirmedZero
+		p.Position.Evidence.add(e.OriginQuality, e.DataGap)
+		strict := e.OriginQuality == storage.OriginConfirmedZero && !e.DataGap
 		research := (e.OriginQuality == storage.OriginConfirmedZero ||
 			e.OriginQuality == storage.OriginVisibleZero) && !e.DataGap
 		if strict {
 			strictN++
-			p.Position.Trusted++
-			tokensStrict[e.Token] = true
+			if e.IsReentry {
+				reentryS++
+			}
 			if e.Adds > 0 {
 				addedStrict++
 				addBuyStrict = append(addBuyStrict, e.AddBuyUSD)
@@ -222,7 +271,9 @@ func BuildProfile(wallet string, episodes []storage.Episode, entries []EntryFact
 		}
 		if research {
 			researchN++
-			tokensResearch[e.Token] = true
+			if e.IsReentry {
+				reentryR++
+			}
 			if e.Adds > 0 {
 				addedResearch++
 				addBuyResearch = append(addBuyResearch, e.AddBuyUSD)
@@ -238,9 +289,14 @@ func BuildProfile(wallet string, episodes []storage.Episode, entries []EntryFact
 		}
 	}
 	if episodeN > 0 {
+		// ReentryRate = re-entry episodes / policy-eligible episodes, where
+		// re-entry (IsReentry) is fixed at full-history reconstruction — the
+		// evidence policy selects WHICH episodes enter the denominator, it
+		// does not redefine who is a re-entry (a censored first episode
+		// still makes the second a re-entry).
 		p.Entry.ReentryRate = two(
-			reentryStat(tokensStrict, strictN),
-			reentryStat(tokensResearch, researchN),
+			ratioStatN(reentryS, strictN),
+			ratioStatN(reentryR, researchN),
 		)
 		p.Entry.AddEpisodeRate = two(
 			ratioStatN(addedStrict, strictN),
@@ -252,10 +308,9 @@ func BuildProfile(wallet string, episodes []storage.Episode, entries []EntryFact
 	p.Entry.MedianCapitalIn = two(median(capStrict), median(capResearch))
 
 	p.Position.Episodes = episodeN
-	p.Position.Censored = episodeN - strictN
 	var addsS, addsR, redS, redR, holdS, holdR []float64
 	for _, e := range episodes {
-		strict := e.OriginQuality == storage.OriginConfirmedZero
+		strict := e.OriginQuality == storage.OriginConfirmedZero && !e.DataGap
 		research := (e.OriginQuality == storage.OriginConfirmedZero ||
 			e.OriginQuality == storage.OriginVisibleZero) && !e.DataGap
 		if strict {
@@ -288,7 +343,7 @@ func BuildProfile(wallet string, episodes []storage.Episode, entries []EntryFact
 			incompleteN++
 			gapPnl += e.RealizedPnL // data-gap bucket (always OriginCensored)
 		}
-		strict := e.OriginQuality == storage.OriginConfirmedZero
+		strict := e.OriginQuality == storage.OriginConfirmedZero && !e.DataGap
 		research := (e.OriginQuality == storage.OriginConfirmedZero ||
 			e.OriginQuality == storage.OriginVisibleZero) && !e.DataGap
 		if !strict && !research {
@@ -359,13 +414,6 @@ func BuildProfile(wallet string, episodes []storage.Episode, entries []EntryFact
 }
 
 func two(s, r MedianStat) TwoStat { return TwoStat{Strict: s, Research: r} }
-
-func reentryStat(tokens map[string]bool, n int) MedianStat {
-	if n == 0 {
-		return MedianStat{}
-	}
-	return MedianStat{Value: 1 - float64(len(tokens))/float64(n), N: n}
-}
 
 func ratioStat(values []float64, threshold float64) MedianStat {
 	n := 0

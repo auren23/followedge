@@ -39,7 +39,8 @@ func TestBuildProfile(t *testing.T) {
 			CapitalIn: 30, CapitalOut: 0, RealizedPnL: 0, HoldDurationS: 0,
 			Status:      storage.EpisodeOpen,
 			FirstSellAt: 0, InitialBuyUSD: 30, AddBuyUSD: 0,
-			SellLegs: 0, PartialExitLegs: 0, DataGap: false, OriginQuality: storage.OriginConfirmedZero},
+			SellLegs: 0, PartialExitLegs: 0, DataGap: false, OriginQuality: storage.OriginConfirmedZero,
+			IsReentry: true}, // T1 had an earlier episode — fixed at reconstruction
 	}
 	// entries: T1 initial (+chase, valid prior), T1 add (+chase, since 60s),
 	// T2 initial (+chase, prior INVALID — window before dataset start),
@@ -61,10 +62,12 @@ func TestBuildProfile(t *testing.T) {
 	p := BuildProfile("W", episodes, entries)
 
 	// ENTRY — initial vs add
-	if p.Entry.InitialCount != 3 || p.Entry.InitialConfirmed != 3 ||
-		p.Entry.InitialVisible != 0 || p.Entry.InitialCensored != 0 || p.Entry.AddCount != 1 {
-		t.Errorf("initial = %d (conf %d, vis %d, cens %d) add %d, want 3 (3/0/0)/1",
-			p.Entry.InitialCount, p.Entry.InitialConfirmed, p.Entry.InitialVisible, p.Entry.InitialCensored, p.Entry.AddCount)
+	if p.Entry.InitialCount != 3 || p.Entry.Initial.Confirmed != 3 ||
+		p.Entry.Initial.Visible != 0 || p.Entry.Initial.Censored != 0 ||
+		p.Entry.Initial.DataGap != 0 || p.Entry.AddCount != 1 {
+		t.Errorf("initial = %d (conf %d, vis %d, cens %d, gap %d) add %d, want 3 (3/0/0/0)/1",
+			p.Entry.InitialCount, p.Entry.Initial.Confirmed, p.Entry.Initial.Visible,
+			p.Entry.Initial.Censored, p.Entry.Initial.DataGap, p.Entry.AddCount)
 	}
 	if math.Abs(p.Entry.ReentryRate.Strict.Value-(1.0/3.0)) > 0.001 { // 3 confirmed episodes, 2 tokens
 		t.Errorf("reentry (strict) = %.2f, want 0.33", p.Entry.ReentryRate.Strict.Value)
@@ -99,9 +102,11 @@ func TestBuildProfile(t *testing.T) {
 	}
 
 	// POSITION — hold median only over closed (180, 300)
-	if p.Position.Episodes != 4 || p.Position.Trusted != 3 || p.Position.Censored != 1 {
-		t.Errorf("episodes = %d (trusted %d censored %d), want 4 (3/1)",
-			p.Position.Episodes, p.Position.Trusted, p.Position.Censored)
+	if p.Position.Episodes != 4 ||
+		p.Position.Evidence.Confirmed != 3 || p.Position.Evidence.Visible != 0 ||
+		p.Position.Evidence.Censored != 0 || p.Position.Evidence.DataGap != 1 {
+		t.Errorf("episodes = %d evidence %+v, want 4 (conf 3 / vis 0 / cens 0 / gap 1)",
+			p.Position.Episodes, p.Position.Evidence)
 	}
 	if p.Position.MedianHoldSecs.Strict.Value != 240 || p.Position.MedianHoldSecs.Strict.N != 2 {
 		t.Errorf("median hold = %.0f (n%d), want 240 (n2, closed only)", p.Position.MedianHoldSecs.Strict.Value, p.Position.MedianHoldSecs.Strict.N)
@@ -214,18 +219,21 @@ func TestProductionPathNeverConfirms(t *testing.T) {
 		entries = append(entries, EntryFact{
 			Initial: ce.Initial, TradeTime: ce.TradeTime, ReceivedAt: ce.ReceivedAt,
 			SinceInitialSecs: ce.SinceInitialSecs, OriginQuality: ce.OriginQuality,
+			DataGap: ce.DataGap,
 		})
 	}
 	p := BuildProfile("W_E2E", episodes, entries)
 
 	// e1 is the first observed episode (Censored), e3 sits after a visible
 	// close (VisibleZero) — nothing can be Confirmed on the production path
-	if p.Entry.InitialConfirmed != 0 || p.Entry.InitialVisible != 1 || p.Entry.InitialCensored != 1 {
-		t.Errorf("initial split = conf %d vis %d cens %d, want 0/1/1",
-			p.Entry.InitialConfirmed, p.Entry.InitialVisible, p.Entry.InitialCensored)
+	if p.Entry.Initial.Confirmed != 0 || p.Entry.Initial.Visible != 1 ||
+		p.Entry.Initial.Censored != 1 || p.Entry.Initial.DataGap != 0 {
+		t.Errorf("initial split = %+v, want conf 0 / vis 1 / cens 1 / gap 0", p.Entry.Initial)
 	}
-	if p.Position.Trusted != 0 || p.Position.Censored != 2 {
-		t.Errorf("episodes = trusted %d censored %d, want 0/2", p.Position.Trusted, p.Position.Censored)
+	if p.Position.Evidence.StrictN() != 0 || p.Position.Evidence.ResearchN() != 1 ||
+		p.Position.Evidence.Censored != 1 {
+		t.Errorf("episodes evidence = %+v, want strict 0 / research 1 / censored 1 (visible is NOT censored)",
+			p.Position.Evidence)
 	}
 	// strict channel must be completely empty; research channel has data
 	if p.Entry.MedianChase.Strict.N != 0 || p.Entry.MedianInitialBuy.Strict.N != 0 {
@@ -234,8 +242,12 @@ func TestProductionPathNeverConfirms(t *testing.T) {
 	if p.Position.MedianHoldSecs.Research.N == 0 {
 		t.Errorf("research channel must carry the visible-zero episodes, got %+v", p.Position.MedianHoldSecs)
 	}
-	if p.Entry.ReentryRate.Strict.N != 0 || p.Entry.ReentryRate.Research.N != 1 {
-		t.Errorf("reentry = strict n%d research n%d, want 0/1 (one visible-zero episode)",
-			p.Entry.ReentryRate.Strict.N, p.Entry.ReentryRate.Research.N)
+	// e3 re-enters T1 (its first episode was censored but IS an episode) —
+	// the research reentry rate must be 100%, not 0: evidence policy selects
+	// which episodes enter the denominator, it never redefines who re-enters.
+	if p.Entry.ReentryRate.Strict.N != 0 || p.Entry.ReentryRate.Research.N != 1 ||
+		math.Abs(p.Entry.ReentryRate.Research.Value-1.0) > 0.001 {
+		t.Errorf("reentry = strict n%d research n%d v%.2f, want 0/1/1.00 (censored first episode still marks a re-entry)",
+			p.Entry.ReentryRate.Strict.N, p.Entry.ReentryRate.Research.N, p.Entry.ReentryRate.Research.Value)
 	}
 }

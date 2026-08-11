@@ -75,14 +75,20 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 	}
 
 	// ---- BEHAVIOR (full-history reconstruction, filtered to window) ----
-	episodes, err := s.ReconstructEpisodesFor(wallet, since)
+	// Single unified walker (v0.2.1.1): episodes AND classified entries come
+	// from one reconstruction pass, and entries carry their episode's FINAL
+	// evidence — they can never claim research eligibility the episode lost.
+	ds, err := s.ReconstructBehaviorFor(wallet)
 	if err != nil {
 		return err
 	}
-	classified, err := s.ClassifiedEntries(wallet)
-	if err != nil {
-		return err
+	episodes := ds.Episodes[:0]
+	for _, e := range ds.Episodes {
+		if e.OpenedAt >= since.Unix() {
+			episodes = append(episodes, e)
+		}
 	}
+	classified := ds.Entries
 	obs, err := s.EntryObservations(wallet, since)
 	if err != nil {
 		return err
@@ -111,6 +117,7 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 			ReceivedAt:       ce.ReceivedAt,
 			SinceInitialSecs: ce.SinceInitialSecs,
 			OriginQuality:    ce.OriginQuality,
+			DataGap:          ce.DataGap,
 		}
 		if ch, ok := chaseByEvent[ce.EventID]; ok {
 			f.ChasePct, f.HasChase = ch, true
@@ -130,12 +137,14 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 	fmt.Fprintf(w, "\nBEHAVIOR COHORT — positions opened since %s\n", since.Format("2006-01-02"))
 	fmt.Fprintf(w, "\n                         confirmed   inferred\n")
 	fmt.Fprintf(w, "\nENTRY\n")
-	fmt.Fprintf(w, "  initial buys        %-11s %-11s (%d censored, origin unknown)\n",
-		fmt.Sprintf("%d", prof.Entry.InitialConfirmed),
-		fmt.Sprintf("%d", prof.Entry.InitialVisible),
-		prof.Entry.InitialCensored)
-	fmt.Fprintf(w, "  add buys            %-11s %-11s\n",
-		fmt.Sprintf("%d", prof.Entry.AddCount), "—")
+	fmt.Fprintf(w, "  initial buys        %-11s %-11s (%d censored, %d gap, origin unknown)\n",
+		fmt.Sprintf("%d", prof.Entry.Initial.Confirmed),
+		fmt.Sprintf("%d", prof.Entry.Initial.Visible),
+		prof.Entry.Initial.Censored, prof.Entry.Initial.DataGap)
+	fmt.Fprintf(w, "  add buys            %-11s %-11s (%d censored, %d gap, origin unknown)\n",
+		fmt.Sprintf("%d", prof.Entry.Add.Confirmed),
+		fmt.Sprintf("%d", prof.Entry.Add.Visible),
+		prof.Entry.Add.Censored, prof.Entry.Add.DataGap)
 	fmt.Fprintf(w, "  reentry rate        %s\n", twoPct(prof.Entry.ReentryRate))
 	fmt.Fprintf(w, "  initial buy         %s\n", twoUsd(prof.Entry.MedianInitialBuy))
 	fmt.Fprintf(w, "  add buy             %s\n", twoUsd(prof.Entry.MedianAddBuy))
@@ -149,8 +158,10 @@ func Behavior(w io.Writer, s *storage.Store, wallet string, since time.Time,
 	fmt.Fprintf(w, "  prior KOL P50       %s\n", twoNum(prof.Entry.KOLPriorP50))
 	fmt.Fprintf(w, "  cluster >=3         %s\n", twoPct(prof.Entry.Cluster3Plus))
 	fmt.Fprintf(w, "\nPOSITION\n")
-	fmt.Fprintf(w, "  episodes            %d  (confirmed %d · censored %d)\n",
-		prof.Position.Episodes, prof.Position.Trusted, prof.Position.Censored)
+	fmt.Fprintf(w, "  episodes            %d  (confirmed %d · inferred %d · censored %d · gap %d)\n",
+		prof.Position.Episodes,
+		prof.Position.Evidence.Confirmed, prof.Position.Evidence.Visible,
+		prof.Position.Evidence.Censored, prof.Position.Evidence.DataGap)
 	fmt.Fprintf(w, "  median adds         %s\n", twoNum(prof.Position.MedianAdds))
 	fmt.Fprintf(w, "  median reduces      %s\n", twoNum(prof.Position.MedianReduces))
 	fmt.Fprintf(w, "  median hold         %s\n", twoSecs(prof.Position.MedianHoldSecs))

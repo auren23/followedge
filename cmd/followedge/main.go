@@ -22,11 +22,12 @@ import (
 	"github.com/auren23/followedge/internal/config"
 	"github.com/auren23/followedge/internal/domain"
 	"github.com/auren23/followedge/internal/markout"
+	"github.com/auren23/followedge/internal/mechanism"
 	"github.com/auren23/followedge/internal/source/gmgn"
 	"github.com/auren23/followedge/internal/storage"
 )
 
-const version = "0.2.1-mechanism-evidence"
+const version = "0.2.1.1-mechanism-matrix"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
@@ -72,6 +73,7 @@ usage:
                              [--sort quality|replicability|pnl|copy-ev] [--frontier]
   followedge actors inspect [--config ...] <wallet> [--since 24h]
   followedge actors behavior [--config ...] <wallet> [--since 24h] [--horizon 5m]
+  followedge actors matrix [--config ...] [--since 24h] [--horizon 5m] [--min-quality 30]
   followedge analyze latency   [--config ...] [--since 1h]
   followedge analyze latency-ev [--config ...] [--horizon 5m] [--side buy] [--by-chase]
   followedge analyze chase     [--config ...] [--horizon 30s] [--side buy]
@@ -254,7 +256,7 @@ func cmdStatus(args []string) error {
 
 func cmdActors(ctx context.Context, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("actors needs a subcommand: rank|inspect")
+		return fmt.Errorf("actors needs a subcommand: rank|inspect|behavior|matrix")
 	}
 	sub, rest := args[0], args[1:]
 	fs := flag.NewFlagSet("actors "+sub, flag.ExitOnError)
@@ -268,6 +270,7 @@ func cmdActors(ctx context.Context, args []string) error {
 	noExitLoss := fs.Float64("noexit-loss", 100, "assumed loss %% for unpriced market-outcome rows in conservative EV")
 	minReplMarket := fs.Int("min-repl-market", 20, "min effective market rows (filled + market loss) for frontier/replication sort eligibility")
 	minReplFilled := fs.Int("min-repl-filled", 5, "min filled replication rows for frontier/replication sort eligibility")
+	minQuality := fs.Float64("min-quality", 30, "target cohort quality gate (matrix)")
 	if err := fs.Parse(rest); err != nil {
 		return err
 	}
@@ -320,6 +323,20 @@ func cmdActors(ctx context.Context, args []string) error {
 		}
 		return analyze.Behavior(os.Stdout, store, fs.Arg(0), sinceT, h,
 			*noExitLoss, cfg.Markout.Grace, clusterWindow)
+	case "matrix":
+		windows, err := parseDurations(cfg.Cluster.Windows)
+		if err != nil {
+			return err
+		}
+		clusterWindow := time.Minute
+		if len(windows) > 0 {
+			clusterWindow = windows[0]
+		}
+		opts := mechanism.DefaultHypothesisOpts()
+		opts.Window = *sinceStr
+		return analyze.Matrix(os.Stdout, store, sinceT, h, cfg.Markout.Grace,
+			*noExitLoss, clusterWindow, *minReplMarket, *minReplFilled,
+			*minQuality, opts)
 	default:
 		return fmt.Errorf("unknown actors subcommand %q", sub)
 	}

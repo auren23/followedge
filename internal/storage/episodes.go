@@ -14,6 +14,11 @@ const (
 	EpisodePartial = "partial" // sell legs exceeded visible position (data gap)
 )
 
+// EpisodeID is the lineage key connecting a ClassifiedEntry to the episode
+// it belongs to. Format "wallet/token#ordinal" — deterministic over the
+// event stream (never persisted; rebuilt on demand).
+type EpisodeID string
+
 // Episode is one reconstructed position round-trip of a (wallet, token).
 //
 // Status semantics (v0.2.0.1): "partial" means the sell legs EXCEEDED the
@@ -22,6 +27,17 @@ const (
 // separately in PartialExitLegs: sell legs that left a positive visible
 // quantity behind.
 type Episode struct {
+	// ID is assigned once at reconstruction; every entry of this episode
+	// carries the same ID (v0.2.1.1 entry↔episode lineage).
+	ID EpisodeID
+
+	// IsReentry is fixed at reconstruction time over FULL history: whether
+	// this token had a finalized episode BEFORE this one. Evidence policy
+	// decides which episodes enter a statistic — it never redefines the
+	// feature itself (a censored first episode still makes the second a
+	// re-entry).
+	IsReentry bool
+
 	Wallet        string
 	Token         string
 	OpenedAt      int64
@@ -58,6 +74,21 @@ type Episode struct {
 	OriginQuality OriginQuality
 }
 
+// BehaviorDataset is ONE wallet's full-history reconstruction in a single
+// pass: episodes AND classified entries, guaranteed to agree because both
+// come from one walker (v0.2.1.1 — they used to be two parallel walkers
+// that could disagree).
+//
+// Entry evidence fields (OriginQuality, DataGap) are assigned at episode
+// FINALIZE, not at the buy event: an entry can never claim an evidence
+// level its episode later lost (e.g. a VisibleZero opening whose episode
+// then hit an oversold gap and became DataGap). Never persisted — rebuilt
+// on demand from trade_events.
+type BehaviorDataset struct {
+	Episodes []Episode
+	Entries  []ClassifiedEntry
+}
+
 // OriginQuality rates the evidence behind an episode's opening buy.
 type OriginQuality int
 
@@ -72,10 +103,10 @@ const (
 //
 // LEGACY/DEBUG CACHE: left-truncated at `since` and only used by the
 // `analyze episodes` debug command. Mechanism analysis MUST use the
-// on-demand ReconstructEpisodesFor (full history + cohort filter) — never
-// this table. Deterministic and idempotent (table wiped and rebuilt).
-// Same-second trades are ordered by received_at then event_id (approximate
-// without a chain tx index).
+// on-demand ReconstructEpisodesFor / ReconstructBehaviorFor (full history +
+// cohort filter) — never this table. Deterministic and idempotent (table
+// wiped and rebuilt). Same-second trades are ordered by received_at then
+// event_id (approximate without a chain tx index).
 func (s *Store) RebuildEpisodes(since time.Time) (int, error) {
 	rows, err := s.db.Query(`
 		SELECT wallet, token_address, side, token_amount, amount_usd,
@@ -87,10 +118,11 @@ func (s *Store) RebuildEpisodes(since time.Time) (int, error) {
 		return 0, err
 	}
 	defer rows.Close()
-	eps, err := reconstructEpisodes(rows)
+	ds, err := reconstructBehavior(rows)
 	if err != nil {
 		return 0, err
 	}
+	eps := ds.Episodes
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -125,15 +157,18 @@ func (s *Store) RebuildEpisodes(since time.Time) (int, error) {
 	return len(eps), nil
 }
 
-// ReconstructEpisodesFor rebuilds ONE wallet's episodes on demand, straight
-// from trade_events — the behavior card must never depend on a stale or
-// never-materialized position_episodes table.
+// ReconstructBehaviorFor rebuilds ONE wallet's episodes AND classified
+// entries in a single pass over full history (v0.2.1.1). This is the single
+// source of truth for behavior analysis — ReconstructEpisodesFor and
+// ClassifiedEntries are thin views over it, so episode evidence and entry
+// evidence can never disagree.
 //
 // Left-truncation guard: reconstruction runs over the wallet's FULL history
-// and only the final episodes (opened_at >= since) are returned — an episode
-// opened before the analysis window keeps its real InitialBuyUSD / OpenedAt
-// instead of mistaking the first visible add for the opening buy.
-func (s *Store) ReconstructEpisodesFor(wallet string, since time.Time) ([]Episode, error) {
+// and only the final episodes (opened_at >= since) are returned by
+// ReconstructEpisodesFor — an episode opened before the analysis window
+// keeps its real InitialBuyUSD / OpenedAt instead of mistaking the first
+// visible add for the opening buy.
+func (s *Store) ReconstructBehaviorFor(wallet string) (*BehaviorDataset, error) {
 	rows, err := s.db.Query(`
 		SELECT wallet, token_address, side, token_amount, amount_usd,
 		       buy_cost_usd, trade_time, received_at, event_id
@@ -144,12 +179,19 @@ func (s *Store) ReconstructEpisodesFor(wallet string, since time.Time) ([]Episod
 		return nil, err
 	}
 	defer rows.Close()
-	eps, err := reconstructEpisodes(rows)
+	return reconstructBehavior(rows)
+}
+
+// ReconstructEpisodesFor returns the wallet's episodes whose OPENING is
+// inside the analysis window (full-history reconstruction, then cohort
+// filter). See ReconstructBehaviorFor.
+func (s *Store) ReconstructEpisodesFor(wallet string, since time.Time) ([]Episode, error) {
+	ds, err := s.ReconstructBehaviorFor(wallet)
 	if err != nil {
 		return nil, err
 	}
-	out := eps[:0]
-	for _, e := range eps {
+	out := ds.Episodes[:0]
+	for _, e := range ds.Episodes {
 		if e.OpenedAt >= since.Unix() {
 			out = append(out, e)
 		}
@@ -211,23 +253,44 @@ func (b *positionBook) sell(amount float64) PositionState {
 func (b *positionBook) isEmpty() bool { return b.qty <= b.eps() }
 func (b *positionBook) reset()        { b.qty, b.peak = 0, 0 }
 
-func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
-	var eps []Episode
+// reconstructBehavior is the single walker behind ALL behavior
+// reconstruction (episodes + classified entries), replacing the two
+// parallel walkers that previously disagreed on evidence. Runs over rows
+// ordered by (wallet, token_address, trade_time, received_at, event_id).
+//
+// Evidence is assigned in two stages:
+//   - the RUNNING origin (Censored → VisibleZero on a visible full close,
+//     back to Censored on an oversold gap) seeds the NEXT episode;
+//   - every episode's entries inherit the episode's FINAL OriginQuality and
+//     DataGap at finalize — a VisibleZero opening whose episode later goes
+//     oversold becomes DataGap for its entries too, so episode stats and
+//     entry stats can never claim different evidence for the same position.
+func reconstructBehavior(rows *sql.Rows) (*BehaviorDataset, error) {
+	ds := &BehaviorDataset{}
+	seen := map[string]bool{} // wallet-level: tokens with >= 1 finalized episode
 	var cur *Episode
+	var curEntries []*ClassifiedEntry
 	var curWallet, curToken string
 	book := &positionBook{}
 	origin := OriginCensored // per token group: quality of the NEXT episode's opening
+	seq := 0                 // episode ordinal within the (wallet, token) group
 
-	flush := func() {
-		if cur != nil {
-			if cur.Status == EpisodeClosed {
-				// Our ledger reached zero — inferred, NOT confirmed: a hidden
-				// pre-dataset position could still be open.
-				origin = OriginVisibleZero
-			}
-			eps = append(eps, *cur)
-			cur = nil
+	finalize := func() {
+		if cur == nil {
+			return
 		}
+		seen[cur.Token] = true
+		for _, ce := range curEntries {
+			// entry ↔ episode lineage: the final evidence, not the running
+			// origin at buy time — a later oversold downgrades everything
+			// this episode emitted.
+			ce.OriginQuality = cur.OriginQuality
+			ce.DataGap = cur.DataGap
+			ce.EpisodeID = cur.ID
+			ds.Entries = append(ds.Entries, *ce)
+		}
+		ds.Episodes = append(ds.Episodes, *cur)
+		cur, curEntries = nil, nil
 		book.reset()
 	}
 
@@ -235,29 +298,38 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 		var wallet, token, side string
 		var tokenAmount, amountUSD, ts, received float64
 		var buyCost sql.NullFloat64
+		var eventID string
 		if err := rows.Scan(&wallet, &token, &side, &tokenAmount, &amountUSD,
-			&buyCost, &ts, &received, new(string)); err != nil {
+			&buyCost, &ts, &received, &eventID); err != nil {
 			return nil, err
 		}
 		if cur == nil || wallet != curWallet || token != curToken {
-			flush()
+			finalize()
 			if wallet != curWallet || token != curToken {
 				origin = OriginCensored // new (wallet, token) group: censored again
+				book.reset()
+				seq = 0
 			}
 			curWallet, curToken = wallet, token
-			cur = &Episode{Wallet: wallet, Token: token, OpenedAt: int64(ts), Status: EpisodeOpen}
-			// A visible full close only upgrades to VisibleZero — it cannot
-			// prove the wallet's real balance is zero (hidden pre-dataset
-			// position), so OriginConfirmedZero is never reached with the
-			// current data sources.
-			cur.OriginQuality = origin
+			seq++
+			cur = &Episode{
+				Wallet: wallet, Token: token, OpenedAt: int64(ts), Status: EpisodeOpen,
+				ID:            EpisodeID(fmt.Sprintf("%s/%s#%d", wallet, token, seq)),
+				IsReentry:     seen[token],
+				OriginQuality: origin,
+				DataGap:       side == "sell", // window opened on a sell: opening buy unseen
+			}
 			if side == "sell" {
+				// A visible full close only upgrades to VisibleZero — it cannot
+				// prove the wallet's real balance is zero (hidden pre-dataset
+				// position), so OriginConfirmedZero is never reached with the
+				// current data sources.
 				cur.OriginQuality = OriginCensored // opening buy unseen
 			}
-			cur.DataGap = side == "sell" // window opened on a sell: opening buy unseen
 		}
 		if side == "buy" {
-			if book.isEmpty() {
+			initial := book.isEmpty()
+			if initial {
 				// opening buy (or re-opening after a full close)
 				cur.OpenedAt = int64(ts)
 				cur.InitialBuyUSD = amountUSD
@@ -269,6 +341,13 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 			}
 			book.add(tokenAmount)
 			cur.CapitalIn += amountUSD
+			curEntries = append(curEntries, &ClassifiedEntry{
+				EventID: eventID, Token: token,
+				TokenAmount: tokenAmount, AmountUSD: amountUSD,
+				TradeTime: int64(ts), ReceivedAt: int64(received),
+				Initial:          initial,
+				SinceInitialSecs: int64(ts) - cur.OpenedAt,
+			})
 		} else { // sell
 			if book.isEmpty() {
 				cur.DataGap = true // selling with no visible position
@@ -289,7 +368,10 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 				cur.Status = EpisodeClosed
 				cur.ClosedAt = int64(ts)
 				cur.HoldDurationS = cur.ClosedAt - cur.OpenedAt
-				flush()
+				// Our ledger reached zero — inferred, NOT confirmed: a hidden
+				// pre-dataset position could still be open.
+				origin = OriginVisibleZero
+				finalize()
 			case Oversold:
 				cur.Status = EpisodePartial // sold more than visible position
 				cur.DataGap = true
@@ -298,7 +380,7 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 				// an oversold leg proves our trajectory has a gap — the
 				// next episode's origin confidence drops back to Censored
 				origin = OriginCensored
-				flush()
+				finalize()
 			}
 		}
 	}
@@ -306,8 +388,8 @@ func reconstructEpisodes(rows *sql.Rows) ([]Episode, error) {
 		return nil, err
 	}
 	// the last episode per group stays open
-	flush()
-	return eps, nil
+	finalize()
+	return ds, nil
 }
 
 // EpisodeCounts aggregates episodes for analysis.

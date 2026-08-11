@@ -10,12 +10,16 @@ import (
 // opened (adds only). This separates "why does he open" from "why does he
 // add" — the two questions mechanism mining must not conflate.
 //
-// OriginQuality is carried by EVERY buy: it rates the evidence behind the
-// episode this buy belongs to (initial or add). Adds of a left-censored
-// episode are just as untrustworthy as its opening buy.
+// OriginQuality and DataGap are the episode's FINAL evidence, assigned at
+// episode finalize by the unified reconstruction walker (v0.2.1.1): an
+// entry can never claim an evidence level its episode later lost (a
+// VisibleZero opening whose episode then hit an oversold gap is DataGap
+// for its entries too, exactly as for the episode). Adds of a
+// left-censored episode are just as untrustworthy as its opening buy.
 type ClassifiedEntry struct {
 	EventID          string
 	Token            string
+	EpisodeID        EpisodeID // lineage: which episode this buy belongs to
 	TokenAmount      float64
 	AmountUSD        float64
 	TradeTime        int64
@@ -23,65 +27,20 @@ type ClassifiedEntry struct {
 	Initial          bool  // opening buy of an episode vs an add
 	SinceInitialSecs int64 // adds only: trade_time - episode opening time
 	OriginQuality    OriginQuality
+	DataGap          bool // episode's final trajectory gap (oversold / unseen opening)
 }
 
-// ClassifiedEntries walks the wallet's full event stream (all sides, for
-// position tracking) and classifies every buy as initial or add. Runs over
-// full history so a window edge never mislabels an add as an opening buy.
+// ClassifiedEntries classifies every buy of the wallet as initial or add,
+// with the episode's FINAL evidence. Runs over full history so a window
+// edge never mislabels an add as an opening buy. This is a thin view over
+// the single unified walker (ReconstructBehaviorFor) — episode stats and
+// entry stats are guaranteed to agree on evidence.
 func (s *Store) ClassifiedEntries(wallet string) ([]ClassifiedEntry, error) {
-	rows, err := s.db.Query(`
-		SELECT event_id, token_address, side, token_amount, amount_usd, trade_time, received_at
-		FROM trade_events
-		WHERE wallet = ?
-		ORDER BY token_address, trade_time, received_at, event_id`, wallet)
+	ds, err := s.ReconstructBehaviorFor(wallet)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []ClassifiedEntry
-	var curToken string
-	book := &positionBook{}
-	openTime := int64(0)
-	origin := OriginCensored // per token: quality of the next episode's opening
-	for rows.Next() {
-		var id, token, side string
-		var tokenAmt, usd, ts, received float64
-		if err := rows.Scan(&id, &token, &side, &tokenAmt, &usd, &ts, &received); err != nil {
-			return nil, err
-		}
-		if token != curToken {
-			curToken, openTime = token, int64(ts)
-			book.reset()
-			origin = OriginCensored
-		}
-		if side == "buy" {
-			initial := book.isEmpty()
-			if initial {
-				openTime = int64(ts)
-			}
-			book.add(tokenAmt)
-			out = append(out, ClassifiedEntry{
-				EventID: id, Token: token, TradeTime: int64(ts), ReceivedAt: int64(received),
-				TokenAmount: tokenAmt, AmountUSD: usd,
-				Initial: initial, SinceInitialSecs: int64(ts) - openTime,
-				// every buy inherits the episode's origin quality — adds of a
-				// left-censored episode are untrustworthy too
-				OriginQuality: origin,
-			})
-		} else {
-			switch book.sell(tokenAmt) {
-			case Closed:
-				// ledger zero ≠ real zero (hidden pre-dataset position may
-				// remain): inferred, NOT confirmed
-				origin = OriginVisibleZero
-				book.reset()
-			case Oversold:
-				origin = OriginCensored // gap in the trajectory: confidence drops back
-				book.reset()            // classification has no negative positions: next buy reopens
-			}
-		}
-	}
-	return out, rows.Err()
+	return ds.Entries, nil
 }
 
 // EntryObservation is the chase feature of ONE entry, knowable at entry
