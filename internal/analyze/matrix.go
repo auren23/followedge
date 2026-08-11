@@ -190,26 +190,30 @@ func matrixRowFor(s *storage.Store, a *Actor, since time.Time, clusterWindow tim
 }
 
 // splitCells partitions repl-eligible rows into the Quality × Replicability
-// 2×2 outcome cells (v0.2.1.2, band applied to ALL four cells in
-// v0.2.1.3):
+// 2×2 outcome cells (v0.2.1.2; activity band applied to ALL four cells in
+// v0.2.1.3; wallet-type set derived from the band-matched A subset in
+// v0.2.1.4):
 //
 //	              ConsEV > 0      ConsEV <= 0
 //	Quality >= g   A (target)     B
 //	Quality <  g   C              D
 //
-// The activity band (trades within [0.5, 2] × the RAW A median) and the
-// wallet-type set are derived from cell A's candidates, then applied in ONE
-// pass to EVERY row — cells differ in OUTCOME, not in who they are, and
-// cell A is band-matched exactly like B/C/D (an A-label outlier can never
-// confound the contrasts with an activity difference). Rows outside the
-// band are dropped and counted. If cell A has no candidates the band cannot
-// be derived: rows are bucketed by labels only and a note is returned (no
-// contrast can run — both involve A, but the 2×2 layout stays printable as
-// the diagnostic).
+// Three passes, so every cell comes from the SAME activity × wallet-type
+// matched population:
+//  1. rawA (A-label rows, unfiltered) → activity band from A's trade median
+//  2. matchedA = rawA ∩ activity band → the ALLOWED wallet-type set. A type
+//     that only exists on band-outlier A rows must NOT leak into the filter
+//     (a KOL outlier in A must not admit KOL rows into B/C).
+//  3. ONE filter pass over all rows: activity band AND wallet type ∈ matchedA
+//     types → classify A/B/C/D. Rows outside are dropped and counted.
+//
+// If cell A has no candidates the band cannot be derived: rows are bucketed
+// by labels only and a note is returned (no contrast can run — both involve
+// A, but the 2×2 layout stays printable as the diagnostic).
 func splitCells(rows []mechanism.MechanismMatrixRow, minQuality float64) (a, b, c, d []mechanism.MechanismMatrixRow, dropped int, bandLo, bandHi int, bandNote string) {
 	// Pass 1: rawA = all A-LABEL rows (unfiltered) — the band's derivation
-	// population. Only the median and type set of rawA matter; A itself is
-	// band-filtered in pass 2 like every other cell.
+	// population. Only A's trade median matters here; A itself is
+	// band-filtered like every other cell.
 	var rawA []mechanism.MechanismMatrixRow
 	for _, r := range rows {
 		if r.ConsEV > 0 && r.Quality >= minQuality {
@@ -230,16 +234,25 @@ func splitCells(rows []mechanism.MechanismMatrixRow, minQuality float64) (a, b, 
 		return a, b, c, d, 0, 0, 0, "(no cell A — activity band unavailable; all rows bucketed by label)"
 	}
 	var trades []int
-	types := map[string]bool{}
 	for _, r := range rawA {
 		trades = append(trades, r.Trades)
-		types[r.WalletType] = true
 	}
 	sort.Ints(trades)
 	med := trades[len(trades)/2]
 	bandLo, bandHi = int(float64(med)*0.5), int(float64(med)*2.0)
 
-	// Pass 2: ONE band-filtered pass over ALL rows — A/B/C/D all come from
+	// Pass 2: allowed wallet types come from the ACTIVITY-BAND-MATCHED A
+	// subset (matchedA is never empty — the median trade count itself is
+	// always inside [0.5·med, 2·med]). A wallet type that appears only on
+	// band-outlier A rows must not admit that type into B/C/D.
+	types := map[string]bool{}
+	for _, r := range rawA {
+		if r.Trades >= bandLo && r.Trades <= bandHi {
+			types[r.WalletType] = true
+		}
+	}
+
+	// Pass 3: ONE band + type filter over ALL rows — A/B/C/D all come from
 	// the same matched population.
 	for _, r := range rows {
 		if r.Trades < bandLo || r.Trades > bandHi || !types[r.WalletType] {

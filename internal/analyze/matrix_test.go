@@ -185,6 +185,45 @@ func TestSplitCellsPartition(t *testing.T) {
 	}
 }
 
+// TestSplitCellsWalletTypeFromMatchedA is trap T13 (v0.2.1.4): the allowed
+// wallet-type set must come from the ACTIVITY-BAND-MATCHED A subset, not raw
+// A. A type that exists only on a band-outlier A row (KOL 10 trades vs band
+// 50-200) must not admit that type into B/C/D — otherwise A vs B/C could
+// confound Profit/Copyability with a wallet-type difference, the same
+// defect class as the activity-band leak T12 fixed.
+func TestSplitCellsWalletTypeFromMatchedA(t *testing.T) {
+	mk := func(wallet, typ string, q, consEV float64, trades int) mechanism.MechanismMatrixRow {
+		return mechanism.MechanismMatrixRow{
+			Wallet: wallet, WalletType: typ, Quality: q, ConsEV: consEV, Trades: trades,
+		}
+	}
+	rows := []mechanism.MechanismMatrixRow{
+		mk("A1", "sm", 50, 5, 100),   // A
+		mk("A2", "sm", 50, 5, 100),   // A
+		mk("A3", "sm", 50, 5, 100),   // A
+		mk("A4", "kol", 50, 5, 10),   // A-label, activity outlier → dropped; KOL must NOT become allowed
+		mk("B1", "kol", 50, -1, 100), // KOL B, in band but type not in matchedA → dropped
+		mk("C1", "sm", 20, 5, 100),   // SM C, in band and allowed type → retained
+	}
+	a, b, c, d, dropped, lo, hi, _ := splitCells(rows, 30)
+	if lo != 50 || hi != 200 {
+		t.Fatalf("band = %d-%d, want 50-200 (raw A median 100)", lo, hi)
+	}
+	if len(a) != 3 || len(b) != 0 || len(c) != 1 || len(d) != 0 || dropped != 2 {
+		t.Errorf("split = A%d B%d C%d D%d dropped %d, want 3/0/1/0/2", len(a), len(b), len(c), len(d), dropped)
+	}
+	for _, r := range a {
+		if r.WalletType != "sm" {
+			t.Errorf("cell A must be smart_money only: %+v", a)
+		}
+	}
+	for _, r := range c {
+		if r.Wallet != "C1" {
+			t.Errorf("cell C must keep the smart_money row: %+v", c)
+		}
+	}
+}
+
 // TestSplitCellsBandAppliesToA is trap T12 (v0.2.1.3): the activity band
 // must be applied to cell A ITSELF, not only to B/C/D. With raw A trades
 // {10,100,100,100,1000} → median 100 → band [50,200], the 10- and 1000-trade

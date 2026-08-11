@@ -2,7 +2,7 @@
 
 **Profit Actor Discovery & Strategy Replication Engine.**
 
-版本：`v0.2.1.3-matched-population-fix`。
+版本：`v0.2.1.4-wallet-type-match-fix`。
 
 核心问题不是"哪些信号可以买"，而是：
 
@@ -157,7 +157,8 @@ edge 都必须扛住它。样本量远不够下结论，继续积累 5,000+ even
 | `v0.2.1-mechanism-evidence` | 双证据通道：全部统计以 confirmed / inferred 双列输出（Strict=ConfirmedZero，Research=VisibleZero+ConfirmedZero 排除 Censored/DataGap）；Oversold 降级 origin 回 Censored；pnl 拆互斥三桶（research / censored-complete / data-gap）；trap：生产路径永不产生 Confirmed |
 | `v0.2.1.1-mechanism-matrix` | Entry↔Episode 最终证据血缘（单遍 `ReconstructBehaviorFor`：episode finalize 后统一赋 OriginQuality/DataGap，episode 说不可信 entry 必不可信）；`EvidenceCounts` 统一 provenance（Matrix/CLI/Hypothesis 同源）；ReentryRate 改为 reconstruction 期固定的 `IsReentry`（censored 首次 episode 也算 re-entry）；Cross-Actor Matrix：TARGET（ConsEV>0+Quality gate）vs CONTROL（activity-band 匹配），label 不进特征向量，pattern prevalence 分离门槛 → `MechanismHypothesis`（INFERRED/DISCOVERED，先可审计假设不做 KMeans） |
 | `v0.2.1.2-matrix-integrity` | Matrix 研究完整性：`MinSideBN`（P0：零 evaluable control 永不毕业）；evaluability coverage 门（双侧 ≥50% + `|Δcoverage|≤30pp`，float-epsilon 边界）；**Quality × Replicability 2×2 outcome matrix**（A/B/C/D，Profit=A vs C / Copyability=A vs B 双 contrast，D 仅诊断，旧 TARGET/CONTROL 删除）；hypothesis 诚实 N（total/evaluable/matched actor+episode，`MatchedEpisodeN` 只累加 matched actor）；行为卡/矩阵列名统一 `confirmed   research`（StrictN/ResearchN） |
-| `v0.2.1.3-matched-population-fix`（本版） | **activity/wallet-type band 真正应用到 A/B/C/D 四格**（band 从 raw A 推导后单遍过滤所有 rows；修复 A 自身不过滤导致的 activity confounding，trap：A 内 band 外 outlier 必须 dropped） |
+| `v0.2.1.3-matched-population-fix` | **activity/wallet-type band 真正应用到 A/B/C/D 四格**（band 从 raw A 推导后单遍过滤所有 rows；修复 A 自身不过滤导致的 activity confounding，trap：A 内 band 外 outlier 必须 dropped） |
+| `v0.2.1.4-wallet-type-match-fix`（本版） | **allowed wallet types 从 band-matched A 推导**（3-pass：raw A → band；band∩A → 类型集；全体按 band+类型过滤）；只存在于 A band-outlier 上的类型不再泄漏进 B/C/D（trap：KOL 仅见于 A outlier → B 里 KOL 必须 dropped，同 activity confounding 同类） |
 | `v0.2.1-mechanism` | Mechanism Analyzer（他靠什么赚钱）、Hypothesis 注册、archetype 聚类 |
 | `v0.3.0-experiment` | Replay/Experiment Engine（train/val/test）、Strategy 血缘注册 |
 | `v0.4.0-shadow` | 实时 Shadow Copy + Strategy Clone |
