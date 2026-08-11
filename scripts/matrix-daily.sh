@@ -4,9 +4,21 @@
 # Runs the three observation windows (24h/72h/168h) of the cross-actor
 # matrix and writes a compact daily report to data/reports/matrix-daily.txt;
 # full raw output is retained under data/reports/raw/. The report carries
-# the reopen-trigger check: KEEP COLLECTING until A/B/C each >= 10 (the
-# 10-15 range; default the lower bound) AND flagship pattern evaluability
-# coverage on the discovery side >= 50%.
+# the reopen-trigger check: KEEP COLLECTING until ONE COMPLETE window has
+# A/B/C each >= 10 (10-15 range; lower bound default) AND flagship pattern
+# evaluability coverage on the discovery side >= 50%. The four numbers are
+# never assembled across windows — each window is an independent cohort
+# definition (ConsEV can flip sign across windows), so a "best of each
+# window" trigger would fabricate a REACHED no single window earned.
+#
+# Fail-closed: if the matrix command fails (SQLite lock/corruption, binary
+# crash, config error, disk full), the report says ERROR and the script
+# exits non-zero so the systemd unit shows failed — a broken collector must
+# never be disguised as "no data yet". A rank failure only degrades to WARN
+# (rank does not participate in the trigger).
+#
+# REACHED is a signal for a HUMAN to review — the script never starts
+# Discovery or changes any configuration on its own.
 #
 # Intended to run from a systemd user timer (Persistent=true) or cron.
 # No measurement/cohort/pattern-gate logic lives here — this is ops only,
@@ -44,11 +56,27 @@ DB_MTIME="$(stat -c '%y' "$REPO/data/followedge.db" 2>/dev/null || echo 'n/a')"
     echo
 } > "$REPORT"
 
-max_a=0; max_b=0; max_c=0; max_cov=0
+qualifying=""  # first window that clears ALL gates on its own
+q_a=0; q_b=0; q_c=0; q_cov=0
 
 for win in 24h 72h 168h; do
-    matrix_out="$("$BIN" actors matrix --since "$win" --horizon 5m 2>&1 || true)"
-    rank_out="$("$BIN" actors rank --since "$win" --horizon 5m --limit 20 2>&1 || true)"
+    # Fail closed: matrix is the trigger source — any failure must abort
+    # with an ERROR report, not be read as "no data".
+    matrix_err=""
+    matrix_out="$("$BIN" actors matrix --since "$win" --horizon 5m 2>&1)" || matrix_err=$?
+    if [ -n "$matrix_err" ]; then
+        echo "$matrix_out" > "$RAW/matrix-daily-$DATE-$win.txt"
+        {
+            echo "--- $win ---"
+            echo "MATRIX ERROR (exit $matrix_err):"
+            echo "$matrix_out"
+        } >> "$REPORT"
+        echo "STATUS: ERROR — matrix command failed for $win (exit $matrix_err); trigger not evaluated" >> "$REPORT"
+        exit 1
+    fi
+
+    rank_err=""
+    rank_out="$("$BIN" actors rank --since "$win" --horizon 5m --limit 20 2>&1)" || rank_err=$?
     echo "$matrix_out" > "$RAW/matrix-daily-$DATE-$win.txt"
     echo "$rank_out"   > "$RAW/matrix-daily-$DATE-$win-rank.txt"
 
@@ -62,39 +90,43 @@ for win in 24h 72h 168h; do
     rb=$(echo "$matrix_out" | awk '/^  B /{print $7}'); rb=${rb:-0}
     rc=$(echo "$matrix_out" | awk '/^  C /{print $7}'); rc=${rc:-0}
     rd=$(echo "$matrix_out" | awk '/^  D /{print $7}'); rd=${rd:-0}
-    # flagship pattern side-A coverage in the PROFIT contrast (may be absent
-    # when cell A is empty — the pipeline then yields "" → 0)
+    # flagship pattern side-A coverage in the PROFIT contrast (absent when
+    # cell A is empty → "" → 0)
     cov=$(echo "$matrix_out" | awk '/CONTRAST: PROFIT/,0' \
         | grep -m1 'early independent entry' \
         | grep -o 'cov [0-9]*%' | head -1 | tr -dc '0-9' || true)
     cov=${cov:-0}
 
-    # Track maxima for the reopen trigger: the longest window is not
-    # necessarily the largest on every metric (ConsEV can flip sign across
-    # windows), so trigger on the best-observed window.
-    [ "$a" -gt "$max_a" ] && max_a=$a
-    [ "$b" -gt "$max_b" ] && max_b=$b
-    [ "$c" -gt "$max_c" ] && max_c=$c
-    [ "$cov" -gt "$max_cov" ] && max_cov=$cov
+    # A window qualifies only when IT ALONE clears every gate — never mix
+    # the best A from one window with the best B from another.
+    if [ -z "$qualifying" ] \
+       && [ "$a" -ge "$THRESHOLD_A" ] && [ "$b" -ge "$THRESHOLD_B" ] \
+       && [ "$c" -ge "$THRESHOLD_C" ] && [ "$cov" -ge "$COV_GATE" ]; then
+        qualifying="$win"
+        q_a=$a; q_b=$b; q_c=$c; q_cov=$cov
+    fi
+
+    rank_note="ok"
+    [ -n "$rank_err" ] && rank_note="WARN — rank failed (exit $rank_err); replication detail missing"
 
     {
         echo "--- $win ---"
         echo "cells:        A=$a B=$b C=$c D=$d"
         echo "research eps: A=$ra B=$rb C=$rc D=$rd"
         echo "flagship cov (side A): ${cov}%"
+        echo "rank: $rank_note"
         echo "patterns/gates:"
         echo "$matrix_out" | sed -n '/PATTERNS — prevalence per side/,/^HYPOTHESES/p' \
             | grep -v '^HYPOTHESES' | head -16 || true
-        echo "replication (effective N / filled / coverage): see raw/$DATE-$win-rank.txt"
+        echo "full raw: data/reports/raw/matrix-daily-$DATE-$win.txt (+ -rank.txt)"
         echo
     } >> "$REPORT"
 done
 
-if [ "$max_a" -ge "$THRESHOLD_A" ] && [ "$max_b" -ge "$THRESHOLD_B" ] \
-   && [ "$max_c" -ge "$THRESHOLD_C" ] && [ "$max_cov" -ge "$COV_GATE" ]; then
-    status="REACHED — best window A=$max_a B=$max_b C=$max_c, flagship cov=${max_cov}% >= ${COV_GATE}%; prepare Discovery window"
+if [ -n "$qualifying" ]; then
+    status="REACHED — $qualifying qualifies (A=$q_a B=$q_b C=$q_c, flagship cov=${q_cov}%); HUMAN REVIEW required — script never auto-starts Discovery"
 else
-    status="KEEP COLLECTING — need A/B/C >= $THRESHOLD_A/$THRESHOLD_B/$THRESHOLD_C and flagship cov >= ${COV_GATE}% (best: A=$max_a B=$max_b C=$max_c cov=${max_cov}%)"
+    status="KEEP COLLECTING — need at least ONE full window with A/B/C >= $THRESHOLD_A/$THRESHOLD_B/$THRESHOLD_C AND flagship cov >= ${COV_GATE}%; none qualified today"
 fi
 
 echo "STATUS: $status" >> "$REPORT"
