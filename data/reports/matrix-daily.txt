@@ -1,59 +1,92 @@
 # Matrix Daily — 2026-08-12 (discovery freeze 4e761e9)
 # gates: min-repl 20/5 · quality 30 · horizon 5m
-# db last write: 2026-08-12 09:05:34.404343820 +0800  (collector freshness)
+# db last write: 2026-08-12 09:45:58.685681109 +0800  (collector freshness)
 
 --- 24h ---
-cells:        A=107 B=91 C=0 D=2
-research eps: A=996 B=941 C=0 D=2
+cells:        A=107 B=96 C=0 D=2
+research eps: A=979 B=1015 C=0 D=2
+flagship cov (side A): 92%
+rank: ok
+patterns/gates:
+PATTERNS — prevalence per side
+  (canonical per side: matched M/E · evaluable E/T · total T · cov P% · un-eval U/V: N data · M label)
+  pattern                                      side A                                                 side B                                                      Δ  gate
+  early independent entry + consensus-confirmed scaling matched 1/98 · evaluable 98/107 · total 107 · cov 92% (un-eval 9/107: 6 data · 3 unobservable)   matched 2/85 · evaluable 85/96 · total 96 · cov 89% (un-eval 11/96: 8 data · 3 unobservable)     -1pp  prevalence
+  momentum chase entry                         matched 18/97 · evaluable 97/107 · total 107 · cov 91% (un-eval 10/107: 6 data · 4 unobservable)   matched 26/83 · evaluable 83/96 · total 96 · cov 86% (un-eval 13/96: 8 data · 5 unobservable)    -13pp  prevalence
+  confirmation-scale scalper                   matched 1/101 · evaluable 101/107 · total 107 · cov 94% (un-eval 6/107: 6 data · 0 unobservable)   matched 3/88 · evaluable 88/96 · total 96 · cov 92% (un-eval 8/96: 8 data · 0 unobservable)     -2pp  prevalence
+  patient position trader                      matched 0/101 · evaluable 101/107 · total 107 · cov 94% (un-eval 6/107: 6 data · 0 unobservable)   matched 3/88 · evaluable 88/96 · total 96 · cov 92% (un-eval 8/96: 8 data · 0 unobservable)     -3pp  prevalence
+  fast partial-exit swing                      matched 15/100 · evaluable 100/107 · total 107 · cov 93% (un-eval 7/107: 6 data · 1 unobservable)   matched 20/88 · evaluable 88/96 · total 96 · cov 92% (un-eval 8/96: 8 data · 0 unobservable)     -8pp  prevalence
+  token revisitor                              matched 101/101 · evaluable 101/107 · total 107 · cov 94% (un-eval 6/107: 6 data · 0 unobservable)   matched 88/88 · evaluable 88/96 · total 96 · cov 92% (un-eval 8/96: 8 data · 0 unobservable)     +0pp  separation
+
+c maturation funnel:
+C MATURATION FUNNEL (observability only — measurement frozen at 4e761e9)
+  potential_c      q<gate && ConsEV>0 (ConsValid)         N=29
+  filled_ge_2                                             N=27
+  filled_ge_5                                             N=13
+  repl_eligible    effectiveN>=20 && filled>=5            N=2
+  band_eligible    repl + activity/type match             N=0
+  matrix_c         final cell C                           N=0
+  drop — repl gate: filled<5: 16 · effectiveN<20: 27
+  drop — band: activity: 2 · wallet type: 0
+  same-source check: band_eligible == matrix_c == 0 ✓
+full raw: data/reports/raw/matrix-daily-2026-08-12-24h.txt (+ -rank.txt)
+
+--- 72h ---
+cells:        A=108 B=103 C=0 D=1
+research eps: A=985 B=1067 C=0 D=2
 flagship cov (side A): 93%
 rank: ok
 patterns/gates:
 PATTERNS — prevalence per side
   (canonical per side: matched M/E · evaluable E/T · total T · cov P% · un-eval U/V: N data · M label)
   pattern                                      side A                                                 side B                                                      Δ  gate
-  early independent entry + consensus-confirmed scaling matched 1/99 · evaluable 99/107 · total 107 · cov 93% (un-eval 8/107: 6 data · 2 unobservable)   matched 2/81 · evaluable 81/91 · total 91 · cov 89% (un-eval 10/91: 7 data · 3 unobservable)     -1pp  prevalence
-  momentum chase entry                         matched 18/97 · evaluable 97/107 · total 107 · cov 91% (un-eval 10/107: 6 data · 4 unobservable)   matched 28/80 · evaluable 80/91 · total 91 · cov 88% (un-eval 11/91: 7 data · 4 unobservable)    -16pp  prevalence
-  confirmation-scale scalper                   matched 1/101 · evaluable 101/107 · total 107 · cov 94% (un-eval 6/107: 6 data · 0 unobservable)   matched 3/84 · evaluable 84/91 · total 91 · cov 92% (un-eval 7/91: 7 data · 0 unobservable)     -3pp  prevalence
-  patient position trader                      matched 0/101 · evaluable 101/107 · total 107 · cov 94% (un-eval 6/107: 6 data · 0 unobservable)   matched 3/84 · evaluable 84/91 · total 91 · cov 92% (un-eval 7/91: 7 data · 0 unobservable)     -4pp  prevalence
-  fast partial-exit swing                      matched 14/100 · evaluable 100/107 · total 107 · cov 93% (un-eval 7/107: 6 data · 1 unobservable)   matched 21/84 · evaluable 84/91 · total 91 · cov 92% (un-eval 7/91: 7 data · 0 unobservable)    -11pp  prevalence
-  token revisitor                              matched 101/101 · evaluable 101/107 · total 107 · cov 94% (un-eval 6/107: 6 data · 0 unobservable)   matched 84/84 · evaluable 84/91 · total 91 · cov 92% (un-eval 7/91: 7 data · 0 unobservable)     +0pp  separation
+  early independent entry + consensus-confirmed scaling matched 1/100 · evaluable 100/108 · total 108 · cov 93% (un-eval 8/108: 6 data · 2 unobservable)   matched 2/90 · evaluable 90/103 · total 103 · cov 87% (un-eval 13/103: 10 data · 3 unobservable)     -1pp  prevalence
+  momentum chase entry                         matched 19/99 · evaluable 99/108 · total 108 · cov 92% (un-eval 9/108: 6 data · 3 unobservable)   matched 27/87 · evaluable 87/103 · total 103 · cov 84% (un-eval 16/103: 10 data · 6 unobservable)    -12pp  prevalence
+  confirmation-scale scalper                   matched 1/102 · evaluable 102/108 · total 108 · cov 94% (un-eval 6/108: 6 data · 0 unobservable)   matched 4/93 · evaluable 93/103 · total 103 · cov 90% (un-eval 10/103: 10 data · 0 unobservable)     -3pp  prevalence
+  patient position trader                      matched 0/102 · evaluable 102/108 · total 108 · cov 94% (un-eval 6/108: 6 data · 0 unobservable)   matched 3/93 · evaluable 93/103 · total 103 · cov 90% (un-eval 10/103: 10 data · 0 unobservable)     -3pp  prevalence
+  fast partial-exit swing                      matched 15/101 · evaluable 101/108 · total 108 · cov 94% (un-eval 7/108: 6 data · 1 unobservable)   matched 20/93 · evaluable 93/103 · total 103 · cov 90% (un-eval 10/103: 10 data · 0 unobservable)     -7pp  prevalence
+  token revisitor                              matched 102/102 · evaluable 102/108 · total 108 · cov 94% (un-eval 6/108: 6 data · 0 unobservable)   matched 93/93 · evaluable 93/103 · total 103 · cov 90% (un-eval 10/103: 10 data · 0 unobservable)     +0pp  separation
 
-full raw: data/reports/raw/matrix-daily-2026-08-12-24h.txt (+ -rank.txt)
-
---- 72h ---
-cells:        A=105 B=97 C=0 D=1
-research eps: A=975 B=993 C=0 D=2
-flagship cov (side A): 92%
-rank: ok
-patterns/gates:
-PATTERNS — prevalence per side
-  (canonical per side: matched M/E · evaluable E/T · total T · cov P% · un-eval U/V: N data · M label)
-  pattern                                      side A                                                 side B                                                      Δ  gate
-  early independent entry + consensus-confirmed scaling matched 1/97 · evaluable 97/105 · total 105 · cov 92% (un-eval 8/105: 6 data · 2 unobservable)   matched 2/86 · evaluable 86/97 · total 97 · cov 89% (un-eval 11/97: 8 data · 3 unobservable)     -1pp  prevalence
-  momentum chase entry                         matched 19/95 · evaluable 95/105 · total 105 · cov 90% (un-eval 10/105: 6 data · 4 unobservable)   matched 29/84 · evaluable 84/97 · total 97 · cov 87% (un-eval 13/97: 8 data · 5 unobservable)    -15pp  prevalence
-  confirmation-scale scalper                   matched 1/99 · evaluable 99/105 · total 105 · cov 94% (un-eval 6/105: 6 data · 0 unobservable)   matched 4/89 · evaluable 89/97 · total 97 · cov 92% (un-eval 8/97: 8 data · 0 unobservable)     -3pp  prevalence
-  patient position trader                      matched 0/99 · evaluable 99/105 · total 105 · cov 94% (un-eval 6/105: 6 data · 0 unobservable)   matched 3/89 · evaluable 89/97 · total 97 · cov 92% (un-eval 8/97: 8 data · 0 unobservable)     -3pp  prevalence
-  fast partial-exit swing                      matched 14/98 · evaluable 98/105 · total 105 · cov 93% (un-eval 7/105: 6 data · 1 unobservable)   matched 21/89 · evaluable 89/97 · total 97 · cov 92% (un-eval 8/97: 8 data · 0 unobservable)     -9pp  prevalence
-  token revisitor                              matched 99/99 · evaluable 99/105 · total 105 · cov 94% (un-eval 6/105: 6 data · 0 unobservable)   matched 89/89 · evaluable 89/97 · total 97 · cov 92% (un-eval 8/97: 8 data · 0 unobservable)     +0pp  separation
-
+c maturation funnel:
+C MATURATION FUNNEL (observability only — measurement frozen at 4e761e9)
+  potential_c      q<gate && ConsEV>0 (ConsValid)         N=28
+  filled_ge_2                                             N=24
+  filled_ge_5                                             N=12
+  repl_eligible    effectiveN>=20 && filled>=5            N=1
+  band_eligible    repl + activity/type match             N=0
+  matrix_c         final cell C                           N=0
+  drop — repl gate: filled<5: 16 · effectiveN<20: 27
+  drop — band: activity: 1 · wallet type: 0
+  same-source check: band_eligible == matrix_c == 0 ✓
 full raw: data/reports/raw/matrix-daily-2026-08-12-72h.txt (+ -rank.txt)
 
 --- 168h ---
-cells:        A=105 B=97 C=0 D=1
-research eps: A=975 B=993 C=0 D=2
-flagship cov (side A): 92%
+cells:        A=108 B=103 C=0 D=1
+research eps: A=985 B=1067 C=0 D=2
+flagship cov (side A): 93%
 rank: ok
 patterns/gates:
 PATTERNS — prevalence per side
   (canonical per side: matched M/E · evaluable E/T · total T · cov P% · un-eval U/V: N data · M label)
   pattern                                      side A                                                 side B                                                      Δ  gate
-  early independent entry + consensus-confirmed scaling matched 1/97 · evaluable 97/105 · total 105 · cov 92% (un-eval 8/105: 6 data · 2 unobservable)   matched 2/86 · evaluable 86/97 · total 97 · cov 89% (un-eval 11/97: 8 data · 3 unobservable)     -1pp  prevalence
-  momentum chase entry                         matched 19/95 · evaluable 95/105 · total 105 · cov 90% (un-eval 10/105: 6 data · 4 unobservable)   matched 29/84 · evaluable 84/97 · total 97 · cov 87% (un-eval 13/97: 8 data · 5 unobservable)    -15pp  prevalence
-  confirmation-scale scalper                   matched 1/99 · evaluable 99/105 · total 105 · cov 94% (un-eval 6/105: 6 data · 0 unobservable)   matched 4/89 · evaluable 89/97 · total 97 · cov 92% (un-eval 8/97: 8 data · 0 unobservable)     -3pp  prevalence
-  patient position trader                      matched 0/99 · evaluable 99/105 · total 105 · cov 94% (un-eval 6/105: 6 data · 0 unobservable)   matched 3/89 · evaluable 89/97 · total 97 · cov 92% (un-eval 8/97: 8 data · 0 unobservable)     -3pp  prevalence
-  fast partial-exit swing                      matched 14/98 · evaluable 98/105 · total 105 · cov 93% (un-eval 7/105: 6 data · 1 unobservable)   matched 21/89 · evaluable 89/97 · total 97 · cov 92% (un-eval 8/97: 8 data · 0 unobservable)     -9pp  prevalence
-  token revisitor                              matched 99/99 · evaluable 99/105 · total 105 · cov 94% (un-eval 6/105: 6 data · 0 unobservable)   matched 89/89 · evaluable 89/97 · total 97 · cov 92% (un-eval 8/97: 8 data · 0 unobservable)     +0pp  separation
+  early independent entry + consensus-confirmed scaling matched 1/100 · evaluable 100/108 · total 108 · cov 93% (un-eval 8/108: 6 data · 2 unobservable)   matched 2/90 · evaluable 90/103 · total 103 · cov 87% (un-eval 13/103: 10 data · 3 unobservable)     -1pp  prevalence
+  momentum chase entry                         matched 19/99 · evaluable 99/108 · total 108 · cov 92% (un-eval 9/108: 6 data · 3 unobservable)   matched 27/87 · evaluable 87/103 · total 103 · cov 84% (un-eval 16/103: 10 data · 6 unobservable)    -12pp  prevalence
+  confirmation-scale scalper                   matched 1/102 · evaluable 102/108 · total 108 · cov 94% (un-eval 6/108: 6 data · 0 unobservable)   matched 4/93 · evaluable 93/103 · total 103 · cov 90% (un-eval 10/103: 10 data · 0 unobservable)     -3pp  prevalence
+  patient position trader                      matched 0/102 · evaluable 102/108 · total 108 · cov 94% (un-eval 6/108: 6 data · 0 unobservable)   matched 3/93 · evaluable 93/103 · total 103 · cov 90% (un-eval 10/103: 10 data · 0 unobservable)     -3pp  prevalence
+  fast partial-exit swing                      matched 15/101 · evaluable 101/108 · total 108 · cov 94% (un-eval 7/108: 6 data · 1 unobservable)   matched 20/93 · evaluable 93/103 · total 103 · cov 90% (un-eval 10/103: 10 data · 0 unobservable)     -7pp  prevalence
+  token revisitor                              matched 102/102 · evaluable 102/108 · total 108 · cov 94% (un-eval 6/108: 6 data · 0 unobservable)   matched 93/93 · evaluable 93/103 · total 103 · cov 90% (un-eval 10/103: 10 data · 0 unobservable)     +0pp  separation
 
+c maturation funnel:
+C MATURATION FUNNEL (observability only — measurement frozen at 4e761e9)
+  potential_c      q<gate && ConsEV>0 (ConsValid)         N=28
+  filled_ge_2                                             N=24
+  filled_ge_5                                             N=12
+  repl_eligible    effectiveN>=20 && filled>=5            N=1
+  band_eligible    repl + activity/type match             N=0
+  matrix_c         final cell C                           N=0
+  drop — repl gate: filled<5: 16 · effectiveN<20: 27
+  drop — band: activity: 1 · wallet type: 0
+  same-source check: band_eligible == matrix_c == 0 ✓
 full raw: data/reports/raw/matrix-daily-2026-08-12-168h.txt (+ -rank.txt)
 
 STATUS: KEEP COLLECTING — need at least ONE full window with A/B/C >= 10/10/10 AND flagship cov >= 50%; none qualified today
