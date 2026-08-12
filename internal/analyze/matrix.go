@@ -79,7 +79,7 @@ func Matrix(w io.Writer, s *storage.Store, since time.Time, horizon, grace time.
 		return nil
 	}
 
-	a, b, c, d, dropped, bandLo, bandHi, bandNote := splitCells(rows, minQuality)
+	a, b, c, d, dropped, bandLo, bandHi, bandTypes, bandNote := splitCells(rows, minQuality)
 
 	fmt.Fprintf(w, "MECHANISM MATRIX (since %s, horizon %v, quality gate %.0f)\n",
 		since.Format("2006-01-02"), horizon, minQuality)
@@ -99,6 +99,12 @@ func Matrix(w io.Writer, s *storage.Store, since time.Time, horizon, grace time.
 	printOutcome2x2(w, a, b, c, d)
 	printCellCoverage(w, a, b, c, d)
 	printCellFeatures(w, a, b, c, d)
+
+	// ---- C maturation funnel (observability only, frozen measurement) ----
+	funnel := computeCMaturationFunnel(rows, actors, replEligible,
+		bandLo, bandHi, bandTypes, minQuality, minReplMarket, minReplFilled)
+	funnel.FinalC = len(c)
+	printCMaturationFunnel(w, funnel, minReplMarket, minReplFilled)
 
 	// ---- contrasts (both always run) ----
 	patterns := mechanism.DefaultPatterns
@@ -210,7 +216,12 @@ func matrixRowFor(s *storage.Store, a *Actor, since time.Time, clusterWindow tim
 // If cell A has no candidates the band cannot be derived: rows are bucketed
 // by labels only and a note is returned (no contrast can run — both involve
 // A, but the 2×2 layout stays printable as the diagnostic).
-func splitCells(rows []mechanism.MechanismMatrixRow, minQuality float64) (a, b, c, d []mechanism.MechanismMatrixRow, dropped int, bandLo, bandHi int, bandNote string) {
+//
+// bandTypes (v0.2.1.5 observability) is the allowed wallet-type set derived
+// in pass 2; it is returned so the C-maturation funnel can evaluate band
+// membership with the SAME set instead of re-deriving a second matching
+// logic. Never nil when a band was derived.
+func splitCells(rows []mechanism.MechanismMatrixRow, minQuality float64) (a, b, c, d []mechanism.MechanismMatrixRow, dropped int, bandLo, bandHi int, bandTypes map[string]bool, bandNote string) {
 	// Pass 1: rawA = all A-LABEL rows (unfiltered) — the band's derivation
 	// population. Only A's trade median matters here; A itself is
 	// band-filtered like every other cell.
@@ -231,7 +242,7 @@ func splitCells(rows []mechanism.MechanismMatrixRow, minQuality float64) (a, b, 
 				d = append(d, r)
 			}
 		}
-		return a, b, c, d, 0, 0, 0, "(no cell A — activity band unavailable; all rows bucketed by label)"
+		return a, b, c, d, 0, 0, 0, nil, "(no cell A — activity band unavailable; all rows bucketed by label)"
 	}
 	var trades []int
 	for _, r := range rawA {
@@ -270,7 +281,7 @@ func splitCells(rows []mechanism.MechanismMatrixRow, minQuality float64) (a, b, 
 			d = append(d, r)
 		}
 	}
-	return a, b, c, d, dropped, bandLo, bandHi, ""
+	return a, b, c, d, dropped, bandLo, bandHi, types, ""
 }
 
 // runContrast prints one contrast's header + PATTERNS table and returns the

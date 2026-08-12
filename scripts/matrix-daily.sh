@@ -159,6 +159,8 @@ for win in 24h 72h 168h; do
         echo "patterns/gates:"
         echo "$matrix_out" | sed -n '/PATTERNS — prevalence per side/,/^HYPOTHESES/p' \
             | grep -v '^HYPOTHESES' | head -16 || true
+        echo "c maturation funnel:"
+        echo "$matrix_out" | sed -n '/C MATURATION FUNNEL/,/same-source/p' || true
         echo "full raw: data/reports/raw/matrix-daily-$DATE-$win.txt (+ -rank.txt)"
         echo
     } >> "$REPORT"

@@ -27,7 +27,7 @@ import (
 	"github.com/auren23/followedge/internal/storage"
 )
 
-const version = "0.2.1.4-wallet-type-match-fix"
+const version = "0.2.1.5-observability-funnel"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))

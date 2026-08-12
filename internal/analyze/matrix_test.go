@@ -164,12 +164,15 @@ func TestSplitCellsPartition(t *testing.T) {
 	for i := 0; i < 9; i++ {
 		rows = append(rows, mk(tWallet(30+i), 20, -1)) // D
 	}
-	a, b, c, d, dropped, lo, hi, note := splitCells(rows, 30)
+	a, b, c, d, dropped, lo, hi, bandTypes, note := splitCells(rows, 30)
 	if len(a) != 6 || len(b) != 4 || len(c) != 3 || len(d) != 9 || dropped != 0 || note != "" {
 		t.Errorf("split = A%d B%d C%d D%d dropped %d note %q, want 6/4/3/9/0", len(a), len(b), len(c), len(d), dropped, note)
 	}
 	if lo != 5 || hi != 20 { // A median 10 → band [5, 20]
 		t.Errorf("band = %d-%d, want 5-20", lo, hi)
+	}
+	if len(bandTypes) != 1 || !bandTypes["sm"] {
+		t.Errorf("band types = %v, want {sm}", bandTypes)
 	}
 	if len(a)+len(b)+len(c)+len(d)+dropped != len(rows) {
 		t.Errorf("partition lost rows: %d", len(a)+len(b)+len(c)+len(d)+dropped)
@@ -179,7 +182,7 @@ func TestSplitCellsPartition(t *testing.T) {
 	rows = []mechanism.MechanismMatrixRow{
 		mk("B_A", 30, 1), mk("B_B", 30, 0), mk("B_C", 29, 1), mk("B_D", 29, 0),
 	}
-	a, b, c, d, _, _, _, _ = splitCells(rows, 30)
+	a, b, c, d, _, _, _, _, _ = splitCells(rows, 30)
 	if len(a) != 1 || len(b) != 1 || len(c) != 1 || len(d) != 1 {
 		t.Errorf("boundary split = A%d B%d C%d D%d, want 1/1/1/1", len(a), len(b), len(c), len(d))
 	}
@@ -205,7 +208,7 @@ func TestSplitCellsWalletTypeFromMatchedA(t *testing.T) {
 		mk("B1", "kol", 50, -1, 100), // KOL B, in band but type not in matchedA → dropped
 		mk("C1", "sm", 20, 5, 100),   // SM C, in band and allowed type → retained
 	}
-	a, b, c, d, dropped, lo, hi, _ := splitCells(rows, 30)
+	a, b, c, d, dropped, lo, hi, _, _ := splitCells(rows, 30)
 	if lo != 50 || hi != 200 {
 		t.Fatalf("band = %d-%d, want 50-200 (raw A median 100)", lo, hi)
 	}
@@ -247,7 +250,7 @@ func TestSplitCellsBandAppliesToA(t *testing.T) {
 		mk("C2", 20, 5, 5000), // C, outside band → dropped
 		mk("D1", 20, -1, 80),  // D, in band
 	}
-	a, b, c, d, dropped, lo, hi, _ := splitCells(rows, 30)
+	a, b, c, d, dropped, lo, hi, _, _ := splitCells(rows, 30)
 	if lo != 50 || hi != 200 {
 		t.Fatalf("band = %d-%d, want 50-200 (raw A median 100)", lo, hi)
 	}
@@ -346,6 +349,7 @@ func TestMatrixCLI(t *testing.T) {
 
 	for _, want := range []string{
 		"MECHANISM MATRIX", "OUTCOME 2×2", "EVIDENCE COVERAGE", "FEATURES",
+		"C MATURATION FUNNEL", "same-source check",
 		"CONTRAST: PROFIT", "CONTRAST: COPYABILITY", "PATTERNS", "HYPOTHESES",
 		"confirmed  visible  censored  gap  research",
 	} {
