@@ -1,8 +1,59 @@
 # Matrix Daily — 2026-08-12 (discovery freeze 4e761e9)
 # gates: min-repl 20/5 · quality 30 · horizon 5m
-# db last write: 2026-08-12 08:59:47.434288101 +0800  (collector freshness)
+# db last write: 2026-08-12 09:05:34.404343820 +0800  (collector freshness)
 
 --- 24h ---
-MATRIX ERROR (exit 1):
-error: read config configs/observe.yaml: open configs/observe.yaml: no such file or directory
-STATUS: ERROR — matrix command failed for 24h (exit 1); trigger not evaluated
+cells:        A=107 B=91 C=0 D=2
+research eps: A=996 B=941 C=0 D=2
+flagship cov (side A): 93%
+rank: ok
+patterns/gates:
+PATTERNS — prevalence per side
+  (canonical per side: matched M/E · evaluable E/T · total T · cov P% · un-eval U/V: N data · M label)
+  pattern                                      side A                                                 side B                                                      Δ  gate
+  early independent entry + consensus-confirmed scaling matched 1/99 · evaluable 99/107 · total 107 · cov 93% (un-eval 8/107: 6 data · 2 unobservable)   matched 2/81 · evaluable 81/91 · total 91 · cov 89% (un-eval 10/91: 7 data · 3 unobservable)     -1pp  prevalence
+  momentum chase entry                         matched 18/97 · evaluable 97/107 · total 107 · cov 91% (un-eval 10/107: 6 data · 4 unobservable)   matched 28/80 · evaluable 80/91 · total 91 · cov 88% (un-eval 11/91: 7 data · 4 unobservable)    -16pp  prevalence
+  confirmation-scale scalper                   matched 1/101 · evaluable 101/107 · total 107 · cov 94% (un-eval 6/107: 6 data · 0 unobservable)   matched 3/84 · evaluable 84/91 · total 91 · cov 92% (un-eval 7/91: 7 data · 0 unobservable)     -3pp  prevalence
+  patient position trader                      matched 0/101 · evaluable 101/107 · total 107 · cov 94% (un-eval 6/107: 6 data · 0 unobservable)   matched 3/84 · evaluable 84/91 · total 91 · cov 92% (un-eval 7/91: 7 data · 0 unobservable)     -4pp  prevalence
+  fast partial-exit swing                      matched 14/100 · evaluable 100/107 · total 107 · cov 93% (un-eval 7/107: 6 data · 1 unobservable)   matched 21/84 · evaluable 84/91 · total 91 · cov 92% (un-eval 7/91: 7 data · 0 unobservable)    -11pp  prevalence
+  token revisitor                              matched 101/101 · evaluable 101/107 · total 107 · cov 94% (un-eval 6/107: 6 data · 0 unobservable)   matched 84/84 · evaluable 84/91 · total 91 · cov 92% (un-eval 7/91: 7 data · 0 unobservable)     +0pp  separation
+
+full raw: data/reports/raw/matrix-daily-2026-08-12-24h.txt (+ -rank.txt)
+
+--- 72h ---
+cells:        A=105 B=97 C=0 D=1
+research eps: A=975 B=993 C=0 D=2
+flagship cov (side A): 92%
+rank: ok
+patterns/gates:
+PATTERNS — prevalence per side
+  (canonical per side: matched M/E · evaluable E/T · total T · cov P% · un-eval U/V: N data · M label)
+  pattern                                      side A                                                 side B                                                      Δ  gate
+  early independent entry + consensus-confirmed scaling matched 1/97 · evaluable 97/105 · total 105 · cov 92% (un-eval 8/105: 6 data · 2 unobservable)   matched 2/86 · evaluable 86/97 · total 97 · cov 89% (un-eval 11/97: 8 data · 3 unobservable)     -1pp  prevalence
+  momentum chase entry                         matched 19/95 · evaluable 95/105 · total 105 · cov 90% (un-eval 10/105: 6 data · 4 unobservable)   matched 29/84 · evaluable 84/97 · total 97 · cov 87% (un-eval 13/97: 8 data · 5 unobservable)    -15pp  prevalence
+  confirmation-scale scalper                   matched 1/99 · evaluable 99/105 · total 105 · cov 94% (un-eval 6/105: 6 data · 0 unobservable)   matched 4/89 · evaluable 89/97 · total 97 · cov 92% (un-eval 8/97: 8 data · 0 unobservable)     -3pp  prevalence
+  patient position trader                      matched 0/99 · evaluable 99/105 · total 105 · cov 94% (un-eval 6/105: 6 data · 0 unobservable)   matched 3/89 · evaluable 89/97 · total 97 · cov 92% (un-eval 8/97: 8 data · 0 unobservable)     -3pp  prevalence
+  fast partial-exit swing                      matched 14/98 · evaluable 98/105 · total 105 · cov 93% (un-eval 7/105: 6 data · 1 unobservable)   matched 21/89 · evaluable 89/97 · total 97 · cov 92% (un-eval 8/97: 8 data · 0 unobservable)     -9pp  prevalence
+  token revisitor                              matched 99/99 · evaluable 99/105 · total 105 · cov 94% (un-eval 6/105: 6 data · 0 unobservable)   matched 89/89 · evaluable 89/97 · total 97 · cov 92% (un-eval 8/97: 8 data · 0 unobservable)     +0pp  separation
+
+full raw: data/reports/raw/matrix-daily-2026-08-12-72h.txt (+ -rank.txt)
+
+--- 168h ---
+cells:        A=105 B=97 C=0 D=1
+research eps: A=975 B=993 C=0 D=2
+flagship cov (side A): 92%
+rank: ok
+patterns/gates:
+PATTERNS — prevalence per side
+  (canonical per side: matched M/E · evaluable E/T · total T · cov P% · un-eval U/V: N data · M label)
+  pattern                                      side A                                                 side B                                                      Δ  gate
+  early independent entry + consensus-confirmed scaling matched 1/97 · evaluable 97/105 · total 105 · cov 92% (un-eval 8/105: 6 data · 2 unobservable)   matched 2/86 · evaluable 86/97 · total 97 · cov 89% (un-eval 11/97: 8 data · 3 unobservable)     -1pp  prevalence
+  momentum chase entry                         matched 19/95 · evaluable 95/105 · total 105 · cov 90% (un-eval 10/105: 6 data · 4 unobservable)   matched 29/84 · evaluable 84/97 · total 97 · cov 87% (un-eval 13/97: 8 data · 5 unobservable)    -15pp  prevalence
+  confirmation-scale scalper                   matched 1/99 · evaluable 99/105 · total 105 · cov 94% (un-eval 6/105: 6 data · 0 unobservable)   matched 4/89 · evaluable 89/97 · total 97 · cov 92% (un-eval 8/97: 8 data · 0 unobservable)     -3pp  prevalence
+  patient position trader                      matched 0/99 · evaluable 99/105 · total 105 · cov 94% (un-eval 6/105: 6 data · 0 unobservable)   matched 3/89 · evaluable 89/97 · total 97 · cov 92% (un-eval 8/97: 8 data · 0 unobservable)     -3pp  prevalence
+  fast partial-exit swing                      matched 14/98 · evaluable 98/105 · total 105 · cov 93% (un-eval 7/105: 6 data · 1 unobservable)   matched 21/89 · evaluable 89/97 · total 97 · cov 92% (un-eval 8/97: 8 data · 0 unobservable)     -9pp  prevalence
+  token revisitor                              matched 99/99 · evaluable 99/105 · total 105 · cov 94% (un-eval 6/105: 6 data · 0 unobservable)   matched 89/89 · evaluable 89/97 · total 97 · cov 92% (un-eval 8/97: 8 data · 0 unobservable)     +0pp  separation
+
+full raw: data/reports/raw/matrix-daily-2026-08-12-168h.txt (+ -rank.txt)
+
+STATUS: KEEP COLLECTING — need at least ONE full window with A/B/C >= 10/10/10 AND flagship cov >= 50%; none qualified today
