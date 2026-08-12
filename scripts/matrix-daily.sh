@@ -31,6 +31,10 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The binary resolves configs/observe.yaml relative to the CWD, and the
+# systemd timer does not run with the repo as CWD — cd first so a timer run
+# finds the config (the 2026-08-12 ERROR report was this bug).
+cd "$REPO"
 BIN="$REPO/bin/followedge"
 REPORT="$REPO/data/reports/matrix-daily.txt"
 RAW="$REPO/data/reports/raw"
